@@ -52,7 +52,11 @@ fn positionals(args: &[String]) -> Vec<&String> {
     while i < args.len() {
         let a = &args[i];
         if a.starts_with("--") {
-            i += if VALUE_FLAGS.contains(&a.as_str()) { 2 } else { 1 };
+            i += if VALUE_FLAGS.contains(&a.as_str()) {
+                2
+            } else {
+                1
+            };
         } else {
             out.push(a);
             i += 1;
@@ -87,7 +91,10 @@ fn cmd_parse(args: &[String]) -> Result<()> {
         println!("{} ({} symbols)", file.display(), nodes.len());
         for n in &nodes {
             let exp = if n.is_exported { "export " } else { "" };
-            println!("  {exp}{:?} {} @ {}:{}", n.kind, n.name, n.span.start_line, n.span.start_col);
+            println!(
+                "  {exp}{:?} {} @ {}:{}",
+                n.kind, n.name, n.span.start_line, n.span.start_col
+            );
         }
     }
     Ok(())
@@ -96,7 +103,11 @@ fn cmd_parse(args: &[String]) -> Result<()> {
 fn cmd_index(args: &[String]) -> Result<()> {
     let roots: Vec<PathBuf> = {
         let r: Vec<PathBuf> = positionals(args).into_iter().map(PathBuf::from).collect();
-        if r.is_empty() { vec![".".into()] } else { r }
+        if r.is_empty() {
+            vec![".".into()]
+        } else {
+            r
+        }
     };
     println!("{}", index_project(&roots)?);
     Ok(())
@@ -128,7 +139,7 @@ fn index_project(roots: &[PathBuf]) -> Result<String> {
 
     // cross-service: TS→resolver (GraphqlCall), resolver→context (Calls), fn→schema (DbQuery)
     let mut cross = resolve::link_cross_service(&indexed.files, &nodes);
-    let cross_count = cross.graphql + cross.db;
+    let (graphql, db) = (cross.graphql, cross.db);
     edges.append(&mut cross.edges);
 
     store.write(&nodes, &edges)?;
@@ -136,10 +147,10 @@ fn index_project(roots: &[PathBuf]) -> Result<String> {
 
     let s = indexed.stats;
     Ok(format!(
-        "indexed {} files across {} root(s) ({} added, {} changed, {} unchanged, {} removed) → {} nodes, {} edges ({} co-change, {} graphql) ({})",
+        "indexed {} files across {} root(s) ({} added, {} changed, {} unchanged, {} removed) → {} nodes, {} edges ({} co-change, {} graphql, {} db) ({})",
         indexed.result.files_indexed, indexed.roots.len(),
         s.added, s.changed, s.unchanged, s.removed,
-        nodes.len(), edges.len(), cochange_applied, cross_count,
+        nodes.len(), edges.len(), cochange_applied, graphql, db,
         db_path(&roots[0]).display()
     ))
 }
@@ -147,7 +158,9 @@ fn index_project(roots: &[PathBuf]) -> Result<String> {
 fn cmd_impact(args: &[String]) -> Result<()> {
     let json = args.iter().any(|a| a == "--json");
     let root: PathBuf = flag_value(args, "--root").map_or_else(|| ".".into(), PathBuf::from);
-    let budget: usize = flag_value(args, "--budget").and_then(|s| s.parse().ok()).unwrap_or(20);
+    let budget: usize = flag_value(args, "--budget")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20);
     let symbols: Vec<&str> = positionals(args).into_iter().map(String::as_str).collect();
     if symbols.is_empty() {
         bail!("{USAGE}");
@@ -177,7 +190,11 @@ fn cmd_impact(args: &[String]) -> Result<()> {
             .collect();
         println!("{}", serde_json::to_string_pretty(&out)?);
     } else {
-        println!("blast radius of {} — {} hits (ranked):", symbols.join(", "), hits.len());
+        println!(
+            "blast radius of {} — {} hits (ranked):",
+            symbols.join(", "),
+            hits.len()
+        );
         for h in &hits {
             println!(
                 "  {:.2}  {:?}<{:.2}> {} ({})",
@@ -193,18 +210,29 @@ fn cmd_impact(args: &[String]) -> Result<()> {
 /// history); the static-vs-co-change gap shows why co-change is needed.
 fn cmd_eval(args: &[String]) -> Result<()> {
     let root: PathBuf = flag_value(args, "--root").map_or_else(|| ".".into(), PathBuf::from);
-    let k: usize = flag_value(args, "--commits").and_then(|s| s.parse().ok()).unwrap_or(200);
+    let k: usize = flag_value(args, "--commits")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(200);
     let graph = RedbStore::open(db_path(&root)).load()?;
 
     let indexed = |p: &str| graph.get(ir::SymbolId::module(p)).is_some();
-    let static_kinds = [EdgeKind::Calls, EdgeKind::Imports, EdgeKind::GraphqlCall, EdgeKind::DbQuery];
+    let static_kinds = [
+        EdgeKind::Calls,
+        EdgeKind::Imports,
+        EdgeKind::GraphqlCall,
+        EdgeKind::DbQuery,
+    ];
     let cochange = |a: &str, b: &str| {
         let (ma, mb) = (ir::SymbolId::module(a), ir::SymbolId::module(b));
-        graph.out_edges(ma).iter().any(|e| e.kind == EdgeKind::ChangesWith && e.dst == mb)
+        graph
+            .out_edges(ma)
+            .iter()
+            .any(|e| e.kind == EdgeKind::ChangesWith && e.dst == mb)
     };
     // cache each test file's statically-reachable file set (from all its symbols)
     let commits = overlay::recent_commit_files(&root, k);
-    let mut reach: std::collections::HashMap<String, std::collections::HashSet<String>> = std::collections::HashMap::new();
+    let mut reach: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
     let mut reach_of = |file: &str| -> std::collections::HashSet<String> {
         if let Some(s) = reach.get(file) {
             return s.clone();
@@ -224,18 +252,38 @@ fn cmd_eval(args: &[String]) -> Result<()> {
                 pairs += 1;
                 let s = reach_of(a).contains(b.as_str()) || reach_of(b).contains(a.as_str());
                 let c = cochange(a, b) || cochange(b, a);
-                if s { stat += 1; }
-                if c { co += 1; }
-                if s || c { either += 1; }
+                if s {
+                    stat += 1;
+                }
+                if c {
+                    co += 1;
+                }
+                if s || c {
+                    either += 1;
+                }
             }
         }
     }
-    let pct = |n: u32| if pairs == 0 { 0.0 } else { 100.0 * n as f32 / pairs as f32 };
-    println!("historical co-change prediction over recent commits ({pairs} same-commit file pairs):");
-    println!("  static edges alone : {:.1}%  ({stat})   ← leakage-free baseline", pct(stat));
+    let pct = |n: u32| {
+        if pairs == 0 {
+            0.0
+        } else {
+            100.0 * n as f32 / pairs as f32
+        }
+    };
+    println!(
+        "historical co-change prediction over recent commits ({pairs} same-commit file pairs):"
+    );
+    println!(
+        "  static edges alone : {:.1}%  ({stat})   ← leakage-free baseline",
+        pct(stat)
+    );
     println!("  co-change alone    : {:.1}%  ({co})", pct(co));
     println!("  fused (either)     : {:.1}%  ({either})", pct(either));
-    println!("  → co-change lifts recall by {:.1} pts over static-only", pct(either) - pct(stat));
+    println!(
+        "  → co-change lifts recall by {:.1} pts over static-only",
+        pct(either) - pct(stat)
+    );
     Ok(())
 }
 
@@ -256,7 +304,9 @@ fn cmd_mcp(args: &[String]) -> Result<()> {
         if line.trim().is_empty() {
             continue;
         }
-        let Ok(req) = serde_json::from_str::<Value>(&line) else { continue };
+        let Ok(req) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
         let id = req.get("id").cloned();
         let method = req.get("method").and_then(Value::as_str).unwrap_or("");
         if id.is_none() {
@@ -275,7 +325,9 @@ fn cmd_mcp(args: &[String]) -> Result<()> {
         };
         let resp = match result {
             Ok(r) => json!({ "jsonrpc": "2.0", "id": id, "result": r }),
-            Err(e) => json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32603, "message": e } }),
+            Err(e) => {
+                json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32603, "message": e } })
+            }
         };
         writeln!(stdout, "{resp}")?;
         stdout.flush()?;
@@ -342,10 +394,20 @@ fn mcp_text(v: Value) -> Value {
     json!({ "content": [{ "type": "text", "text": v.to_string() }] })
 }
 
-fn mcp_call(graph: &mut InMemoryGraph, root: &Path, params: Option<&Value>) -> Result<Value, String> {
+fn mcp_call(
+    graph: &mut InMemoryGraph,
+    root: &Path,
+    params: Option<&Value>,
+) -> Result<Value, String> {
     let params = params.ok_or("missing params")?;
-    let name = params.get("name").and_then(Value::as_str).ok_or("missing tool name")?;
-    let a = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+    let name = params
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or("missing tool name")?;
+    let a = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
     let str_arg = |k: &str| a.get(k).and_then(Value::as_str).map(str::to_owned);
     let usize_arg = |k: &str, d: usize| a.get(k).and_then(Value::as_u64).map_or(d, |n| n as usize);
 
@@ -353,7 +415,9 @@ fn mcp_call(graph: &mut InMemoryGraph, root: &Path, params: Option<&Value>) -> R
         "reindex" => {
             let summary = index_project(std::slice::from_ref(&root.to_path_buf()))
                 .map_err(|e| e.to_string())?;
-            *graph = RedbStore::open(db_path(root)).load().map_err(|e| e.to_string())?;
+            *graph = RedbStore::open(db_path(root))
+                .load()
+                .map_err(|e| e.to_string())?;
             Ok(mcp_text(json!({ "reindexed": summary })))
         }
         "search" => {
@@ -367,27 +431,47 @@ fn mcp_call(graph: &mut InMemoryGraph, root: &Path, params: Option<&Value>) -> R
                         || n.module_path.to_lowercase().contains(&q)
                 })
                 .collect();
-            hits.sort_by(|a, b| (a.module_path.as_str(), a.name.as_str()).cmp(&(b.module_path.as_str(), b.name.as_str())));
+            hits.sort_by(|a, b| {
+                (a.module_path.as_str(), a.name.as_str())
+                    .cmp(&(b.module_path.as_str(), b.name.as_str()))
+            });
             let total = hits.len();
-            let out: Vec<_> = hits.iter().take(limit).map(|n| json!({
-                "symbol": n.name, "qualified": n.qualified_name, "module": n.module_path,
-                "kind": format!("{:?}", n.kind),
-            })).collect();
-            Ok(mcp_text(json!({ "shown": out.len(), "total": total, "results": out })))
+            let out: Vec<_> = hits
+                .iter()
+                .take(limit)
+                .map(|n| {
+                    json!({
+                        "symbol": n.name, "qualified": n.qualified_name, "module": n.module_path,
+                        "kind": format!("{:?}", n.kind),
+                    })
+                })
+                .collect();
+            Ok(mcp_text(
+                json!({ "shown": out.len(), "total": total, "results": out }),
+            ))
         }
         "impact" => {
             let sym = str_arg("symbol").ok_or("symbol required")?;
             let seeds: Vec<_> = graph.find_by_name(&sym).into_iter().map(|n| n.id).collect();
             if seeds.is_empty() {
-                return Ok(mcp_text(json!({ "error": format!("no symbol '{sym}' — try `search`") })));
+                return Ok(mcp_text(
+                    json!({ "error": format!("no symbol '{sym}' — try `search`") }),
+                ));
             }
             let hits = query::impact(graph, &seeds, usize_arg("budget", 20));
-            let out: Vec<_> = hits.iter().map(|h| json!({
-                "symbol": h.node.name, "module": h.node.module_path,
-                "score": h.score, "weight": h.weight, "depth": h.depth,
-                "via": format!("{:?}", h.via), "risk": h.node.risk.composite,
-            })).collect();
-            Ok(mcp_text(json!({ "seeds_matched": seeds.len(), "blast_radius": out })))
+            let out: Vec<_> = hits
+                .iter()
+                .map(|h| {
+                    json!({
+                        "symbol": h.node.name, "module": h.node.module_path,
+                        "score": h.score, "weight": h.weight, "depth": h.depth,
+                        "via": format!("{:?}", h.via), "risk": h.node.risk.composite,
+                    })
+                })
+                .collect();
+            Ok(mcp_text(
+                json!({ "seeds_matched": seeds.len(), "blast_radius": out }),
+            ))
         }
         "review_focus" => {
             let changed = overlay::diff_lines(root, str_arg("base").as_deref());
@@ -403,7 +487,11 @@ fn mcp_call(graph: &mut InMemoryGraph, root: &Path, params: Option<&Value>) -> R
         }
         "neighbors" => {
             let sym = str_arg("symbol").ok_or("symbol required")?;
-            let dir = if str_arg("direction").as_deref() == Some("in") { Dir::In } else { Dir::Out };
+            let dir = if str_arg("direction").as_deref() == Some("in") {
+                Dir::In
+            } else {
+                Dir::Out
+            };
             let depth = usize_arg("depth", 1);
             let limit = usize_arg("limit", 50);
             let mut out = Vec::new();
@@ -417,7 +505,9 @@ fn mcp_call(graph: &mut InMemoryGraph, root: &Path, params: Option<&Value>) -> R
             }
             let total = out.len();
             out.truncate(limit);
-            Ok(mcp_text(json!({ "shown": out.len(), "total": total, "neighbors": out })))
+            Ok(mcp_text(
+                json!({ "shown": out.len(), "total": total, "neighbors": out }),
+            ))
         }
         "risk" => {
             let t = str_arg("target").ok_or("target required")?;
@@ -425,11 +515,17 @@ fn mcp_call(graph: &mut InMemoryGraph, root: &Path, params: Option<&Value>) -> R
             if hits.is_empty() {
                 hits = graph.nodes_in_file(&t);
             }
-            let out: Vec<_> = hits.iter().take(50).map(|n| json!({
-                "symbol": n.name, "module": n.module_path,
-                "composite": n.risk.composite, "churn": n.risk.churn,
-                "bug_density": n.risk.bug_density, "ownership": n.risk.ownership,
-            })).collect();
+            let out: Vec<_> = hits
+                .iter()
+                .take(50)
+                .map(|n| {
+                    json!({
+                        "symbol": n.name, "module": n.module_path,
+                        "composite": n.risk.composite, "churn": n.risk.churn,
+                        "bug_density": n.risk.bug_density, "ownership": n.risk.ownership,
+                    })
+                })
+                .collect();
             Ok(mcp_text(json!({ "risk": out })))
         }
         "explain_edge" => {
@@ -459,7 +555,9 @@ fn mcp_call(graph: &mut InMemoryGraph, root: &Path, params: Option<&Value>) -> R
 fn cmd_review(args: &[String]) -> Result<()> {
     let json = args.iter().any(|a| a == "--json");
     let root: PathBuf = flag_value(args, "--root").map_or_else(|| ".".into(), PathBuf::from);
-    let budget: usize = flag_value(args, "--budget").and_then(|s| s.parse().ok()).unwrap_or(15);
+    let budget: usize = flag_value(args, "--budget")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(15);
     let base = positional(args); // optional rev; default = working tree vs HEAD
 
     let changed = overlay::diff_lines(&root, base.map(String::as_str));
@@ -484,14 +582,21 @@ fn cmd_review(args: &[String]) -> Result<()> {
             }))?
         );
     } else {
-        println!("review focus ({} changed symbols), highest priority first:", r.focus.len());
+        println!(
+            "review focus ({} changed symbols), highest priority first:",
+            r.focus.len()
+        );
         for f in &r.focus {
             println!(
                 "  {:.2}  {} ({})  — {}",
                 f.review_priority,
                 f.node.name,
                 f.node.module_path,
-                if f.reasons.is_empty() { "—".into() } else { f.reasons.join(", ") }
+                if f.reasons.is_empty() {
+                    "—".into()
+                } else {
+                    f.reasons.join(", ")
+                }
             );
         }
         if !r.missing_cochange.is_empty() {
@@ -554,8 +659,14 @@ fn cmd_neighbors(args: &[String]) -> Result<()> {
     let json = args.iter().any(|a| a == "--json");
     let symbol = positional(args).context(USAGE)?.clone();
     let root: PathBuf = flag_value(args, "--root").map_or_else(|| ".".into(), PathBuf::from);
-    let dir = if args.iter().any(|a| a == "--in") { Dir::In } else { Dir::Out };
-    let depth: usize = flag_value(args, "--depth").and_then(|s| s.parse().ok()).unwrap_or(1);
+    let dir = if args.iter().any(|a| a == "--in") {
+        Dir::In
+    } else {
+        Dir::Out
+    };
+    let depth: usize = flag_value(args, "--depth")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
 
     let store = RedbStore::open(db_path(&root));
     let graph = store.load()?;
@@ -565,7 +676,11 @@ fn cmd_neighbors(args: &[String]) -> Result<()> {
         bail!("symbol not found: {symbol}");
     }
 
-    let arrow = if dir == Dir::In { "callers/importers of" } else { "neighbors of" };
+    let arrow = if dir == Dir::In {
+        "callers/importers of"
+    } else {
+        "neighbors of"
+    };
     for start in matches {
         let hops = graph.neighbors(start.id, dir, Some(&NEIGHBOR_KINDS), depth);
         if json {
@@ -581,7 +696,12 @@ fn cmd_neighbors(args: &[String]) -> Result<()> {
                 .collect();
             println!("{}", serde_json::to_string_pretty(&out)?);
         } else {
-            println!("{arrow} {} ({}) [{}]", start.name, start.module_path, format_args!("{:?}", start.kind));
+            println!(
+                "{arrow} {} ({}) [{}]",
+                start.name,
+                start.module_path,
+                format_args!("{:?}", start.kind)
+            );
             for h in &hops {
                 let indent = "  ".repeat(h.depth);
                 println!(
@@ -605,9 +725,15 @@ mod tests {
     fn positionals_skip_flag_values() {
         // --root's value must not leak as a positional (was a real bug)
         assert_eq!(positional(&v(&["--root", "/repo"])), None);
-        assert_eq!(positional(&v(&["HEAD~5", "--root", "/repo"])).unwrap(), "HEAD~5");
+        assert_eq!(
+            positional(&v(&["HEAD~5", "--root", "/repo"])).unwrap(),
+            "HEAD~5"
+        );
         assert_eq!(positional(&v(&["--root", "/repo", "sym"])).unwrap(), "sym");
-        assert_eq!(positional(&v(&["--in", "--root", "/r", "sym", "--depth", "2"])).unwrap(), "sym");
+        assert_eq!(
+            positional(&v(&["--in", "--root", "/r", "sym", "--depth", "2"])).unwrap(),
+            "sym"
+        );
         assert_eq!(positionals(&v(&["a", "--root", "/r", "b"])), vec!["a", "b"]);
     }
 }

@@ -157,280 +157,12 @@ fn collect_gql(node: TsNode, src: &[u8], out: &mut Vec<GqlOp>) {
     }
 }
 
-// ── Elixir: aliases, Absinthe fields, schema decls, remote calls, Ecto refs ──
+// ── Elixir: aliases, schema fields, entity decls, remote calls, data refs ──
+/// Reads the file's macro shapes generically (`elixir::macros`), then projects
+/// them onto these facts with the per-framework tables in `elixir::dsl` — no
+/// framework name appears in the walker itself.
 pub fn elixir(root: TsNode, src: &[u8]) -> CrossFacts {
-    let mut f = ElixirFacts::default();
-    walk_elixir(root, src, None, &mut f);
-    // Resolve module expressions to FQNs *here* (a second pass, once the whole
-    // alias table is collected) so the `resolve` layer never touches Elixir
-    // alias semantics — it just joins on FQNs.
-    for field in &mut f.fields {
-        field.module = resolve_module(&field.module, &f.aliases);
-    }
-    for (module, _, _) in &mut f.remote_calls {
-        *module = resolve_module(module, &f.aliases);
-    }
-    for (module, _) in &mut f.schema_refs {
-        *module = resolve_module(module, &f.aliases);
-    }
-    CrossFacts {
-        elixir: Some(f),
-        ..Default::default()
-    }
-}
-
-/// `scope` is the Absinthe block enclosing `node` (see `AbsintheField::scope`),
-/// `None` outside any such block.
-fn walk_elixir(node: TsNode, src: &[u8], scope: Option<&str>, facts: &mut ElixirFacts) {
-    match node.kind() {
-        "call" => {
-            if let Some(target) = node.child_by_field_name("target") {
-                match target.kind() {
-                    "identifier" => match text(target, src) {
-                        "alias" => collect_alias(node, src, facts),
-                        "schema" => {
-                            if first_arg(node).is_some_and(|a| a.kind() == "string") {
-                                facts.is_schema = true;
-                            }
-                        }
-                        "field" => collect_field(node, src, scope, facts),
-                        "import_fields" => collect_import_fields(node, src, scope, facts),
-                        "from" => collect_from(node, src, facts),
-                        _ => {}
-                    },
-                    "dot" => {
-                        if let (Some(l), Some(r)) = (
-                            target.child_by_field_name("left"),
-                            target.child_by_field_name("right"),
-                        ) {
-                            if l.kind() == "alias" && r.kind() == "identifier" {
-                                let module = text(l, src).to_owned();
-                                let line = node.start_position().row as u32 + 1;
-                                facts.remote_calls.push((
-                                    module.clone(),
-                                    text(r, src).to_owned(),
-                                    line,
-                                ));
-                                if module == "Repo" {
-                                    if let Some(a) = first_arg(node) {
-                                        if a.kind() == "alias" {
-                                            facts.schema_refs.push((text(a, src).to_owned(), line));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        "struct" => {
-            if let Some(a) = node.named_child(0) {
-                if a.kind() == "alias" {
-                    facts.schema_refs.push((
-                        text(a, src).to_owned(),
-                        node.start_position().row as u32 + 1,
-                    ));
-                }
-            }
-        }
-        _ => {}
-    }
-    let entered = absinthe_scope(node, src);
-    let inner = entered.as_deref().or(scope);
-    let mut c = node.walk();
-    for child in node.children(&mut c) {
-        walk_elixir(child, src, inner, facts);
-    }
-}
-
-/// The Absinthe scope a `do`-block call opens, if any: `query do` / `mutation do` /
-/// `subscription do` (no arguments) are the root scopes; `object :player do` and
-/// friends open a type scope. Prefixed so a literal `object :query` can't be
-/// mistaken for the root query.
-fn absinthe_scope(node: TsNode, src: &[u8]) -> Option<String> {
-    if node.kind() != "call" {
-        return None;
-    }
-    let target = node.child_by_field_name("target")?;
-    if target.kind() != "identifier" {
-        return None;
-    }
-    let name = text(target, src);
-    let mut c = node.walk();
-    if !node.children(&mut c).any(|ch| ch.kind() == "do_block") {
-        return None;
-    }
-    if GQL_ROOT_SCOPES.contains(&name) && args_node(node).is_none() {
-        return Some(name.to_owned());
-    }
-    if matches!(name, "object" | "input_object" | "interface" | "union") {
-        let atom = first_arg(node).filter(|a| a.kind() == "atom")?;
-        return Some(format!(
-            "object:{}",
-            text(atom, src).trim_start_matches(':')
-        ));
-    }
-    None
-}
-
-fn args_node(call: TsNode) -> Option<TsNode> {
-    let mut c = call.walk();
-    // bound to a local so the cursor's borrow ends before returning
-    let found = call.children(&mut c).find(|n| n.kind() == "arguments");
-    found
-}
-
-/// Resolve an Elixir module expression (possibly an alias local name) to a FQN,
-/// using a file's alias table. Elixir-specific, so it lives in `lang`.
-pub fn resolve_module(expr: &str, aliases: &HashMap<String, String>) -> String {
-    if let Some(fqn) = aliases.get(expr) {
-        return fqn.clone();
-    }
-    if let Some((head, rest)) = expr.split_once('.') {
-        if let Some(fqn) = aliases.get(head) {
-            return format!("{fqn}.{rest}");
-        }
-    }
-    expr.to_owned()
-}
-
-fn first_arg(call: TsNode) -> Option<TsNode> {
-    args_node(call)?.named_child(0)
-}
-
-fn collect_alias(call: TsNode, src: &[u8], facts: &mut ElixirFacts) {
-    let Some(arg) = first_arg(call) else { return };
-    match arg.kind() {
-        "alias" => {
-            let fqn = text(arg, src);
-            if let Some(last) = fqn.rsplit('.').next() {
-                facts.aliases.insert(last.to_owned(), fqn.to_owned());
-            }
-        }
-        "dot" => {
-            let (Some(l), Some(r)) = (
-                arg.child_by_field_name("left"),
-                arg.child_by_field_name("right"),
-            ) else {
-                return;
-            };
-            let prefix = text(l, src);
-            if r.kind() == "tuple" {
-                let mut c = r.walk();
-                for t in r.named_children(&mut c) {
-                    if t.kind() == "alias" {
-                        let name = text(t, src);
-                        facts
-                            .aliases
-                            .insert(name.to_owned(), format!("{prefix}.{name}"));
-                    }
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
-fn collect_field(call: TsNode, src: &[u8], scope: Option<&str>, facts: &mut ElixirFacts) {
-    // a `field` outside any Absinthe block is something else (e.g. an Ecto
-    // `schema` column) — no scope, no join key, so don't guess one
-    let Some(scope) = scope else { return };
-    let Some(atom) = first_arg(call) else { return };
-    if atom.kind() != "atom" {
-        return;
-    }
-    let field = camelize(text(atom, src).trim_start_matches(':'));
-    if let Some((module, func)) = find_resolve(call, src) {
-        facts.fields.push(AbsintheField {
-            scope: scope.to_owned(),
-            field,
-            module,
-            func,
-        });
-    }
-}
-
-fn collect_import_fields(call: TsNode, src: &[u8], scope: Option<&str>, facts: &mut ElixirFacts) {
-    let (Some(scope), Some(atom)) = (scope, first_arg(call)) else {
-        return;
-    };
-    if atom.kind() != "atom" {
-        return;
-    }
-    let included = format!("object:{}", text(atom, src).trim_start_matches(':'));
-    facts.scope_includes.push((scope.to_owned(), included));
-}
-
-/// The resolver a `field` declares, in either Absinthe spelling:
-/// `field :x, :t do resolve(&M.f/3) end` or `field :x, :t, resolve: &M.f/3`.
-/// `None` when the resolver isn't a plain module function (`dataloader(...)`, an
-/// inline `fn`) — under-linking beats inventing an edge.
-fn find_resolve(call: TsNode, src: &[u8]) -> Option<(String, String)> {
-    let mut stack = vec![call];
-    while let Some(n) = stack.pop() {
-        match n.kind() {
-            "call"
-                if n.child_by_field_name("target")
-                    .is_some_and(|t| t.kind() == "identifier" && text(t, src) == "resolve") =>
-            {
-                return capture_mod_func(n, src);
-            }
-            "pair"
-                if n.child_by_field_name("key")
-                    .is_some_and(|k| text(k, src).trim().trim_end_matches(':') == "resolve") =>
-            {
-                return capture_mod_func(n.child_by_field_name("value")?, src);
-            }
-            _ => {}
-        }
-        let mut c = n.walk();
-        for ch in n.children(&mut c) {
-            stack.push(ch);
-        }
-    }
-    None
-}
-
-fn capture_mod_func(node: TsNode, src: &[u8]) -> Option<(String, String)> {
-    let mut stack = vec![node];
-    while let Some(n) = stack.pop() {
-        // an inline `fn ... end` resolver has no single named resolver function;
-        // whatever it calls is picked up as a remote call instead
-        if n.kind() == "anonymous_function" {
-            continue;
-        }
-        if n.kind() == "dot" {
-            if let (Some(l), Some(r)) = (
-                n.child_by_field_name("left"),
-                n.child_by_field_name("right"),
-            ) {
-                if l.kind() == "alias" && r.kind() == "identifier" {
-                    return Some((text(l, src).to_owned(), text(r, src).to_owned()));
-                }
-            }
-        }
-        let mut c = n.walk();
-        for ch in n.children(&mut c) {
-            stack.push(ch);
-        }
-    }
-    None
-}
-
-fn collect_from(call: TsNode, src: &[u8], facts: &mut ElixirFacts) {
-    let Some(arg) = first_arg(call) else { return };
-    if arg.kind() == "binary_operator" {
-        if let Some(r) = arg.child_by_field_name("right") {
-            if r.kind() == "alias" {
-                facts.schema_refs.push((
-                    text(r, src).to_owned(),
-                    call.start_position().row as u32 + 1,
-                ));
-            }
-        }
-    }
+    crate::elixir::dsl::cross_facts(&crate::elixir::macros::scan(root, src))
 }
 
 /// snake_case atom → camelCase (Absinthe LanguageConventions default).
@@ -469,23 +201,22 @@ mod tests {
         assert_eq!(camelize("player"), "player");
     }
 
-    #[test]
-    fn resolve_module_via_alias() {
-        let mut al = HashMap::new();
-        al.insert(
-            "PlayerResolver".to_string(),
-            "App.Resolvers.PlayerResolver".to_string(),
-        );
-        assert_eq!(
-            resolve_module("PlayerResolver", &al),
-            "App.Resolvers.PlayerResolver"
-        );
-        assert_eq!(resolve_module("Unknown", &al), "Unknown");
-    }
-
     fn elixir_facts_of(src: &str) -> ElixirFacts {
         let t = parse(crate::elixir::Adapter::new().grammar(), src);
         elixir(t.root_node(), src.as_bytes()).elixir.unwrap()
+    }
+
+    /// Every entity argument counts as a reference, not just the first: a joined
+    /// table and a preloaded association are as much a dependency as the primary
+    /// one. Non-entity modules ride along harmlessly — the link step keeps only
+    /// modules that actually declared a `schema "table"`.
+    #[test]
+    fn data_refs_cover_every_entity_argument() {
+        let f = elixir_facts_of("defmodule S do\n  def q(id) do\n    from p in Player, join: t in Team, where: p.id == ^id\n    Repo.preload(p, Game)\n    Repo.get(Player, id)\n  end\nend\n");
+        let refs: Vec<&str> = f.schema_refs.iter().map(|(m, _)| m.as_str()).collect();
+        for entity in ["Player", "Team", "Game"] {
+            assert!(refs.contains(&entity), "missing {entity} in {refs:?}");
+        }
     }
 
     #[test]

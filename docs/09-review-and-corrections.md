@@ -82,3 +82,53 @@ A second review (correctness + readability + extensibility + MCP-usability) drov
 **MCP agent-usability:** the server now indexes-if-missing on startup, and exposes `search` (find symbols/paths by substring — the discovery entry point), `explain_edge` (edge provenance: kind/confidence/site), and `reindex` (rebuild after edits — fixes staleness), with bounded output (`{shown,total}`) so results fit an agent's token budget. Verified end-to-end over stdio JSON-RPC incl. error cases.
 
 **Still open:** rename reconciliation (`git log --follow`); weight/decay tuning on labelled data; holdout eval; per-framework cross-service detectors beyond GraphQL/Ecto (HTTP/gRPC/pub-sub).
+
+## Round 3 — Absinthe field scoping + generic Elixir macro seam (post-v3)
+
+**Correctness: GraphQL producer keying.** The producer map was keyed on the field
+name alone, so same-named fields on different types overwrote each other and one
+resolver silently won the key. It is now keyed on `(root scope, field)`:
+
+- extraction records the enclosing Absinthe block on each field (`query` /
+  `mutation` / `subscription` for root fields, `object:<name>` for type fields)
+  and the GraphQL document side records each operation's own root type;
+- `import_fields` is recorded as a scope inclusion and followed transitively at
+  link time, since real Absinthe schemas declare root fields in
+  `object :x_queries` blocks and pull them into `query do` (5noobs does this for
+  every one of its ~30 query groups) — without it, scoping alone would have
+  dropped the whole chain;
+- N candidates for one field now emit N edges at `0.9/N` confidence instead of
+  one fabricated edge (invariant 5).
+
+Also fixed: the keyword spelling `field :x, :t, resolve: &M.f/3` was never
+extracted (only the block form), and a resolver that names no single function
+(`dataloader(...)`, an inline `fn`) no longer has a function guessed out of its
+body. A stale extract cache row is now a cache miss rather than a hard error, so
+a schema change to the facts re-extracts instead of failing the index.
+
+**Extensibility: the Elixir macro seam.** The Absinthe/Ecto macro names were
+hard-coded in the extraction walker, which contradicts the "adapter seam is
+data" rule — supporting Ash or a Phoenix router meant new Rust match arms. Split
+in two:
+
+- `lang::elixir::macros` — framework-blind. Elixir declarations are all macro
+  `call`s of one shape (`name :atom, opts do ... end`), so it reads that shape
+  once: macro name, enclosing block chain, atom/string/module arguments,
+  `&M.f/N` references, keyword references, alias→FQN resolution.
+- `lang::elixir::dsl` — the only place a framework is named: small tables
+  (`ABSINTHE`, `ECTO`) saying which macro opens a type block, which declares a
+  member, which names a resolver, which declares an entity. Adding a DSL adds a
+  table, not a walker.
+
+This revises round 2's "Tier 2–3 are per-framework by nature" — the *shape* is
+generic after all; only the *mapping* is per-framework, and the mapping is data.
+
+Verified against 5noobs (web + api, 3353 files): extracted Absinthe fields and
+scope inclusions are byte-identical to the pre-refactor implementation (310
+fields, 68 inclusions), and `GraphqlCall` edges are unchanged at 343. Entity
+references widened from the first argument to every entity argument
+(`from p in Player, join: t in Team`, `Repo.preload(x, Game)`): 1080 → 1135
+refs, `DbQuery` 827 → 875. Non-entity modules that ride along are dropped at
+link time, which only keeps modules that declared a `schema "table"`. The
+`index` summary counted `graphql + db` under the label "graphql"; it now reports
+them separately.

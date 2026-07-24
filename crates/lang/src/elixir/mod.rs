@@ -2,6 +2,9 @@
 //! `defmodule`/`def`/`defp` are macro `call`s — so tags.scm leans on predicates
 //! (`#eq?`/`#any-of?` on the call target), which the parse layer now evaluates.
 
+pub mod dsl;
+pub mod macros;
+
 use crate::LanguageAdapter;
 
 pub struct Adapter;
