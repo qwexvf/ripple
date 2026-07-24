@@ -1,0 +1,16 @@
+[package]
+name = "store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ir = { workspace = true }
+parse = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+redb = "2"
+
+[dev-dependencies]
+ir = { workspace = true }
+parse = { workspace = true }

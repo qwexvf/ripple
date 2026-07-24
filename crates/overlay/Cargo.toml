@@ -1,0 +1,10 @@
+[package]
+name = "overlay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ir = { workspace = true }
+anyhow = { workspace = true }
+git2 = { workspace = true }

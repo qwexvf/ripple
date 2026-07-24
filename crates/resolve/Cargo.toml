@@ -1,0 +1,18 @@
+[package]
+name = "resolve"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ir = { workspace = true }
+parse = { workspace = true }
+lang = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+walkdir = "2"
+blake3 = "1"
+rayon = { workspace = true }
+
+[dev-dependencies]
+ir = { workspace = true }

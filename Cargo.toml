@@ -1,0 +1,36 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ir",
+    "crates/parse",
+    "crates/lang",
+    "crates/resolve",
+    "crates/store",
+    "crates/overlay",
+    "crates/query",
+    "crates/cli",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/qwexvf/ripple"
+
+[workspace.dependencies]
+ir = { path = "crates/ir" }
+parse = { path = "crates/parse" }
+lang = { path = "crates/lang" }
+resolve = { path = "crates/resolve" }
+store = { path = "crates/store" }
+overlay = { path = "crates/overlay" }
+query = { path = "crates/query" }
+git2 = { version = "0.20", default-features = false }
+tree-sitter = "0.25"
+tree-sitter-typescript = "0.23"
+tree-sitter-elixir = "0.3"
+tree-sitter-graphql = "0.1"
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"

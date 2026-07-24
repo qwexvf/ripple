@@ -1,0 +1,20 @@
+[package]
+name = "ripple-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ripple"
+path = "src/main.rs"
+
+[dependencies]
+ir = { workspace = true }
+lang = { workspace = true }
+parse = { workspace = true }
+resolve = { workspace = true }
+store = { workspace = true }
+overlay = { workspace = true }
+query = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }

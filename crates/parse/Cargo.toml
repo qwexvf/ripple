@@ -1,0 +1,13 @@
+[package]
+name = "parse"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ir = { workspace = true }
+lang = { workspace = true }
+tree-sitter = { workspace = true }
+streaming-iterator = "0.1"
+serde = { workspace = true }
+anyhow = { workspace = true }
