@@ -33,14 +33,18 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
             NodeKind::Class => {
                 fqn_to_module.insert(n.qualified_name.as_str(), n.module_path.as_str());
                 fqn_to_class.insert(n.qualified_name.as_str(), n.id);
-                fqns_in_file.entry(n.module_path.as_str()).or_default().push(n.qualified_name.as_str());
+                fqns_in_file
+                    .entry(n.module_path.as_str())
+                    .or_default()
+                    .push(n.qualified_name.as_str());
             }
             NodeKind::Function | NodeKind::Method => {
                 fn_by_loc.insert((n.module_path.as_str(), n.name.as_str()), n.id);
-                fn_spans
-                    .entry(n.module_path.as_str())
-                    .or_default()
-                    .push((n.span.start_line, n.span.end_line, n.id));
+                fn_spans.entry(n.module_path.as_str()).or_default().push((
+                    n.span.start_line,
+                    n.span.end_line,
+                    n.id,
+                ));
             }
             _ => {}
         }
@@ -56,39 +60,88 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
         }
     }
 
-    // GraphQL operation → root fields (aggregated across all .gql files)
-    let mut op_fields: HashMap<&str, Vec<&str>> = HashMap::new();
+    // GraphQL operation name → the (scope, root field) pairs it selects,
+    // aggregated across all .gql files
+    let mut op_fields: HashMap<&str, Vec<(&str, &str)>> = HashMap::new();
     for f in files {
-        for (op, field) in &f.extract.cross.gql_ops {
-            op_fields.entry(op.as_str()).or_default().push(field.as_str());
+        for op in &f.extract.cross.gql_ops {
+            op_fields
+                .entry(op.name.as_str())
+                .or_default()
+                .push((op.scope.as_str(), op.field.as_str()));
         }
     }
 
-    // producer: root field (camelCase) → resolver function symbol
-    let mut producer: HashMap<&str, SymbolId> = HashMap::new();
+    // scope → scopes whose fields it includes (Absinthe `import_fields`)
+    let mut includes: HashMap<&str, Vec<&str>> = HashMap::new();
     for f in files {
-        let Some(ex) = &f.extract.cross.elixir else { continue };
-        for (field, fqn, func) in &ex.fields {
-            // `fqn` is already resolved (alias→FQN) at extraction time
-            if let Some(&file) = fqn_to_module.get(fqn.as_str()) {
-                if let Some(&id) = fn_by_loc.get(&(file, func.as_str())) {
-                    producer.insert(field.as_str(), id);
-                }
+        let Some(ex) = &f.extract.cross.elixir else {
+            continue;
+        };
+        for (scope, included) in &ex.scope_includes {
+            includes
+                .entry(scope.as_str())
+                .or_default()
+                .push(included.as_str());
+        }
+    }
+
+    // producer: (root scope, field) → resolver functions. A field reached from a
+    // root scope through `import_fields` is a root field too, so each declared
+    // scope is expanded to every root scope that pulls it in. More than one
+    // candidate means the match is ambiguous — all are kept and the confidence
+    // is split, never collapsed to a single fabricated edge.
+    let roots_by_scope = roots_by_scope(&includes);
+    let mut producer: HashMap<(&str, &str), Vec<SymbolId>> = HashMap::new();
+    for f in files {
+        let Some(ex) = &f.extract.cross.elixir else {
+            continue;
+        };
+        for field in &ex.fields {
+            // `field.module` is already resolved (alias→FQN) at extraction time
+            let Some(&file) = fqn_to_module.get(field.module.as_str()) else {
+                continue;
+            };
+            let Some(&id) = fn_by_loc.get(&(file, field.func.as_str())) else {
+                continue;
+            };
+            let Some(roots) = roots_by_scope.get(field.scope.as_str()) else {
+                continue;
+            };
+            for root in roots {
+                producer
+                    .entry((*root, field.field.as_str()))
+                    .or_default()
+                    .push(id);
             }
         }
+    }
+    for ids in producer.values_mut() {
+        ids.sort_unstable();
+        ids.dedup();
     }
 
     // ── build edges (deduped by src/dst/kind) ──
     let mut edges = Vec::new();
     let mut seen: HashSet<(SymbolId, SymbolId, u8)> = HashSet::new();
-    let mut emit = |edges: &mut Vec<Edge>, src: SymbolId, dst: SymbolId, kind: EdgeKind, conf: f32, line: u32| {
+    let mut emit = |edges: &mut Vec<Edge>,
+                    src: SymbolId,
+                    dst: SymbolId,
+                    kind: EdgeKind,
+                    conf: f32,
+                    line: u32| {
         if src != dst && seen.insert((src, dst, kind as u8)) {
             edges.push(Edge {
                 src,
                 dst,
                 kind,
                 confidence: conf,
-                site: Span { start_line: line, start_col: 1, end_line: line, end_col: 1 },
+                site: Span {
+                    start_line: line,
+                    start_col: 1,
+                    end_line: line,
+                    end_col: 1,
+                },
             });
             true
         } else {
@@ -104,10 +157,17 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
         }
         let src_id = SymbolId::module(&f.module_path);
         for op in &f.extract.cross.ts_docs {
-            let Some(fields) = op_fields.get(op.as_str()) else { continue };
-            for field in fields {
-                if let Some(&resolver) = producer.get(field) {
-                    if emit(&mut edges, src_id, resolver, EdgeKind::GraphqlCall, CONF_GRAPHQL, 0) {
+            let Some(fields) = op_fields.get(op.as_str()) else {
+                continue;
+            };
+            for key in fields {
+                let Some(resolvers) = producer.get(key) else {
+                    continue;
+                };
+                // N candidates for one field → 1/N each (docs/06-risk-and-queries.md)
+                let conf = CONF_GRAPHQL / resolvers.len() as f32;
+                for &resolver in resolvers {
+                    if emit(&mut edges, src_id, resolver, EdgeKind::GraphqlCall, conf, 0) {
                         graphql += 1;
                     }
                 }
@@ -119,17 +179,27 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
     let mut elixir_calls = 0;
     let mut db = 0;
     for f in files {
-        let Some(ex) = &f.extract.cross.elixir else { continue };
+        let Some(ex) = &f.extract.cross.elixir else {
+            continue;
+        };
         let empty = Vec::new();
         let spans = fn_spans.get(f.module_path.as_str()).unwrap_or(&empty);
 
         for (fqn, func, line) in &ex.remote_calls {
-            let (Some(&file), Some(caller)) = (fqn_to_module.get(fqn.as_str()), enclosing(spans, *line))
+            let (Some(&file), Some(caller)) =
+                (fqn_to_module.get(fqn.as_str()), enclosing(spans, *line))
             else {
                 continue;
             };
             if let Some(&target) = fn_by_loc.get(&(file, func.as_str())) {
-                if emit(&mut edges, caller, target, EdgeKind::Calls, CONF_ELIXIR_CALL, *line) {
+                if emit(
+                    &mut edges,
+                    caller,
+                    target,
+                    EdgeKind::Calls,
+                    CONF_ELIXIR_CALL,
+                    *line,
+                ) {
                     elixir_calls += 1;
                 }
             }
@@ -138,17 +208,55 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
             if !schema_fqns.contains(fqn.as_str()) {
                 continue;
             }
-            let (Some(&target), Some(caller)) = (fqn_to_class.get(fqn.as_str()), enclosing(spans, *line))
+            let (Some(&target), Some(caller)) =
+                (fqn_to_class.get(fqn.as_str()), enclosing(spans, *line))
             else {
                 continue;
             };
-            if emit(&mut edges, caller, target, EdgeKind::DbQuery, CONF_DB_QUERY, *line) {
+            if emit(
+                &mut edges,
+                caller,
+                target,
+                EdgeKind::DbQuery,
+                CONF_DB_QUERY,
+                *line,
+            ) {
                 db += 1;
             }
         }
     }
 
-    CrossEdges { edges, graphql, elixir_calls, db }
+    CrossEdges {
+        edges,
+        graphql,
+        elixir_calls,
+        db,
+    }
+}
+
+/// For every declared scope, the root scopes whose fields it contributes to —
+/// itself if it *is* a root, plus any root that includes it (transitively) via
+/// `import_fields`. Scopes no root reaches are absent: their fields are
+/// type-level, not selectable as a document's root field.
+fn roots_by_scope<'a>(includes: &HashMap<&'a str, Vec<&'a str>>) -> HashMap<&'a str, Vec<&'a str>> {
+    let mut out: HashMap<&'a str, Vec<&'a str>> = HashMap::new();
+    for root in lang::cross::GQL_ROOT_SCOPES {
+        let mut seen: HashSet<&'a str> = HashSet::new();
+        let mut queue = vec![root];
+        while let Some(scope) = queue.pop() {
+            if !seen.insert(scope) {
+                continue;
+            }
+            out.entry(scope).or_default().push(root);
+            if let Some(next) = includes.get(scope) {
+                queue.extend(next);
+            }
+        }
+    }
+    for roots in out.values_mut() {
+        roots.sort_unstable();
+    }
+    out
 }
 
 /// Innermost function span containing `line` (smallest range), so a call inside
@@ -160,4 +268,3 @@ fn enclosing(spans: &[(u32, u32, SymbolId)], line: u32) -> Option<SymbolId> {
         .min_by_key(|(s, e, _)| e - s)
         .map(|&(.., id)| id)
 }
-

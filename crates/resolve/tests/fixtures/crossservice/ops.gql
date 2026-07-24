@@ -1,0 +1,17 @@
+query CurrentPlayer {
+  currentPlayer {
+    id
+  }
+}
+
+mutation FollowPlayer {
+  followPlayer {
+    id
+  }
+}
+
+query Duplicated {
+  duplicated {
+    id
+  }
+}

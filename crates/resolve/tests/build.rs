@@ -127,11 +127,100 @@ fn multi_root_merges_and_namespaces() {
 
     assert_eq!(r.roots.len(), 2);
     // module paths are namespaced by root tag (dir name) so both repos coexist
-    assert!(r.result.nodes.iter().any(|n| n.module_path.starts_with("proj/")));
-    assert!(r.result.nodes.iter().any(|n| n.module_path.starts_with("members/")));
+    assert!(r
+        .result
+        .nodes
+        .iter()
+        .any(|n| n.module_path.starts_with("proj/")));
+    assert!(r
+        .result
+        .nodes
+        .iter()
+        .any(|n| n.module_path.starts_with("members/")));
     // symbols from both roots are present
     assert!(r.result.nodes.iter().any(|n| n.name == "helper"));
     assert!(r.result.nodes.iter().any(|n| n.name == "Service"));
+}
+
+/// TS document → GraphQL operation → Absinthe root field → Elixir resolver,
+/// including the `import_fields` hop every real Absinthe schema uses. The
+/// same-named field on `object :player` must NOT be linked: it isn't a root
+/// field, and before scoping it collided with the root one.
+#[test]
+fn links_graphql_operations_to_root_field_resolvers() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/crossservice");
+    let indexed = resolve::build_incremental(
+        std::slice::from_ref(&root),
+        &std::collections::HashMap::new(),
+    )
+    .unwrap();
+    // cross-service linking is its own pass over the built graph (as in `ripple index`)
+    let r = resolve::link_cross_service(&indexed.files, &indexed.result.nodes);
+
+    let page = SymbolId::module("page.ts");
+    let me = SymbolId::of("resolver.ex", "me");
+    let follow = SymbolId::of("resolver.ex", "follow");
+    let decoy = SymbolId::of("resolver.ex", "decoy");
+
+    let targets: Vec<SymbolId> = r
+        .edges
+        .iter()
+        .filter(|e| e.src == page && e.kind == EdgeKind::GraphqlCall)
+        .map(|e| e.dst)
+        .collect();
+
+    assert!(
+        targets.contains(&me),
+        "query CurrentPlayer should reach the imported root field's resolver"
+    );
+    assert!(
+        targets.contains(&follow),
+        "mutation FollowPlayer should reach its resolver"
+    );
+    assert!(
+        !targets.contains(&decoy),
+        "a same-named field on object :player is not a root field and must not be linked"
+    );
+
+    // unambiguous match → full confidence, not split
+    let conf = r
+        .edges
+        .iter()
+        .find(|e| e.src == page && e.dst == me && e.kind == EdgeKind::GraphqlCall)
+        .map(|e| e.confidence)
+        .unwrap();
+    assert!(
+        (conf - 0.9).abs() < f32::EPSILON,
+        "expected 0.9, got {conf}"
+    );
+}
+
+/// Two imported objects declaring the same root field: both candidates are kept
+/// and share the confidence, rather than one silently winning the key.
+#[test]
+fn ambiguous_root_field_splits_confidence() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/crossservice");
+    let indexed = resolve::build_incremental(
+        std::slice::from_ref(&root),
+        &std::collections::HashMap::new(),
+    )
+    .unwrap();
+    let r = resolve::link_cross_service(&indexed.files, &indexed.result.nodes);
+
+    let page = SymbolId::module("page.ts");
+    let legacy = SymbolId::of("resolver.ex", "legacy");
+
+    // `query Duplicated` matches both :player_queries and :legacy_queries
+    let legacy_edge = r
+        .edges
+        .iter()
+        .find(|e| e.src == page && e.dst == legacy && e.kind == EdgeKind::GraphqlCall)
+        .expect("ambiguous candidate should still be linked");
+    assert!(
+        (legacy_edge.confidence - 0.45).abs() < 1e-6,
+        "2 candidates should halve confidence, got {}",
+        legacy_edge.confidence
+    );
 }
 
 #[test]

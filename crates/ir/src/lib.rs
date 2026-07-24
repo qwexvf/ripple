@@ -10,7 +10,9 @@ use serde::{Deserialize, Serialize};
 /// keyed on module-relative path + qualified name + signature discriminator so
 /// overloads don't collide and file moves don't orphan history. v0 fills the
 /// discriminator with the span until signature capture lands in M2.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// `Ord` is derived so callers can put ids in a total order — the determinism
+/// invariant needs a stable tie-break key, not a meaningful ordering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct SymbolId(pub u64);
 
 impl SymbolId {

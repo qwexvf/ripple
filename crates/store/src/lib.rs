@@ -89,7 +89,11 @@ impl GraphStore for RedbStore {
         if let Ok(t) = rtx.open_table(EXTRACTS) {
             for row in t.iter()? {
                 let (_k, v) = row?;
-                let f: CachedFile = serde_json::from_slice(v.value())?;
+                // a row written by an older extract schema is a cache miss, not a
+                // failure — the file is simply re-extracted
+                let Ok(f) = serde_json::from_slice::<CachedFile>(v.value()) else {
+                    continue;
+                };
                 out.insert(f.module_path.clone(), f);
             }
         }
@@ -97,8 +101,12 @@ impl GraphStore for RedbStore {
     }
 
     fn load(&self) -> Result<InMemoryGraph> {
-        let db = Database::open(&self.path)
-            .with_context(|| format!("open redb at {} (run `ripple index` first)", self.path.display()))?;
+        let db = Database::open(&self.path).with_context(|| {
+            format!(
+                "open redb at {} (run `ripple index` first)",
+                self.path.display()
+            )
+        })?;
         let rtx = db.begin_read()?;
 
         let mut nodes = Vec::new();
@@ -183,8 +191,13 @@ impl InMemoryGraph {
     /// All nodes whose module path equals `path` or ends with `/path` (a path
     /// suffix on a segment boundary, so `bar.ts` won't match `foobar.ts`).
     pub fn nodes_in_file(&self, path: &str) -> Vec<&Node> {
-        let matches = |mp: &str| mp == path || mp.strip_suffix(path).is_some_and(|p| p.ends_with('/'));
-        let mut v: Vec<&Node> = self.nodes.values().filter(|n| matches(&n.module_path)).collect();
+        let matches =
+            |mp: &str| mp == path || mp.strip_suffix(path).is_some_and(|p| p.ends_with('/'));
+        let mut v: Vec<&Node> = self
+            .nodes
+            .values()
+            .filter(|n| matches(&n.module_path))
+            .collect();
         v.sort_by_key(|n| (n.module_path.clone(), n.span.start_line));
         v
     }
