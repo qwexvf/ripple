@@ -5,7 +5,7 @@
 
 use ir::{Edge, EdgeKind, Node, SymbolId};
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use store::InMemoryGraph;
 
 /// One node reached by a change, with how strongly it's impacted.
@@ -146,6 +146,119 @@ pub fn reachable_modules(
     }
     set
 }
+
+// ── path ──────────────────────────────────────────────────────────────────
+
+/// One step of a path: the edge taken, and the node it lands on.
+pub struct Step {
+    pub edge: Edge,
+    pub node: Node,
+}
+
+/// A route from one symbol to another, with how much of the claim survives it.
+pub struct Route {
+    pub steps: Vec<Step>,
+    /// product of the edge confidences — a five-hop route of 0.9s is not a 0.9 claim
+    pub confidence: f32,
+}
+
+/// Routes from `from` to `to` along dependency direction, shortest first.
+///
+/// This is the question the graph exists to answer and could not: "how does this page
+/// reach that table?" needed one `neighbors` call per hop, and the answer had to be
+/// assembled by hand — and where a name is ambiguous (`get` is seven resolvers) the
+/// hops could not even be attributed to each other.
+///
+/// Bounded DFS rather than BFS: every route is wanted, not just one per node, and the
+/// depth cap is what keeps that finite. Deterministic — edges are expanded in
+/// (dst, site) order and routes are ranked by (length, −confidence, ids).
+pub fn paths(
+    graph: &InMemoryGraph,
+    from: SymbolId,
+    to: SymbolId,
+    max_depth: usize,
+    limit: usize,
+) -> Vec<Route> {
+    let mut found: Vec<Route> = Vec::new();
+    let mut on_path: HashSet<SymbolId> = HashSet::new();
+    on_path.insert(from);
+    let mut steps: Vec<Step> = Vec::new();
+    walk(
+        graph,
+        from,
+        to,
+        max_depth,
+        &mut on_path,
+        &mut steps,
+        &mut found,
+    );
+
+    found.sort_by(|a, b| {
+        a.steps
+            .len()
+            .cmp(&b.steps.len())
+            .then(b.confidence.total_cmp(&a.confidence))
+            .then_with(|| {
+                let ids = |r: &Route| r.steps.iter().map(|s| s.node.id.0).collect::<Vec<_>>();
+                ids(a).cmp(&ids(b))
+            })
+    });
+    found.truncate(limit);
+    found
+}
+
+fn walk(
+    graph: &InMemoryGraph,
+    at: SymbolId,
+    to: SymbolId,
+    left: usize,
+    on_path: &mut HashSet<SymbolId>,
+    steps: &mut Vec<Step>,
+    found: &mut Vec<Route>,
+) {
+    if left == 0 || found.len() >= MAX_ROUTES {
+        return;
+    }
+    let mut out: Vec<&Edge> = graph.out_edges(at).iter().collect();
+    out.sort_by(|a, b| {
+        a.dst
+            .0
+            .cmp(&b.dst.0)
+            .then(a.site.start_line.cmp(&b.site.start_line))
+    });
+    for e in out {
+        // a co-change edge is a statistical companion, not a route anything travels
+        if e.kind == EdgeKind::ChangesWith || !on_path.insert(e.dst) {
+            continue;
+        }
+        if let Some(node) = graph.get(e.dst) {
+            steps.push(Step {
+                edge: e.clone(),
+                node: node.clone(),
+            });
+            if e.dst == to {
+                found.push(Route {
+                    confidence: steps.iter().map(|s| s.edge.confidence).product(),
+                    steps: steps
+                        .iter()
+                        .map(|s| Step {
+                            edge: s.edge.clone(),
+                            node: s.node.clone(),
+                        })
+                        .collect(),
+                });
+            } else {
+                walk(graph, e.dst, to, left - 1, on_path, steps, found);
+            }
+            steps.pop();
+        }
+        on_path.remove(&e.dst);
+    }
+}
+
+/// Stop enumerating here. A hub symbol can sit on thousands of routes, and nobody
+/// reads the four-thousandth — but a silent stop would look like "there are no more".
+const MAX_ROUTES: usize = 2000;
 
 // ── review_focus ──────────────────────────────────────────────────────────
 
@@ -312,6 +425,63 @@ mod tests {
             site: span(),
             source: ir::EdgeSource::Extracted,
         }
+    }
+
+    fn edge(src: &Node, dst: &Node, kind: EdgeKind, confidence: f32) -> Edge {
+        Edge {
+            src: src.id,
+            dst: dst.id,
+            kind,
+            confidence,
+            site: span(),
+            source: ir::EdgeSource::Extracted,
+        }
+    }
+
+    /// The front-to-DB question: a page reaches a table through a resolver and a
+    /// context function, and the route has to come back as one answer with the
+    /// confidence of the whole chain — not one `neighbors` call per hop.
+    #[test]
+    fn a_route_crosses_every_hop_and_multiplies_its_confidence() {
+        let page = node("page.tsx", "Page");
+        let resolver = node("resolver.ex", "get");
+        let context = node("posts.ex", "get_post");
+        let schema = node("post.ex", "Post");
+        let cochange = node("unrelated.ex", "Unrelated");
+        let graph = InMemoryGraph::from_parts(
+            vec![
+                page.clone(),
+                resolver.clone(),
+                context.clone(),
+                schema.clone(),
+                cochange.clone(),
+            ],
+            vec![
+                edge(&page, &resolver, EdgeKind::GraphqlCall, 0.9),
+                edge(&resolver, &context, EdgeKind::Calls, 0.9),
+                edge(&context, &schema, EdgeKind::DbQuery, 0.85),
+                // a companion, not a route: nothing travels a co-change edge
+                edge(&page, &cochange, EdgeKind::ChangesWith, 1.0),
+                edge(&cochange, &schema, EdgeKind::ChangesWith, 1.0),
+            ],
+        );
+
+        let routes = paths(&graph, page.id, schema.id, 6, 3);
+        assert_eq!(routes.len(), 1, "one real route, and not the co-change one");
+        let hops: Vec<&str> = routes[0]
+            .steps
+            .iter()
+            .map(|s| s.node.name.as_str())
+            .collect();
+        assert_eq!(hops, vec!["get", "get_post", "Post"]);
+        assert!(
+            (routes[0].confidence - 0.9 * 0.9 * 0.85).abs() < 1e-6,
+            "a three-hop route of 0.9s is not a 0.9 claim: {}",
+            routes[0].confidence
+        );
+
+        // the depth cap is what makes enumeration finite
+        assert!(paths(&graph, page.id, schema.id, 2, 3).is_empty());
     }
 
     /// A hit has to say where it was reached from, and a truncated answer has to say

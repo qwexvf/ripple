@@ -23,6 +23,7 @@ fn main() -> Result<()> {
         Some("neighbors") => cmd_neighbors(&args[1..]),
         Some("impact") => cmd_impact(&args[1..]),
         Some("review") => cmd_review(&args[1..]),
+        Some("path") => cmd_path(&args[1..]),
         Some("risk") => cmd_risk(&args[1..]),
         Some("mcp") => cmd_mcp(&args[1..]),
         Some("eval") => cmd_eval(&args[1..]),
@@ -32,7 +33,7 @@ fn main() -> Result<()> {
     }
 }
 
-const USAGE: &str = "usage:\n  ripple parse <file> [--json]\n  ripple index <path>...\n  ripple neighbors <symbol> [--in|--out] [--depth N] [--root <path>] [--json]\n  ripple impact <symbol>... [--budget N] [--root <path>] [--json] [--verify lsp]\n  ripple review [<base>] [--budget N] [--root <path>] [--json] [--verify lsp]\n    --verify lsp [--verify-budget 2s] [--floor-contradicted|--drop-contradicted]  (upgrade call edges from a language server)\n  ripple risk <symbol|file> [--root <path>] [--json]\n  ripple mcp [--root <path>]   (MCP server over stdio for AI agents)\n  ripple lsp doctor [--root <path>] [--budget 10s] [--json]   (are language servers usable here?)";
+const USAGE: &str = "usage:\n  ripple parse <file> [--json]\n  ripple index <path>...\n  ripple neighbors <symbol> [--in|--out] [--depth N] [--root <path>] [--json]\n  ripple impact <symbol>... [--budget N] [--root <path>] [--json] [--verify lsp]\n  ripple review [<base>] [--budget N] [--root <path>] [--json] [--verify lsp]\n    --verify lsp [--verify-budget 2s] [--floor-contradicted|--drop-contradicted]  (upgrade call edges from a language server)\n  ripple path <from> <to> [--depth 6] [--limit 3] [--root <path>] [--json]   (how does A reach B?)\n  ripple risk <symbol|file> [--root <path>] [--json]\n  ripple mcp [--root <path>]   (MCP server over stdio for AI agents)\n  ripple lsp doctor [--root <path>] [--budget 10s] [--json]   (are language servers usable here?)";
 
 fn db_path(root: &Path) -> PathBuf {
     root.join(".ripple").join("graph.redb")
@@ -482,6 +483,107 @@ fn lookup_or_bail<'a>(
         }
     }
     Ok(nodes)
+}
+
+/// `ripple path <from> <to>`: how does one symbol reach another?
+///
+/// Answering this used to take one `neighbors` call per hop, assembled by hand — and
+/// where a name is ambiguous (`get` is seven different resolvers) the hops could not
+/// be attributed to each other at all.
+fn cmd_path(args: &[String]) -> Result<()> {
+    let json = args.iter().any(|a| a == "--json");
+    let root: PathBuf = flag_value(args, "--root").map_or_else(|| ".".into(), PathBuf::from);
+    let depth: usize = flag_value(args, "--depth")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(6);
+    let limit: usize = flag_value(args, "--limit")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3);
+    let ends = positionals(args);
+    let [from, to] = ends.as_slice() else {
+        bail!("path wants two symbols: ripple path <from> <to>\n{USAGE}");
+    };
+
+    let graph = RedbStore::open(db_path(&root)).load()?;
+    let starts = lookup_or_bail(&graph, from, json)?;
+    let targets = lookup_or_bail(&graph, to, json)?;
+
+    let mut routes: Vec<(String, String, query::Route)> = Vec::new();
+    for s in &starts {
+        for t in &targets {
+            if s.id == t.id {
+                continue;
+            }
+            for r in query::paths(&graph, s.id, t.id, depth, limit) {
+                routes.push((hit_name(s), hit_name(t), r));
+            }
+        }
+    }
+    routes.sort_by(|a, b| {
+        a.2.steps
+            .len()
+            .cmp(&b.2.steps.len())
+            .then(b.2.confidence.total_cmp(&a.2.confidence))
+    });
+    routes.truncate(limit);
+
+    if json {
+        let out: Vec<Value> = routes
+            .iter()
+            .map(|(from, to, r)| {
+                json!({
+                    "from": from, "to": to,
+                    "hops": r.steps.len(),
+                    "confidence": r.confidence,
+                    "steps": r.steps.iter().map(|s| json!({
+                        "edge": format!("{:?}", s.edge.kind),
+                        "edge_confidence": s.edge.confidence,
+                        "source": format!("{:?}", s.edge.source),
+                        "site_line": s.edge.site.start_line,
+                        "symbol": s.node.name, "module": s.node.module_path,
+                    })).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({ "routes": out }))?
+        );
+        return Ok(());
+    }
+    if routes.is_empty() {
+        println!(
+            "no route from {from} to {to} within {depth} hops \
+             (co-change edges are excluded — they are companions, not routes)"
+        );
+        return Ok(());
+    }
+    for (i, (start, end, r)) in routes.iter().enumerate() {
+        println!(
+            "route {} — {} hops, confidence {:.2}",
+            i + 1,
+            r.steps.len(),
+            r.confidence
+        );
+        println!("  {start}");
+        for s in &r.steps {
+            println!(
+                "    │ {:?}<{:.2}> {}",
+                s.edge.kind,
+                s.edge.confidence,
+                if s.edge.site.start_line > 0 {
+                    format!("line {}", s.edge.site.start_line)
+                } else {
+                    "—".to_owned()
+                }
+            );
+            println!("  ▼ {}", hit_name(&s.node));
+        }
+        if end != &hit_name(&r.steps[r.steps.len() - 1].node) {
+            println!("  (ends at {end})");
+        }
+    }
+    Ok(())
 }
 
 /// How a blast-radius hit is named in human output.
