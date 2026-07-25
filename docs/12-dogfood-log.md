@@ -8,6 +8,39 @@ the roadmap beforehand. Using the tool finds different bugs than reading it.
 
 ---
 
+## 2026-07-25 — rust path calls: 0 hits → 4, after two wrong turns
+
+**Asked:** `impact link_cross_service --root .` reported 0 hits (see the entry
+below). Fix it so ripple can be used on itself.
+
+**Result:** `impact` now returns exactly the four real callers — `index_project` in
+the CLI and three tests — and ripple's own graph goes **380 → 607 edges**. The 5noobs
+stack is byte-identical at 14,153 edges, which is the control: TS member calls and
+Elixir remote calls don't go through this path.
+
+Resolution now honours a qualifier: `Client::new` prefers a `new` defined on
+`Client`; a lowercase qualifier (`resolve::link_cross_service`) is a module path
+where the bare name is the only handle; a capitalized qualifier that matches no
+owner resolves to **nothing**.
+
+**Two wrong turns, both caught by measuring rather than by tests:**
+
+1. First version had no rule for unknown types, so `HashMap::new()` and `Vec::new()`
+   fell back to the bare name and linked to an unrelated `Adapter::new`. Ripple
+   happens to define exactly four `new`s, so my "at most 4 candidates" cap let every
+   one of them through — edges jumped to 1,299, of which **769 were false**. Visible
+   only by asking `neighbors new --in` and seeing `roots_by_scope` calling an Elixir
+   adapter's constructor.
+2. Then `Client::new()` still resolved to the *calling file's* `Local::new`, because
+   same-file names were consulted before the qualifier. An explicit qualifier has to
+   decide first — including deciding that nothing matches.
+
+Also fixed: `last_segment("Client::")` returned empty, so no owner was ever indexed.
+
+**Lesson:** the false positives were invisible in aggregate (1,299 edges looks like
+success) and obvious in one spot check. "Did the number go up" is not the same
+question as "is the number right".
+
 ## 2026-07-25 — elixir `import`, and a negative result on attribution
 
 **Asked:** the oracle said 20 of ripple's misses looked import-shaped. Fix `import`

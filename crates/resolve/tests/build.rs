@@ -358,6 +358,54 @@ fn resolves_bare_calls_through_an_elixir_import() {
     assert_eq!(cross.imported, 1, "exactly one call resolved via import");
 }
 
+/// Rust reaches other modules through paths, so resolving only same-file names left
+/// `impact` blind on any Rust project — it reported zero dependents for functions
+/// used across crates, including ripple's own.
+#[test]
+fn resolves_rust_path_calls() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rust_paths");
+    let r = resolve::build(&root).unwrap();
+
+    let run = SymbolId::of("app.rs", "run");
+    let client_new = SymbolId::of("store.rs", "Client::new");
+    let local_new = SymbolId::of("app.rs", "Local::new");
+    let helper = SymbolId::of("store.rs", "helper");
+
+    let targets: Vec<SymbolId> = r
+        .edges
+        .iter()
+        .filter(|e| e.src == run && e.kind == EdgeKind::Calls)
+        .map(|e| e.dst)
+        .collect();
+
+    assert!(
+        targets.contains(&client_new),
+        "Client::new() should reach the `new` defined on Client: {targets:?}"
+    );
+    assert!(
+        targets.contains(&helper),
+        "store::helper(1) should reach helper across the module"
+    );
+    assert!(
+        targets.contains(&local_new),
+        "Local::new() should reach this file's own Local::new"
+    );
+    // `HashMap::new()` is a type we don't define: a capitalized qualifier must
+    // resolve to its owner or to nothing. Falling back on the bare name linked
+    // every collection constructor to an unrelated `new` (769 false edges on
+    // ripple's own repo).
+    let news: Vec<SymbolId> = targets
+        .iter()
+        .filter(|t| **t == client_new || **t == local_new)
+        .copied()
+        .collect();
+    assert_eq!(
+        news.len(),
+        2,
+        "exactly the two `new`s we call, nothing dragged in by HashMap::new()"
+    );
+}
+
 #[test]
 fn deterministic_build() {
     let a = resolve::build(&fixture()).unwrap();

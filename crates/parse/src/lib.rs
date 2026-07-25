@@ -52,6 +52,12 @@ pub struct RefRec {
     pub kind: RefKind,
     pub site: Span,
     pub receiver: Option<Receiver>, // Some for Member
+    /// What preceded the name in a qualified call — `Client` in `Client::new(x)`,
+    /// `resolve` in `resolve::link(x)`. Lets resolution prefer a definition that
+    /// belongs to the qualifier instead of every same-named definition anywhere.
+    /// `default` so a cache written before this field still loads.
+    #[serde(default)]
+    pub qualifier: Option<String>,
 }
 
 /// A local identifier → type-name binding (`const b = new Bar()`, `(b: Bar)`).
@@ -270,11 +276,13 @@ fn extract_refs(tree: &Tree, query: &Query, src: &[u8]) -> Result<Vec<RefRec>> {
         let mut call: Option<TsNode> = None;
         let mut member: Option<TsNode> = None;
         let mut recv: Option<TsNode> = None;
+        let mut qualifier: Option<TsNode> = None;
         for cap in m.captures {
             match names[cap.index as usize] {
                 "ref.call" => call = Some(cap.node),
                 "ref.member" => member = Some(cap.node),
                 "ref.recv" => recv = Some(cap.node),
+                "ref.qualifier" => qualifier = Some(cap.node),
                 "ref.ignore" => {
                     let s = span_of(cap.node);
                     ignored.push(((s.start_line, s.start_col), (s.end_line, s.end_col)));
@@ -289,6 +297,9 @@ fn extract_refs(tree: &Tree, query: &Query, src: &[u8]) -> Result<Vec<RefRec>> {
                     kind: RefKind::Call,
                     site: span_of(n),
                     receiver: None,
+                    qualifier: qualifier
+                        .and_then(|q| q.utf8_text(src).ok())
+                        .map(str::to_owned),
                 });
             }
         } else if let Some(n) = member {
@@ -298,6 +309,7 @@ fn extract_refs(tree: &Tree, query: &Query, src: &[u8]) -> Result<Vec<RefRec>> {
                     kind: RefKind::Member,
                     site: span_of(n),
                     receiver: Some(receiver_of(recv, src)),
+                    qualifier: None,
                 });
             }
         }

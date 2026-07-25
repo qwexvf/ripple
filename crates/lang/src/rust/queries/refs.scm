@@ -1,11 +1,13 @@
 ; Unqualified calls: `helper(x)`.
 (call_expression function: (identifier) @ref.call)
 
-; Path calls: `Type::new(x)`, `module::helper(x)`. The last segment is the name;
-; resolution treats it like any other call, so `Foo::new` links to a `new` defined
-; in scope. Coarse but honest — real path resolution needs the module tree.
+; Path calls: `Type::new(x)`, `module::helper(x)`. The qualifier is captured too,
+; so resolution can prefer a definition that actually belongs to it rather than
+; linking every `new()` to every `new` in the graph.
 (call_expression
-  function: (scoped_identifier name: (identifier) @ref.call))
+  function: (scoped_identifier
+    path: (_) @ref.qualifier
+    name: (identifier) @ref.call))
 
 ; Method calls: `client.request(...)` — receiver captured for type-based resolution.
 (call_expression

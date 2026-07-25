@@ -68,6 +68,11 @@ const CONF_LOCAL_CALL: f32 = 0.95; // call to an in-scope local/imported def
 const CONF_KNOWN_RECEIVER: f32 = 0.9; // this.m() / new X().m() → X.m
 const CONF_TYPED_RECEIVER: f32 = 0.85; // typed param x: X → x.m() → X.m
 const CONF_CANDIDATE: f32 = 0.6; // by-name member fallback (before the 1/N split)
+const CONF_QUALIFIED_OWNER: f32 = 0.9; // `Client::new()` → a `new` defined on `Client`
+const CONF_QUALIFIED_NAME: f32 = 0.75; // `resolve::link()` → a `link` defined elsewhere
+/// Above this many same-named candidates for a path call, the answer is noise
+/// rather than a blast radius (`Vec::new`-style names match everywhere).
+const MAX_PATH_CANDIDATES: usize = 4;
 
 pub struct BuildResult {
     pub nodes: Vec<Node>,
@@ -296,6 +301,24 @@ struct DefIndex {
     methods_by_class: HashMap<(String, String), Vec<SymbolId>>,
     /// method → symbols (candidate fallback)
     methods_by_name: HashMap<String, Vec<SymbolId>>,
+    /// (owner, name) → symbols, for qualified calls. The owner is whatever the
+    /// language puts before the name in a qualified name: `Client` for Rust's
+    /// `Client::new`, `A` for TypeScript's `A.foo`.
+    by_owner: HashMap<(String, String), Vec<SymbolId>>,
+    /// name → every definition with that name, anywhere. Only consulted for a
+    /// qualified call whose owner didn't match, and only when few enough
+    /// candidates remain to mean something.
+    by_name: HashMap<String, Vec<SymbolId>>,
+}
+
+/// The trailing identifier of a qualified name or path — `Client` from
+/// `crate::store::Client`, `A` from `A.foo`. Both separators appear across the
+/// languages ripple indexes, and only the last segment is ever the owner.
+fn last_segment(path: &str) -> &str {
+    // trailing separators first: an owner is derived by cutting the name off a
+    // qualified name, which leaves `Client::` — and splitting that yields nothing
+    let path = path.trim().trim_end_matches([':', '.']);
+    path.rsplit([':', '.']).next().unwrap_or(path).trim()
 }
 
 /// Phase 2: emit def + module nodes and build the lookup tables.
@@ -323,6 +346,18 @@ fn index_defs(files: &[CachedFile]) -> (DefIndex, Vec<Node>) {
                         .push(d.id);
                     idx.methods_by_name
                         .entry(method.to_owned())
+                        .or_default()
+                        .push(d.id);
+                }
+            }
+            idx.by_name.entry(d.name.clone()).or_default().push(d.id);
+            // an owner is anything the qualified name carries in front of the name
+            if d.qualified_name.len() > d.name.len() && d.qualified_name.ends_with(&d.name) {
+                let owner =
+                    last_segment(&d.qualified_name[..d.qualified_name.len() - d.name.len()]);
+                if !owner.is_empty() {
+                    idx.by_owner
+                        .entry((owner.to_owned(), d.name.clone()))
                         .or_default()
                         .push(d.id);
                 }
@@ -432,13 +467,19 @@ fn resolve_calls(
         }
 
         let (targets, base_conf) = match r.kind {
-            RefKind::Call => {
-                let t = match local.get(&r.name) {
-                    Some(ids) if !ids.is_empty() => ids.clone(),
-                    _ => bindings.get(&r.name).into_iter().copied().collect(),
-                };
-                (t, CONF_LOCAL_CALL)
-            }
+            RefKind::Call => match resolve_qualified(&r.name, r.qualifier.as_deref(), local, idx) {
+                // an explicit qualifier names its target, so it decides — including
+                // deciding that nothing here matches. Consulting same-file names
+                // first made `Client::new()` resolve to whatever local `new` existed.
+                Some(resolved) => resolved,
+                None => match local.get(&r.name) {
+                    Some(ids) if !ids.is_empty() => (ids.clone(), CONF_LOCAL_CALL),
+                    _ => (
+                        bindings.get(&r.name).into_iter().copied().collect(),
+                        CONF_LOCAL_CALL,
+                    ),
+                },
+            },
             RefKind::Member => {
                 resolve_member(&r.name, r.receiver.as_ref(), enclosing, &type_map, idx)
             }
@@ -462,6 +503,70 @@ fn resolve_calls(
                 site: r.site,
             });
         }
+    }
+}
+
+/// Qualified-call resolution ladder. Returns (targets, base confidence).
+///
+/// A path call is the normal way one Rust module calls another, so resolving only
+/// same-file names left `impact` blind on any Rust project — it reported zero
+/// dependents for functions used across crates.
+///
+/// The qualifier is what makes this safe: `Client::new` prefers a `new` defined on
+/// `Client`, so it can't drag in every other `new`. Only when no owner matches does
+/// it fall back to the name alone, and then only if the candidates are few enough to
+/// be worth showing.
+/// `None` means "no qualifier, no opinion" — fall back to scope. `Some(empty)` is a
+/// verdict: the qualifier named something this graph doesn't contain.
+fn resolve_qualified(
+    name: &str,
+    qualifier: Option<&str>,
+    local: &HashMap<String, Vec<SymbolId>>,
+    idx: &DefIndex,
+) -> Option<(Vec<SymbolId>, f32)> {
+    let qualifier = qualifier?;
+    let owner = last_segment(qualifier);
+    if let Some(ids) = idx.by_owner.get(&(owner.to_owned(), name.to_owned())) {
+        return Some((prefer_local(ids, name, local), CONF_QUALIFIED_OWNER));
+    }
+    // A capitalized qualifier names a *type*, and the type is either ours or it
+    // isn't: `Vec::new()` and `HashMap::new()` must resolve to nothing rather than
+    // to whatever `new` happens to exist. Falling back on the bare name linked
+    // every collection constructor in the repo to an unrelated `Adapter::new`.
+    if owner.starts_with(char::is_uppercase) {
+        return Some((Vec::new(), CONF_QUALIFIED_OWNER));
+    }
+    // A lowercase qualifier is a module or crate path (`resolve::link_cross_service`),
+    // where the name alone is the only handle we have.
+    Some(match idx.by_name.get(name) {
+        Some(ids) if ids.len() <= MAX_PATH_CANDIDATES => {
+            (prefer_local(ids, name, local), CONF_QUALIFIED_NAME)
+        }
+        _ => (Vec::new(), CONF_QUALIFIED_NAME),
+    })
+}
+
+/// Candidates defined in the calling file, if any. Several files can define the
+/// same qualified name — ripple itself has four `Adapter::new` — and inside one of
+/// them the call plainly means its own.
+fn prefer_local(
+    candidates: &[SymbolId],
+    name: &str,
+    local: &HashMap<String, Vec<SymbolId>>,
+) -> Vec<SymbolId> {
+    let here: Vec<SymbolId> = local
+        .get(name)
+        .map(|ids| {
+            ids.iter()
+                .filter(|id| candidates.contains(id))
+                .copied()
+                .collect()
+        })
+        .unwrap_or_default();
+    if here.is_empty() {
+        candidates.to_vec()
+    } else {
+        here
     }
 }
 
