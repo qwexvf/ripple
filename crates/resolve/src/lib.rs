@@ -21,16 +21,45 @@ mod workspace;
 
 pub use crossservice::{link_cross_service, CrossEdges};
 
+/// Directories that hold code nobody is going to change in this repo:
+/// dependencies, build output, and tool caches. Indexing them is not just waste —
+/// it drowns the graph. On a real Elixir umbrella, `deps/` held 2176 source files
+/// against 762 of the project's own, so three quarters of the call graph belonged
+/// to third-party libraries.
+///
+/// Matched by directory name, not gitignore rules: generated sources that a repo
+/// ignores (GraphQL documents, protobuf output) are exactly the code cross-service
+/// resolution depends on, so "ignored by git" is the wrong test.
 const IGNORED_DIRS: &[&str] = &[
+    // dependencies
     "node_modules",
+    "deps",
+    "vendor",
+    "site-packages",
+    ".venv",
+    "venv",
+    // build output
+    "_build",
     "dist",
     "build",
     "out",
+    "target",
+    ".next",
+    // caches, tooling, coverage
+    "__pycache__",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".tox",
+    "coverage",
+    "cover",
     ".git",
     ".ripple",
+    ".dexter",
+    ".elixir_ls",
+    ".lexical",
+    ".expert",
+    ".bsp",
     ".claude",
-    ".next",
-    "coverage",
 ];
 
 // Edge confidences, ordered by how much syntax pins the target (see docs/06).

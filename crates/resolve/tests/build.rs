@@ -300,6 +300,29 @@ fn resolves_elixir_local_calls() {
     }
 }
 
+/// Dependencies and build output are not this repo's code. Indexing them drowns
+/// the graph: on a real Elixir umbrella `deps/` held 2176 source files against the
+/// project's 762, three quarters of the call graph.
+#[test]
+fn skips_dependency_and_build_directories() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ignored");
+    let r = resolve::build(&root).unwrap();
+
+    let names: Vec<&str> = r.nodes.iter().map(|n| n.name.as_str()).collect();
+    assert!(
+        names.contains(&"appOwnCode"),
+        "the repo's own code is indexed"
+    );
+    assert!(
+        !names.contains(&"vendoredLibraryCode"),
+        "deps/ must not be indexed: {names:?}"
+    );
+    assert!(
+        !names.contains(&"buildOutputCode"),
+        "_build/ must not be indexed: {names:?}"
+    );
+}
+
 #[test]
 fn deterministic_build() {
     let a = resolve::build(&fixture()).unwrap();
