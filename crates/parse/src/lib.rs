@@ -268,7 +268,7 @@ fn extract_refs(tree: &Tree, query: &Query, src: &[u8]) -> Result<Vec<RefRec>> {
     let mut matches = cursor.matches(query, tree.root_node(), src);
 
     let mut out = Vec::new();
-    let mut ignored: Vec<((u32, u32), (u32, u32))> = Vec::new();
+    let mut ignored: Vec<Region> = Vec::new();
     while let Some(m) = matches.next() {
         if !predicates_hold(query, m, src) {
             continue;
@@ -314,11 +314,39 @@ fn extract_refs(tree: &Tree, query: &Query, src: &[u8]) -> Result<Vec<RefRec>> {
             }
         }
     }
+    // merged once, then binary-searched per ref: the linear scan was O(refs ×
+    // ignored), and an Elixir module that is mostly @spec puts thousands in both
+    let ignored = merge_regions(ignored);
     out.retain(|r| {
         let at = (r.site.start_line, r.site.start_col);
-        !ignored.iter().any(|&(start, end)| at >= start && at <= end)
+        !is_ignored_at(&ignored, at)
     });
     Ok(out)
+}
+
+type Region = ((u32, u32), (u32, u32));
+
+/// Sort and fuse ignored regions into disjoint ones, so membership is a single
+/// binary search rather than a scan. Query patterns match independently, so the
+/// same region can be captured twice and one can sit inside another.
+fn merge_regions(mut regions: Vec<Region>) -> Vec<Region> {
+    regions.sort_unstable();
+    let mut out: Vec<Region> = Vec::with_capacity(regions.len());
+    for (start, end) in regions {
+        match out.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => out.push((start, end)),
+        }
+    }
+    out
+}
+
+/// Is `at` inside any ignored region? `regions` must come from `merge_regions`:
+/// disjoint and sorted, so only the nearest region starting at or before `at` can
+/// contain it.
+fn is_ignored_at(regions: &[Region], at: (u32, u32)) -> bool {
+    let after = regions.partition_point(|&(start, _)| start <= at);
+    after > 0 && at <= regions[after - 1].1
 }
 
 fn extract_bindings(tree: &Tree, query: &Query, src: &[u8]) -> Result<Vec<BindRec>> {
@@ -426,6 +454,30 @@ fn span_of(node: TsNode) -> Span {
 
 #[cfg(test)]
 mod tests {
+    use super::{is_ignored_at, merge_regions};
+
+    #[test]
+    fn merged_ignore_regions_answer_containment() {
+        // captured twice, and one nested inside another — both happen because query
+        // patterns match independently
+        let merged = merge_regions(vec![
+            ((10, 1), (10, 40)),
+            ((3, 1), (5, 9)),
+            ((3, 1), (5, 9)),
+            ((4, 1), (4, 8)),
+        ]);
+        assert_eq!(merged, vec![((3, 1), (5, 9)), ((10, 1), (10, 40))]);
+
+        assert!(is_ignored_at(&merged, (3, 1)), "the start is inside");
+        assert!(is_ignored_at(&merged, (4, 2)), "a nested hit is inside");
+        assert!(is_ignored_at(&merged, (5, 9)), "the end is inside");
+        assert!(!is_ignored_at(&merged, (2, 9)), "before every region");
+        assert!(!is_ignored_at(&merged, (5, 10)), "just past the end");
+        assert!(!is_ignored_at(&merged, (9, 1)), "between regions");
+        assert!(!is_ignored_at(&merged, (11, 1)), "after every region");
+        assert!(!is_ignored_at(&[], (1, 1)));
+    }
+
     use super::*;
     use ir::NodeKind;
 
