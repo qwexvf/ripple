@@ -23,6 +23,10 @@ const MIN_COUPLING: f32 = 0.3;
 const W_CHURN: f32 = 0.4;
 const W_BUG: f32 = 0.4;
 const W_OWN: f32 = 0.2;
+/// Structural dependents. Weighted comparably to churn: a symbol many things
+/// depend on is risky to change even with a calm history — the case the static
+/// graph exists to catch.
+const W_FANOUT: f32 = 0.4;
 
 #[derive(Default)]
 struct RawMetrics {
@@ -196,7 +200,11 @@ fn finalize(
         let churn = percentile(&churn_vals, m.commits as f32);
         let bug_density = percentile(&bug_vals, ratio(m.fix_commits, m.commits));
         let ownership = percentile(&own_vals, 1.0 / m.authors.len().max(1) as f32);
-        let composite = W_CHURN * churn + W_BUG * bug_density + W_OWN * ownership;
+        let composite = blend(&[
+            (W_CHURN, churn, informative(&churn_vals)),
+            (W_BUG, bug_density, informative(&bug_vals)),
+            (W_OWN, ownership, informative(&own_vals)),
+        ]);
         file_risk.insert(
             path.clone(),
             RiskScores {
@@ -322,6 +330,81 @@ fn order(a: &str, b: &str) -> (String, String) {
 /// Percentile rank in [0,1], mapping the minimum value to 0. Uses `count(x < v)`
 /// (not `<=`) so files at the low end — e.g. the many files with `bug_density = 0`
 /// — score 0, not the fraction-of-ties. `<=` inflated every zero-bug file.
+/// Does this signal distinguish anything? A metric with the same value everywhere
+/// ranks nothing.
+fn informative(values: &[f32]) -> bool {
+    let mut it = values.iter();
+    let Some(first) = it.next() else { return false };
+    it.any(|v| (v - first).abs() > f32::EPSILON)
+}
+
+/// Weighted mean over the terms that carry signal, renormalized so the excluded
+/// ones don't scale the result down.
+///
+/// Without this, a metric that is constant across the corpus silently caps the
+/// composite: on a single-author repo every file has one author, so `ownership`
+/// percentile-ranks to 0 everywhere and its 0.2 weight subtracted a flat 20% from
+/// every score. Terms nothing populates yet (`complexity`, `test_proximity`) drop
+/// out by the same rule rather than pretending to be a measured zero.
+fn blend(terms: &[(f32, f32, bool)]) -> f32 {
+    let (sum, weight) = terms
+        .iter()
+        .filter(|(.., informative)| *informative)
+        .fold((0.0, 0.0), |(s, w), (weight, value, _)| {
+            (s + weight * value, w + weight)
+        });
+    if weight == 0.0 {
+        return 0.0;
+    }
+    sum / weight
+}
+
+/// Second risk pass, once every edge exists: how many things depend on each
+/// symbol. Must run after cross-service linking — those edges are exactly the
+/// dependents a purely local pass would miss.
+///
+/// Returns how many nodes got a non-zero fanout.
+pub fn score_structure(nodes: &mut [Node], edges: &[Edge]) -> usize {
+    let mut dependents: HashMap<SymbolId, HashSet<SymbolId>> = HashMap::new();
+    for e in edges {
+        dependents.entry(e.dst).or_default().insert(e.src);
+    }
+    let counts: Vec<f32> = nodes
+        .iter()
+        .map(|n| dependents.get(&n.id).map_or(0, HashSet::len) as f32)
+        .collect();
+
+    // whether a term carries signal is a property of the corpus, not of one node:
+    // a percentile of 0.0 is a real measurement for the least-changed file, and
+    // must not be mistaken for "this metric is missing"
+    let (fanout_varies, churn_varies, bug_varies, own_varies) = {
+        let column =
+            |f: fn(&RiskScores) -> f32| -> Vec<f32> { nodes.iter().map(|n| f(&n.risk)).collect() };
+        (
+            informative(&counts),
+            informative(&column(|r| r.churn)),
+            informative(&column(|r| r.bug_density)),
+            informative(&column(|r| r.ownership)),
+        )
+    };
+
+    let mut scored = 0;
+    for (node, count) in nodes.iter_mut().zip(&counts) {
+        node.risk.fanout = percentile(&counts, *count);
+        if *count > 0.0 {
+            scored += 1;
+        }
+        let r = node.risk;
+        node.risk.composite = blend(&[
+            (W_CHURN, r.churn, churn_varies),
+            (W_BUG, r.bug_density, bug_varies),
+            (W_OWN, r.ownership, own_varies),
+            (W_FANOUT, r.fanout, fanout_varies),
+        ]);
+    }
+    scored
+}
+
 fn percentile(values: &[f32], v: f32) -> f32 {
     if values.is_empty() {
         return 0.0;
@@ -339,6 +422,64 @@ mod tests {
         assert!(is_fix("fix: null deref"));
         assert!(is_fix("Revert broken change"));
         assert!(!is_fix("add feature"));
+    }
+
+    #[test]
+    fn blend_ignores_terms_that_rank_nothing() {
+        // a signal identical everywhere carries no information: excluding it must
+        // not scale the score down (single-author repos capped composite at 0.8)
+        assert!(!informative(&[0.0, 0.0, 0.0]));
+        assert!(!informative(&[]));
+        assert!(informative(&[0.0, 0.5]));
+
+        let both = blend(&[(0.4, 1.0, true), (0.2, 0.0, true)]);
+        assert!((both - 0.666).abs() < 0.01, "got {both}");
+        // same values, but the flat term drops out entirely
+        let one = blend(&[(0.4, 1.0, true), (0.2, 0.0, false)]);
+        assert!((one - 1.0).abs() < f32::EPSILON, "got {one}");
+        assert_eq!(blend(&[(0.4, 1.0, false)]), 0.0, "nothing informative");
+    }
+
+    #[test]
+    fn structure_pass_scores_dependents_and_reblends() {
+        let mut nodes = vec![
+            module_node("hub.ts"),
+            module_node("leaf.ts"),
+            module_node("caller_a.ts"),
+            module_node("caller_b.ts"),
+        ];
+        let (hub, leaf) = (nodes[0].id, nodes[1].id);
+        let (a, b) = (nodes[2].id, nodes[3].id);
+        let e = |src, dst| Edge {
+            src,
+            dst,
+            kind: EdgeKind::Calls,
+            confidence: 1.0,
+            site: Span {
+                start_line: 1,
+                start_col: 1,
+                end_line: 1,
+                end_col: 1,
+            },
+        };
+        // two distinct dependents on hub, none on leaf; a duplicate edge must not
+        // count twice
+        let edges = vec![e(a, hub), e(b, hub), e(a, hub)];
+
+        let scored = overlay_score(&mut nodes, &edges);
+        assert_eq!(scored, 1, "only hub has dependents");
+
+        let of = |id: SymbolId| nodes.iter().find(|n| n.id == id).expect("node").risk;
+        assert!(of(hub).fanout > of(leaf).fanout, "hub must outrank leaf");
+        assert_eq!(of(leaf).fanout, 0.0);
+        // with no git signal at all, composite is carried entirely by fanout —
+        // previously it would have been 0 for every node
+        assert!(of(hub).composite > 0.0, "structural risk alone must score");
+        assert_eq!(of(leaf).composite, 0.0);
+    }
+
+    fn overlay_score(nodes: &mut [Node], edges: &[Edge]) -> usize {
+        score_structure(nodes, edges)
     }
 
     #[test]

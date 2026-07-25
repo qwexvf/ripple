@@ -143,16 +143,19 @@ fn index_project(roots: &[PathBuf]) -> Result<String> {
     let (graphql, db) = (cross.graphql, cross.db);
     edges.append(&mut cross.edges);
 
+    // structural risk needs every edge, including the cross-service ones
+    let with_dependents = overlay::score_structure(&mut nodes, &edges);
+
     store.write(&nodes, &edges)?;
     store.write_extracts(&indexed.files)?;
     store.write_roots(&indexed.roots)?;
 
     let s = indexed.stats;
     Ok(format!(
-        "indexed {} files across {} root(s) ({} added, {} changed, {} unchanged, {} removed) → {} nodes, {} edges ({} co-change, {} graphql, {} db) ({})",
+        "indexed {} files across {} root(s) ({} added, {} changed, {} unchanged, {} removed) → {} nodes, {} edges ({} co-change, {} graphql, {} db, {} with dependents) ({})",
         indexed.result.files_indexed, indexed.roots.len(),
         s.added, s.changed, s.unchanged, s.removed,
-        nodes.len(), edges.len(), cochange_applied, graphql, db,
+        nodes.len(), edges.len(), cochange_applied, graphql, db, with_dependents,
         db_path(&roots[0]).display()
     ))
 }
@@ -852,8 +855,8 @@ fn cmd_risk(args: &[String]) -> Result<()> {
     } else {
         for (name, module, r) in &hits {
             println!(
-                "{name} ({module})\n  composite {:.2} | churn {:.2} bug {:.2} ownership {:.2}",
-                r.composite, r.churn, r.bug_density, r.ownership
+                "{name} ({module})\n  composite {:.2} | churn {:.2} bug {:.2} ownership {:.2} fanout {:.2}",
+                r.composite, r.churn, r.bug_density, r.ownership, r.fanout
             );
         }
     }
