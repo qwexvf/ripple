@@ -327,10 +327,13 @@ fn indexed_languages(graph: Option<&InMemoryGraph>, tag: &str) -> Vec<String> {
     } else {
         format!("{tag}/")
     };
+    // one registry for the whole scan: `for_path` rebuilds it per call, which on a
+    // 44k-node graph is 44k throwaway registries
+    let registry = lang::registry();
     let mut ids: Vec<String> = graph
         .nodes()
         .filter(|n| n.module_path.starts_with(&prefix))
-        .filter_map(|n| lang::for_path(Path::new(&n.module_path)))
+        .filter_map(|n| lang::adapter_for(&registry, Path::new(&n.module_path)))
         .map(|a| a.id().to_owned())
         .collect();
     ids.sort();

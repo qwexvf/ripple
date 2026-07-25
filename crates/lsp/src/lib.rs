@@ -35,6 +35,9 @@ pub struct ServerSpec {
     /// May a query block on this server?
     #[serde(default)]
     pub inline: bool,
+    /// Parallel requests allowed once verification lands (phase 3 in
+    /// docs/11-lsp-integration.md). Recorded but not yet enforced — `doctor` only
+    /// ever runs one request at a time.
     #[serde(default = "default_concurrency")]
     pub max_concurrency: usize,
     #[serde(default = "default_init_timeout_ms")]
@@ -416,10 +419,27 @@ impl Client {
     pub fn stop(mut self) {
         let _ = self.request("shutdown", Value::Null, Duration::from_secs(2));
         let _ = self.notify("exit", Value::Null);
+        self.kill();
+    }
+
+    fn kill(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
 }
+
+/// A dropped client must not leave a language server running — callers that hit
+/// an error path never get to call `stop`.
+impl Drop for Client {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+/// Largest message we'll allocate for. Real responses are far smaller; a bigger
+/// `Content-Length` means a desynced stream or a non-LSP process on the pipe, and
+/// we shouldn't try to allocate our way through it.
+const MAX_FRAME_BYTES: usize = 64 << 20;
 
 /// Read one `Content-Length`-framed JSON-RPC message. `None` at EOF or on a
 /// frame we can't parse — the caller treats that as the server going away.
@@ -438,7 +458,8 @@ fn read_message(reader: &mut impl BufRead) -> Option<Value> {
             len = v.trim().parse::<usize>().ok();
         }
     }
-    let mut body = vec![0; len?];
+    let len = len.filter(|n| *n <= MAX_FRAME_BYTES)?;
+    let mut body = vec![0; len];
     reader.read_exact(&mut body).ok()?;
     serde_json::from_slice(&body).ok()
 }
@@ -527,6 +548,9 @@ mod tests {
         );
         assert!(read_message(&mut BufReader::new(with_type.as_bytes())).is_some());
         assert!(read_message(&mut BufReader::new(&b"Content-Length: 99\r\n\r\n{}"[..])).is_none());
+        // an absurd length is a desynced stream, not something to allocate for
+        let huge = format!("Content-Length: {}\r\n\r\n", MAX_FRAME_BYTES + 1);
+        assert!(read_message(&mut BufReader::new(huge.as_bytes())).is_none());
         assert!(read_message(&mut BufReader::new(&b""[..])).is_none());
     }
 
