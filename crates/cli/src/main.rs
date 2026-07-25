@@ -380,13 +380,9 @@ fn cmd_impact(args: &[String]) -> Result<()> {
 
     let mut store = RedbStore::open(db_path(&root));
     let mut graph = store.load()?;
-    let seeds: Vec<_> = symbols
-        .iter()
-        .flat_map(|s| graph.find_by_name(s))
-        .map(|n| n.id)
-        .collect();
-    if seeds.is_empty() {
-        bail!("no symbols matched: {}", symbols.join(", "));
+    let mut seeds: Vec<ir::SymbolId> = Vec::new();
+    for s in &symbols {
+        seeds.extend(lookup_or_bail(&graph, s, json)?.iter().map(|n| n.id));
     }
     graph = verify_upgrade(&mut store, graph, &root, args, &seeds, json)?;
 
@@ -421,6 +417,48 @@ fn cmd_impact(args: &[String]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Look a symbol up, widening the rule if needed, and say so when the match was
+/// looser than exact.
+///
+/// Exact-only lookup made every Elixir module unfindable by the name a human types:
+/// a module's name *is* its qualified name, so `impact LfgPost` failed and only
+/// `impact FiveNoobs.Lfgs.LfgPost` worked. The note goes to stderr under `--json` so
+/// machine output stays clean.
+fn lookup_or_bail<'a>(
+    graph: &'a InMemoryGraph,
+    query: &str,
+    json: bool,
+) -> Result<Vec<&'a ir::Node>> {
+    let Some((nodes, how)) = graph.lookup(query) else {
+        bail!("no symbol matched: {query}");
+    };
+    if how != store::Match::Exact {
+        let rule = match how {
+            store::Match::Exact => unreachable!(),
+            store::Match::QualifiedSuffix => "qualified-name suffix",
+            store::Match::Substring => "substring",
+        };
+        let names: Vec<&str> = nodes.iter().take(5).map(|n| n.name.as_str()).collect();
+        let more = nodes.len().saturating_sub(names.len());
+        let tail = if more > 0 {
+            format!(", … {more} more")
+        } else {
+            String::new()
+        };
+        let note = format!(
+            "no exact match for '{query}'; matched {} symbol(s) by {rule}: {}{tail}",
+            nodes.len(),
+            names.join(", ")
+        );
+        if json {
+            eprintln!("{note}");
+        } else {
+            println!("{note}");
+        }
+    }
+    Ok(nodes)
 }
 
 /// How a blast-radius hit is named in human output.
@@ -1171,7 +1209,13 @@ fn mcp_call(
         }
         "impact" => {
             let sym = str_arg("symbol").ok_or("symbol required")?;
-            let seeds: Vec<_> = graph.find_by_name(&sym).into_iter().map(|n| n.id).collect();
+            let seeds: Vec<_> = graph
+                .lookup(&sym)
+                .map(|(nodes, _)| nodes)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|n| n.id)
+                .collect();
             if seeds.is_empty() {
                 return Ok(mcp_text(
                     json!({ "error": format!("no symbol '{sym}' — try `search`") }),
@@ -1214,7 +1258,7 @@ fn mcp_call(
             let depth = usize_arg("depth", 1);
             let limit = usize_arg("limit", 50);
             let mut out = Vec::new();
-            for start in graph.find_by_name(&sym) {
+            for start in graph.lookup(&sym).map(|(n, _)| n).unwrap_or_default() {
                 for h in graph.neighbors(start.id, dir, Some(&NEIGHBOR_KINDS), depth) {
                     out.push(json!({
                         "symbol": h.node.name, "module": h.node.module_path,
@@ -1230,7 +1274,7 @@ fn mcp_call(
         }
         "risk" => {
             let t = str_arg("target").ok_or("target required")?;
-            let mut hits = graph.find_by_name(&t);
+            let mut hits = graph.lookup(&t).map(|(n, _)| n).unwrap_or_default();
             if hits.is_empty() {
                 hits = graph.nodes_in_file(&t);
             }
@@ -1344,7 +1388,9 @@ fn cmd_risk(args: &[String]) -> Result<()> {
     let graph = RedbStore::open(db_path(&root)).load()?;
     // match by symbol name/qualified name, or by module path (file)
     let mut hits: Vec<_> = graph
-        .find_by_name(&query)
+        .lookup(&query)
+        .map(|(nodes, _)| nodes)
+        .unwrap_or_default()
         .into_iter()
         .map(|n| (n.name.clone(), n.module_path.clone(), n.risk))
         .collect();
@@ -1398,10 +1444,7 @@ fn cmd_neighbors(args: &[String]) -> Result<()> {
     let store = RedbStore::open(db_path(&root));
     let graph = store.load()?;
 
-    let matches = graph.find_by_name(&symbol);
-    if matches.is_empty() {
-        bail!("symbol not found: {symbol}");
-    }
+    let matches = lookup_or_bail(&graph, &symbol, json)?;
 
     let arrow = if dir == Dir::In {
         "callers/importers of"

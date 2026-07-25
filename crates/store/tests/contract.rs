@@ -124,6 +124,57 @@ fn an_edge_without_provenance_loads_as_extracted() {
     assert_eq!(e.source, ir::EdgeSource::Extracted);
 }
 
+/// Exact-only lookup made every Elixir module unfindable by the name a human types:
+/// a module's name *is* its qualified name, so `impact LfgPost` matched nothing while
+/// `impact FiveNoobs.Lfgs.LfgPost` worked. The rule widens only when the stricter one
+/// finds nothing, and reports which one fired.
+#[test]
+fn a_name_lookup_widens_only_when_it_has_to() {
+    use store::{InMemoryGraph, Match};
+
+    let mut module = node(
+        "lfgs/lfg_post.ex",
+        "FiveNoobs.Lfgs.LfgPost",
+        NodeKind::Class,
+    );
+    module.qualified_name = "FiveNoobs.Lfgs.LfgPost".to_owned();
+    let mut other = node(
+        "lfgs/lfg_posts.ex",
+        "FiveNoobs.Lfgs.LfgPosts",
+        NodeKind::Class,
+    );
+    other.qualified_name = "FiveNoobs.Lfgs.LfgPosts".to_owned();
+    let get_post = node("lfgs/lfg_posts.ex", "get_post", NodeKind::Function);
+    let graph = InMemoryGraph::from_parts(vec![module, other, get_post], Vec::new());
+
+    let (hit, how) = graph.lookup("get_post").expect("exact");
+    assert_eq!((hit.len(), how), (1, Match::Exact));
+
+    // the name a human types is the last segment
+    let (hit, how) = graph.lookup("LfgPost").expect("suffix");
+    assert_eq!(how, Match::QualifiedSuffix);
+    assert_eq!(
+        hit.iter().map(|n| n.name.as_str()).collect::<Vec<_>>(),
+        vec!["FiveNoobs.Lfgs.LfgPost"],
+        "a suffix must land on a segment boundary, so LfgPosts is not a match"
+    );
+
+    // exact wins over the looser rules even when both could match
+    let (hit, how) = graph.lookup("FiveNoobs.Lfgs.LfgPost").expect("exact");
+    assert_eq!((hit.len(), how), (1, Match::Exact));
+
+    // last resort, case-insensitive, and it says so
+    let (hit, how) = graph.lookup("lfgpost").expect("substring");
+    assert_eq!(how, Match::Substring);
+    assert_eq!(hit.len(), 2, "both LfgPost and LfgPosts contain it");
+
+    assert!(graph.lookup("nothing_like_this").is_none());
+    assert!(
+        graph.lookup("lfg_post").is_none(),
+        "matching ignores case, not punctuation — a module path is not a symbol name"
+    );
+}
+
 #[test]
 fn redb_store_satisfies_contract() {
     let path = tmp("redb");

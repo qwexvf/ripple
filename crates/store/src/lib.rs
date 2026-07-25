@@ -205,6 +205,19 @@ impl GraphStore for RedbStore {
     }
 }
 
+/// How a name query found what it found. A looser match still answers, but the
+/// caller should say which rule fired: the answer may not be about what was meant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Match {
+    Exact,
+    /// The query is the trailing segment of a qualified name — `LfgPost` finding
+    /// `FiveNoobs.Lfgs.LfgPost`. Elixir names *are* their FQN, so an exact-only
+    /// lookup makes every module unfindable by the name a human would type.
+    QualifiedSuffix,
+    /// The query appears somewhere in a name. Last resort, and ambiguous by nature.
+    Substring,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Dir {
     Out,
@@ -286,11 +299,37 @@ impl InMemoryGraph {
     }
 
     pub fn find_by_name(&self, name: &str) -> Vec<&Node> {
-        let mut v: Vec<&Node> = self
-            .nodes
-            .values()
-            .filter(|n| n.name == name || n.qualified_name == name)
-            .collect();
+        self.matching(|n| n.name == name || n.qualified_name == name)
+    }
+
+    /// Find symbols by name, widening the rule only when the stricter one finds
+    /// nothing: exact, then qualified-name suffix, then substring.
+    ///
+    /// Returns which rule fired so a caller can say so — a substring hit is a guess
+    /// worth showing, not a silent answer. `None` when nothing matched at all.
+    pub fn lookup(&self, query: &str) -> Option<(Vec<&Node>, Match)> {
+        let exact = self.find_by_name(query);
+        if !exact.is_empty() {
+            return Some((exact, Match::Exact));
+        }
+        let suffix = self.matching(|n| {
+            let dotted = format!(".{query}");
+            n.qualified_name.ends_with(&dotted) || n.name.ends_with(&dotted)
+        });
+        if !suffix.is_empty() {
+            return Some((suffix, Match::QualifiedSuffix));
+        }
+        let lower = query.to_lowercase();
+        let substring = self.matching(|n| {
+            n.name.to_lowercase().contains(&lower)
+                || n.qualified_name.to_lowercase().contains(&lower)
+        });
+        (!substring.is_empty()).then_some((substring, Match::Substring))
+    }
+
+    /// Nodes satisfying `pred`, in a stable order (module path, then line).
+    fn matching(&self, pred: impl Fn(&Node) -> bool) -> Vec<&Node> {
+        let mut v: Vec<&Node> = self.nodes.values().filter(|n| pred(n)).collect();
         v.sort_by_key(|n| (n.module_path.clone(), n.span.start_line));
         v
     }
