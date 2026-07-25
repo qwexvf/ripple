@@ -669,8 +669,23 @@ fn enclosing_def<'a>(defs_by_start: &[&'a Node], site: Span) -> Option<&'a Node>
     defs_by_start[..upper]
         .iter()
         .rev()
-        .find(|d| contains(d.span, site))
+        .find(|d| is_container(d.kind) && contains(d.span, site))
         .copied()
+}
+
+/// Can a call be *made by* this kind of definition?
+///
+/// A `const x = f()` captures `x` as a variable whose span contains the call, and it
+/// was the innermost definition, so the edge said `x` called `f` — in const-heavy
+/// TypeScript that meant a reviewer read a variable name where the calling function
+/// belonged (`flattenKeys ← localeKeys`, where the caller is `checkTranslations`).
+/// A callable declared as a const is captured as a function, not a variable, so
+/// nothing is lost by excluding value bindings.
+fn is_container(kind: NodeKind) -> bool {
+    matches!(
+        kind,
+        NodeKind::Function | NodeKind::Method | NodeKind::Class | NodeKind::Module
+    )
 }
 
 fn contains(outer: Span, inner: Span) -> bool {

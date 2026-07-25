@@ -486,3 +486,34 @@ fn calls_outside_any_function_are_attributed_to_their_module() {
     // and the coarser edges are counted, not blended into the function-level ones
     assert_eq!(cross.file_granular, 2, "the module body and the test block");
 }
+
+/// A call inside a variable initialiser belongs to the enclosing *function*, not to
+/// the variable. `const keys = new Set(collect())` captures `keys` as a definition
+/// whose span contains the call, and it used to win as the innermost one — so the
+/// edge named a value binding as the caller (issue #25).
+#[test]
+fn a_call_in_a_variable_initialiser_belongs_to_the_function() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/var_init");
+    let r = resolve::build(&root).unwrap();
+
+    let collect = SymbolId::of("keys.ts", "collect");
+    let report = SymbolId::of("keys.ts", "report");
+    let keys = SymbolId::of("keys.ts", "keys");
+
+    let callers: Vec<SymbolId> = r
+        .edges
+        .iter()
+        .filter(|e| e.kind == EdgeKind::Calls && e.dst == collect)
+        .map(|e| e.src)
+        .collect();
+
+    assert_eq!(
+        callers,
+        vec![report],
+        "the function calls it, not the const"
+    );
+    assert!(
+        !callers.contains(&keys),
+        "a value binding is not something that calls"
+    );
+}
