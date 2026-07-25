@@ -78,9 +78,19 @@ fn run_contract(store: &mut dyn GraphStore) {
     assert_eq!(cache.len(), 1);
     assert_eq!(cache["a.ts"].hash, "deadbeef");
 
-    // writing the graph again must not wipe the extract cache
+    // roots round-trip, and are empty before anything records them
+    assert!(store.read_roots().unwrap().is_empty());
+    let roots = vec![
+        ("web".to_owned(), PathBuf::from("/proj/web")),
+        ("api".to_owned(), PathBuf::from("/proj/api")),
+    ];
+    store.write_roots(&roots).unwrap();
+    assert_eq!(store.read_roots().unwrap(), roots);
+
+    // writing the graph again must not wipe the extract cache or the roots
     store.write(&[caller], &[]).unwrap();
     assert_eq!(store.read_extracts().unwrap().len(), 1);
+    assert_eq!(store.read_roots().unwrap(), roots);
 }
 
 #[test]

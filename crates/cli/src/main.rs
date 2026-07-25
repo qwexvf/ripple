@@ -144,6 +144,7 @@ fn index_project(roots: &[PathBuf]) -> Result<String> {
 
     store.write(&nodes, &edges)?;
     store.write_extracts(&indexed.files)?;
+    store.write_roots(&indexed.roots)?;
 
     let s = indexed.stats;
     Ok(format!(
@@ -153,6 +154,29 @@ fn index_project(roots: &[PathBuf]) -> Result<String> {
         nodes.len(), edges.len(), cochange_applied, graphql, db,
         db_path(&roots[0]).display()
     ))
+}
+
+/// The tag `index` used for `root`, so a filesystem path can be turned into the
+/// module path the graph actually stores. Empty for a single-root index (paths
+/// are stored bare) and for an index built before roots were recorded.
+fn root_tag(store: &RedbStore, root: &Path) -> Result<String> {
+    let roots = store.read_roots()?;
+    if roots.is_empty() {
+        return Ok(String::new());
+    }
+    let want = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    if let Some((tag, _)) = roots.iter().find(|(_, p)| *p == want) {
+        return Ok(tag.clone());
+    }
+    bail!(
+        "{} is not one of the indexed roots ({}) — run `ripple index` for it first",
+        want.display(),
+        roots
+            .iter()
+            .map(|(_, p)| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
 }
 
 fn cmd_impact(args: &[String]) -> Result<()> {
@@ -213,7 +237,11 @@ fn cmd_eval(args: &[String]) -> Result<()> {
     let k: usize = flag_value(args, "--commits")
         .and_then(|s| s.parse().ok())
         .unwrap_or(200);
-    let graph = RedbStore::open(db_path(&root)).load()?;
+    let store = RedbStore::open(db_path(&root));
+    let graph = store.load()?;
+    // a multi-root index namespaces module paths by root tag, so raw git paths
+    // must be namespaced the same way or every lookup misses
+    let tag = root_tag(&store, &root)?;
 
     let indexed = |p: &str| graph.get(ir::SymbolId::module(p)).is_some();
     let static_kinds = [
@@ -230,7 +258,10 @@ fn cmd_eval(args: &[String]) -> Result<()> {
             .any(|e| e.kind == EdgeKind::ChangesWith && e.dst == mb)
     };
     // cache each test file's statically-reachable file set (from all its symbols)
-    let commits = overlay::recent_commit_files(&root, k);
+    let commits: Vec<Vec<String>> = overlay::recent_commit_files(&root, k)
+        .into_iter()
+        .map(|files| files.iter().map(|p| resolve::namespace(&tag, p)).collect())
+        .collect();
     let mut reach: std::collections::HashMap<String, std::collections::HashSet<String>> =
         std::collections::HashMap::new();
     let mut reach_of = |file: &str| -> std::collections::HashSet<String> {
@@ -271,6 +302,18 @@ fn cmd_eval(args: &[String]) -> Result<()> {
             100.0 * n as f32 / pairs as f32
         }
     };
+    if pairs == 0 {
+        println!(
+            "no same-commit file pairs among indexed files — nothing to evaluate.\n  \
+             checked {k} recent commits of {}; the graph holds {} files.",
+            root.display(),
+            graph
+                .nodes()
+                .filter(|n| n.kind == ir::NodeKind::Module)
+                .count()
+        );
+        return Ok(());
+    }
     println!(
         "historical co-change prediction over recent commits ({pairs} same-commit file pairs):"
     );
@@ -735,5 +778,32 @@ mod tests {
             "sym"
         );
         assert_eq!(positionals(&v(&["a", "--root", "/r", "b"])), vec!["a", "b"]);
+    }
+
+    /// Path-based commands need the index's root tag, or a multi-root graph looks
+    /// empty to them (`eval` silently reported 0 pairs before this).
+    #[test]
+    fn root_tag_comes_from_the_index() {
+        let dir = std::env::temp_dir().join(format!("ripple-roottag-{}", std::process::id()));
+        let (web, api) = (dir.join("web"), dir.join("api"));
+        std::fs::create_dir_all(&web).unwrap();
+        std::fs::create_dir_all(&api).unwrap();
+        let mut store = RedbStore::open(db_path(&web));
+
+        // no roots recorded yet (an index built before roots existed)
+        assert_eq!(root_tag(&store, &web).unwrap(), "");
+
+        store
+            .write_roots(&[
+                ("web".to_owned(), web.canonicalize().unwrap()),
+                ("api".to_owned(), api.canonicalize().unwrap()),
+            ])
+            .unwrap();
+        assert_eq!(root_tag(&store, &web).unwrap(), "web");
+        assert_eq!(root_tag(&store, &api).unwrap(), "api");
+        // an unindexed root is an error, not a silently empty result
+        assert!(root_tag(&store, &dir).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

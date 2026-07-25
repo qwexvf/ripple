@@ -12,6 +12,7 @@ use std::path::PathBuf;
 const NODES: TableDefinition<u64, &[u8]> = TableDefinition::new("nodes");
 const EDGES: TableDefinition<u64, &[u8]> = TableDefinition::new("edges");
 const EXTRACTS: TableDefinition<&str, &[u8]> = TableDefinition::new("extracts");
+const ROOTS: TableDefinition<u64, &[u8]> = TableDefinition::new("roots");
 
 /// Durable graph store. One writer, many readers; query happens after `load`.
 /// Also persists the per-file extract cache for incremental re-indexing.
@@ -22,6 +23,12 @@ pub trait GraphStore {
     fn write_extracts(&mut self, files: &[CachedFile]) -> Result<()>;
     /// Load the extract cache keyed by module path; empty if none yet.
     fn read_extracts(&self) -> Result<HashMap<String, CachedFile>>;
+    /// Persist the (tag, path) roots this index was built from. Commands that
+    /// start from a filesystem path need the tag to namespace it the same way
+    /// indexing did — without it, a multi-root graph looks empty to them.
+    fn write_roots(&mut self, roots: &[(String, PathBuf)]) -> Result<()>;
+    /// The roots of the last index; empty if none were recorded.
+    fn read_roots(&self) -> Result<Vec<(String, PathBuf)>>;
 }
 
 pub struct RedbStore {
@@ -95,6 +102,39 @@ impl GraphStore for RedbStore {
                     continue;
                 };
                 out.insert(f.module_path.clone(), f);
+            }
+        }
+        Ok(out)
+    }
+
+    fn write_roots(&mut self, roots: &[(String, PathBuf)]) -> Result<()> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        let db = Database::create(&self.path).context("create redb")?;
+        let wtx = db.begin_write()?;
+        let _ = wtx.delete_table(ROOTS);
+        {
+            let mut t = wtx.open_table(ROOTS)?;
+            for (i, r) in roots.iter().enumerate() {
+                let bytes = serde_json::to_vec(r)?;
+                t.insert(i as u64, bytes.as_slice())?;
+            }
+        }
+        wtx.commit()?;
+        Ok(())
+    }
+
+    fn read_roots(&self) -> Result<Vec<(String, PathBuf)>> {
+        let Ok(db) = Database::open(&self.path) else {
+            return Ok(Vec::new()); // no prior index
+        };
+        let rtx = db.begin_read()?;
+        let mut out = Vec::new();
+        if let Ok(t) = rtx.open_table(ROOTS) {
+            for row in t.iter()? {
+                let (_k, v) = row?;
+                out.push(serde_json::from_slice(v.value())?);
             }
         }
         Ok(out)
