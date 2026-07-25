@@ -42,6 +42,9 @@ pub struct ServerSpec {
     pub max_concurrency: usize,
     #[serde(default = "default_init_timeout_ms")]
     pub init_timeout_ms: u64,
+    /// Budget for one query request once the handshake is done.
+    #[serde(default = "default_request_timeout_ms")]
+    pub request_timeout_ms: u64,
 }
 
 fn default_concurrency() -> usize {
@@ -50,6 +53,10 @@ fn default_concurrency() -> usize {
 
 fn default_init_timeout_ms() -> u64 {
     30_000
+}
+
+fn default_request_timeout_ms() -> u64 {
+    5_000
 }
 
 /// Built-in server table. Overridden per language by `.ripple/lsp.json`.
@@ -68,6 +75,7 @@ pub fn defaults() -> Vec<ServerSpec> {
             inline,
             max_concurrency: default_concurrency(),
             init_timeout_ms: default_init_timeout_ms(),
+            request_timeout_ms: default_request_timeout_ms(),
         };
     vec![
         spec("elixir", "dexter", &["lsp"], &["mix.exs"], true),
@@ -246,29 +254,35 @@ fn handshake(
         Ok(c) => c,
         Err(e) => return Err((e, Vec::new())),
     };
-    let timeout = Duration::from_millis(spec.init_timeout_ms);
-    let result = client
-        .request("initialize", initialize_params(root), timeout)
-        .and_then(|result| {
-            client.notify("initialized", json!({}))?;
-            let server = result
-                .pointer("/serverInfo/name")
-                .and_then(Value::as_str)
-                .map(|name| {
-                    match result
-                        .pointer("/serverInfo/version")
-                        .and_then(Value::as_str)
-                        .and_then(short_version)
-                    {
-                        Some(v) => format!("{name} {v}"),
-                        None => name.to_owned(),
-                    }
-                });
-            Ok((Caps::from_result(&result), server))
-        });
+    let result = client.initialize(root, spec);
     let log = client.log();
     client.stop();
     result.map_err(|e| (e, log))
+}
+
+/// One reference site the server reported, mapped back to plain paths so the
+/// caller never handles URIs or protocol shapes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallSite {
+    /// Absolute path of the file containing the caller.
+    pub path: PathBuf,
+    /// The calling function's name, as the server names it.
+    pub name: String,
+    /// 1-based line of the caller's own definition.
+    pub line: u32,
+}
+
+/// A function the server found in a file, with the position to ask about it.
+///
+/// Positions come straight from the server and go straight back to it, so no
+/// UTF-16 column arithmetic is involved — the reason the oracle starts from
+/// `documentSymbol` rather than from ripple's own spans.
+#[derive(Debug, Clone)]
+pub struct Symbol {
+    pub name: String,
+    /// LSP-native position of the name (0-based line, UTF-16 character).
+    pub line: u32,
+    pub character: u32,
 }
 
 /// Keep a version string printable. `gopls` answers with its entire build-info
@@ -302,16 +316,89 @@ fn initialize_params(root: &Path) -> Value {
     })
 }
 
+fn file_uri(path: &Path) -> String {
+    format!("file://{}", path.display())
+}
+
+fn uri_to_path(uri: &str) -> Option<PathBuf> {
+    uri.strip_prefix("file://").map(PathBuf::from)
+}
+
+/// Function-like symbols out of either `documentSymbol` shape: the hierarchical
+/// `DocumentSymbol` tree or the flat `SymbolInformation` list.
+fn collect_symbols(node: &Value, out: &mut Vec<Symbol>) {
+    // SymbolKind: 6 = Method, 12 = Function
+    const FUNCTION_KINDS: [u64; 2] = [6, 12];
+    match node {
+        Value::Array(items) => {
+            for i in items {
+                collect_symbols(i, out);
+            }
+        }
+        Value::Object(map) => {
+            let kind = map.get("kind").and_then(Value::as_u64);
+            let name = map.get("name").and_then(Value::as_str);
+            // `selectionRange` is the name itself; `location` is the flat form
+            let pos = node
+                .pointer("/selectionRange/start")
+                .or_else(|| node.pointer("/location/range/start"));
+            if let (Some(kind), Some(name), Some(pos)) = (kind, name, pos) {
+                if FUNCTION_KINDS.contains(&kind) {
+                    if let (Some(line), Some(character)) = (
+                        pos.get("line").and_then(Value::as_u64),
+                        pos.get("character").and_then(Value::as_u64),
+                    ) {
+                        out.push(Symbol {
+                            name: name.to_owned(),
+                            line: line as u32,
+                            character: character as u32,
+                        });
+                    }
+                }
+            }
+            if let Some(children) = map.get("children") {
+                collect_symbols(children, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn caller_of(call: &Value) -> Option<CallSite> {
+    let from = call.get("from")?;
+    Some(CallSite {
+        path: uri_to_path(from.get("uri")?.as_str()?)?,
+        name: from.get("name")?.as_str()?.to_owned(),
+        line: from.pointer("/range/start/line")?.as_u64()? as u32 + 1,
+    })
+}
+
 fn which(command: &str) -> Option<PathBuf> {
     if command.contains('/') {
         let p = PathBuf::from(command);
-        return p.is_file().then_some(p);
+        return is_executable(&p).then_some(p);
     }
     std::env::var_os("PATH").and_then(|paths| {
         std::env::split_paths(&paths)
             .map(|dir| dir.join(command))
-            .find(|p| p.is_file())
+            .find(|p| is_executable(p))
     })
+}
+
+/// A readable file is not a runnable server. `doctor` exists to diagnose, so
+/// reporting a non-executable file as present and then failing at spawn time is
+/// the one thing it must not do.
+fn is_executable(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    true
 }
 
 /// A running server. Requests are id-matched and time-bounded; unsolicited
@@ -322,6 +409,10 @@ pub struct Client {
     rx: Receiver<Value>,
     log: Arc<Mutex<Vec<String>>>,
     next_id: i64,
+    /// Per-request budget after the handshake; a slow server must never hang a
+    /// query (docs/11-lsp-integration.md).
+    timeout: Duration,
+    language_id: String,
 }
 
 impl Client {
@@ -369,13 +460,99 @@ impl Client {
             rx,
             log,
             next_id: 1,
+            timeout: Duration::from_millis(spec.request_timeout_ms),
+            language_id: spec.language.clone(),
         })
+    }
+
+    /// Handshake. Returns what the server supports and how it identifies itself.
+    pub fn initialize(&mut self, root: &Path, spec: &ServerSpec) -> Result<(Caps, Option<String>)> {
+        let timeout = Duration::from_millis(spec.init_timeout_ms);
+        let result = self.request("initialize", initialize_params(root), timeout)?;
+        self.notify("initialized", json!({}))?;
+        self.timeout = Duration::from_millis(spec.request_timeout_ms);
+        self.language_id = spec.language.clone();
+        let server = result
+            .pointer("/serverInfo/name")
+            .and_then(Value::as_str)
+            .map(|name| {
+                match result
+                    .pointer("/serverInfo/version")
+                    .and_then(Value::as_str)
+                    .and_then(short_version)
+                {
+                    Some(v) => format!("{name} {v}"),
+                    None => name.to_owned(),
+                }
+            });
+        Ok((Caps::from_result(&result), server))
+    }
+
+    /// Tell the server about a file. Servers that answer from their own index
+    /// don't need this, but ones that only know open documents do, and it's
+    /// cheap either way.
+    pub fn open(&mut self, path: &Path) -> Result<()> {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("cannot read {}", path.display()))?;
+        self.notify(
+            "textDocument/didOpen",
+            json!({"textDocument": {
+                "uri": file_uri(path),
+                "languageId": self.language_id,
+                "version": 1,
+                "text": text,
+            }}),
+        )
+    }
+
+    /// The functions and methods a file defines, with server-native positions.
+    pub fn functions(&mut self, path: &Path) -> Result<Vec<Symbol>> {
+        let result = self.request(
+            "textDocument/documentSymbol",
+            json!({"textDocument": {"uri": file_uri(path)}}),
+            self.timeout,
+        )?;
+        let mut out = Vec::new();
+        collect_symbols(&result, &mut out);
+        Ok(out)
+    }
+
+    /// Callers of the symbol at `line`/`character`, via the call hierarchy.
+    /// An empty result and "the server has no idea" are indistinguishable in the
+    /// protocol, so a symbol it can't prepare yields `None`, not an empty set —
+    /// the difference decides whether a missing ripple edge counts against us.
+    pub fn incoming_calls(
+        &mut self,
+        path: &Path,
+        line: u32,
+        character: u32,
+    ) -> Result<Option<Vec<CallSite>>> {
+        let at = json!({
+            "textDocument": {"uri": file_uri(path)},
+            "position": {"line": line, "character": character},
+        });
+        let items = self.request("textDocument/prepareCallHierarchy", at, self.timeout)?;
+        let Some(item) = items.as_array().and_then(|a| a.first()) else {
+            return Ok(None);
+        };
+        let calls = self.request(
+            "callHierarchy/incomingCalls",
+            json!({"item": item}),
+            self.timeout,
+        )?;
+        let Some(calls) = calls.as_array() else {
+            return Ok(None);
+        };
+        Ok(Some(calls.iter().filter_map(caller_of).collect()))
     }
 
     pub fn request(&mut self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
         let id = self.next_id;
         self.next_id += 1;
-        self.send(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))?;
+        // a write failure here means the child is gone; say that rather than
+        // surfacing a bare "broken pipe"
+        self.send(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))
+            .with_context(|| format!("server exited before {method} could be sent"))?;
 
         let deadline = Instant::now() + timeout;
         loop {
