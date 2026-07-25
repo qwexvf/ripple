@@ -12,6 +12,38 @@ verify against the source — and **log every gap** (see Dogfood log below).
 Ripple is not a grep replacement. Use it when the question is about *relationships*:
 callers, blast radius, cross-service reach, what to review first.
 
+## Baseline numbers — compare against these
+
+Last measured 2026-07-25 on the 5noobs stack (web + api). A count that moves without
+an explanation is the cheapest bug signal this project has, so re-measure and diff:
+
+```
+1153 files → 10099 nodes, 14153 edges
+  (2461 co-change, 343 graphql, 820 db, 31 imported, 4576 with dependents)
+cold index ~1.7s, warm ~0.9s
+eval (5noobs-web, 300 commits, 4188 same-commit pairs):
+  static 6.5% (leakage-free) | co-change 35.4% | fused 40.4%   ← fused is optimistic
+                                                                 until the holdout lands
+eval --oracle lsp vs dexter 0.7.1, 40 files:
+  145/165 (87.9%) identical caller sets, 1 possible false positive, 19 possible misses
+```
+
+**Build the release binary before timing anything** or compile time lands inside the
+measurement — that has produced two wrong numbers already.
+
+Test stack: `~/projects/private/omeroid/5noobs/5noobs-api` (Elixir umbrella) and
+`~/.../5noobs-api/5noobs-web` (TS, its own git repo). Index cross-repo with
+`index <WEB> <API>`; the database lands under the **first** root. `rm -rf <repo>/.ripple`
+when finished.
+
+`dexter` (Elixir LSP, needs no compile) is installed via mise, but its shim isn't on a
+non-interactive PATH — prefix with `PATH=~/.local/share/mise/shims:$PATH`. Its CLI
+resolves the index from the **current directory**, so `dexter references` run from
+elsewhere silently reports nothing.
+
+Backlog, follow-ups and open questions live on the board:
+<https://github.com/users/qwexvf/projects/7>. Don't keep a second list.
+
 ## Before you can query
 
 ```
