@@ -18,10 +18,11 @@ Last measured 2026-07-25 on the 5noobs stack (web + api). A count that moves wit
 an explanation is the cheapest bug signal this project has, so re-measure and diff:
 
 ```
-1153 files → 9179 nodes, 19277 edges
-  (2461 co-change, 343 graphql, 941 db, 134 imported, 1634 file-granular, 4439 with dependents)
-  ↑ +3490 edges on 2026-07-25 from three TS fixes: .tsx now uses the TSX grammar,
-    JSX rendering is a call, `export { X }` lists count as exports
+1153 files → 9179 nodes, 19538 edges
+  (2461 co-change, 343 graphql, 941 db, 134 imported, 1634 file-granular, 4441 with dependents)
+  ↑ +3751 edges on 2026-07-25 from four TS fixes: .tsx now uses the TSX grammar,
+    JSX rendering is a call, `export { X }` lists count as exports, and an import
+    through a barrel (`export * from`) follows the chain
 cold index ~1.5s, warm ~0.8s
 eval (5noobs-web, held out — co-change mined only from commits older than the test window):
   --commits 50  (500 train, 2078 pairs): static 7.1% | co-change 3.4% | fused 10.5%
@@ -32,11 +33,12 @@ eval --oracle lsp vs dexter 0.7.1, 40 files (compare by position, state granular
   elixir  --granularity function: 165/165 (100.0%) | 0 ripple-only | 0 server-only
   elixir  --granularity file    : 153/165 (92.7%)  | 44 ripple-only | 0 server-only
   30 files, per language (tsgo 7.0.0-dev for ts/tsx, dexter 0.7.1 for elixir):
-    elixir      161/162 (99.4%) | 1 ripple-only  | 0 server-only
-    tsx          32/35  (91.4%) | 3 ripple-only  | 0 server-only
-    typescript   34/43  (79.1%) | 0 ripple-only  | 693 server-only ← all one pattern
-    those 693 are issue #27: an import through a barrel (`export * from`) resolves to
-    nothing, and one generated GraphQL barrel is imported by the whole app
+    typescript   34/35 (97.1%) | 5 ripple-only | 0 server-only
+    tsx          32/35 (91.4%) | 3 ripple-only | 0 server-only
+    elixir       94/95 (98.9%) | 1 ripple-only | 0 server-only
+    server answers are unioned per ripple symbol first — overloads and Elixir clauses
+    are several server symbols for one node, and judging each separately invented
+    disagreements (45 of them, once barrels started resolving)
   the 44 are true edges dexter misses (it reports 1 caller for filter_posts and misses
   5 real call sites in lfg_posts_test.exs) — ripple-only at file granularity is capped
   by the oracle's own completeness, so read it with that in mind
@@ -116,6 +118,9 @@ eval [--commits N] [--root P]        # static vs co-change recall on N held-out 
   (`fromRanges`), never by the caller name the server chose — dexter credits a call
   inside an ExUnit `test` block to the preceding `defp`, and trusting that added 145
   false edges before it was checked.
+- A symbol lookup widens only when it must: exact, then qualified-name suffix
+  (`impact LfgPost` finds `FiveNoobs.Lfgs.LfgPost`), then case-insensitive substring.
+  The command prints which rule fired — a substring hit is a guess, not an answer.
 - `--verify lsp` asks the language server about the seed files plus one hop, then
   **persists** what it learns (confirmed → 1.0, server-only → 0.7, both
   `LspVerified`). It never blocks the answer: past `--verify-budget` it prints the
