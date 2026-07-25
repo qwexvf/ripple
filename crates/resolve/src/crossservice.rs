@@ -21,6 +21,9 @@ pub struct CrossEdges {
     pub db: usize,
     /// bare calls resolved through an `import`
     pub imported: usize,
+    /// edges whose caller is a file or module rather than a function, because the
+    /// call sits outside every definition (a module body, a `test` block, a script)
+    pub file_granular: usize,
 }
 
 /// Link cross-service edges from the per-file facts already on each `CachedFile`.
@@ -30,7 +33,8 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
     let mut fqn_to_class: HashMap<&str, SymbolId> = HashMap::new();
     let mut fqns_in_file: HashMap<&str, Vec<&str>> = HashMap::new();
     let mut fn_by_loc: HashMap<(&str, &str), SymbolId> = HashMap::new();
-    let mut fn_spans: HashMap<&str, Vec<(u32, u32, SymbolId)>> = HashMap::new();
+    // (start, end, id, is the container a function or the whole module body?)
+    let mut fn_spans: HashMap<&str, Vec<(u32, u32, SymbolId, Granularity)>> = HashMap::new();
     for n in nodes {
         match n.kind {
             NodeKind::Class => {
@@ -40,6 +44,13 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
                     .entry(n.module_path.as_str())
                     .or_default()
                     .push(n.qualified_name.as_str());
+                // widest container: a call in a module body belongs to the module.
+                // `enclosing` takes the smallest containing span, so this is only
+                // reached when no function contains the call.
+                let spans = fn_spans.entry(n.module_path.as_str()).or_default();
+                for s in n.definition_spans() {
+                    spans.push((s.start_line, s.end_line, n.id, Granularity::File));
+                }
             }
             NodeKind::Function | NodeKind::Method => {
                 fn_by_loc.insert((n.module_path.as_str(), n.name.as_str()), n.id);
@@ -48,7 +59,7 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
                 // one belongs to it just as much
                 let spans = fn_spans.entry(n.module_path.as_str()).or_default();
                 for s in n.definition_spans() {
-                    spans.push((s.start_line, s.end_line, n.id));
+                    spans.push((s.start_line, s.end_line, n.id, Granularity::Function));
                 }
             }
             _ => {}
@@ -197,6 +208,7 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
         }
     }
     let mut imported = 0;
+    let mut file_granular = 0;
     for f in files {
         let Some(ex) = &f.extract.cross.elixir else {
             continue;
@@ -223,9 +235,7 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
                 .collect();
             targets.sort_unstable();
             targets.dedup();
-            let Some(caller) = enclosing(spans, r.site.start_line) else {
-                continue;
-            };
+            let (caller, grain) = caller_at(spans, &f.module_path, r.site.start_line);
             let conf = CONF_IMPORTED_CALL / targets.len().max(1) as f32;
             for t in targets {
                 if emit(
@@ -237,6 +247,7 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
                     r.site.start_line,
                 ) {
                     imported += 1;
+                    file_granular += usize::from(grain == Granularity::File);
                 }
             }
         }
@@ -253,11 +264,10 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
         let spans = fn_spans.get(f.module_path.as_str()).unwrap_or(&empty);
 
         for (fqn, func, line) in &ex.remote_calls {
-            let (Some(&file), Some(caller)) =
-                (fqn_to_module.get(fqn.as_str()), enclosing(spans, *line))
-            else {
+            let Some(&file) = fqn_to_module.get(fqn.as_str()) else {
                 continue;
             };
+            let (caller, grain) = caller_at(spans, &f.module_path, *line);
             if let Some(&target) = fn_by_loc.get(&(file, func.as_str())) {
                 if emit(
                     &mut edges,
@@ -268,6 +278,7 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
                     *line,
                 ) {
                     elixir_calls += 1;
+                    file_granular += usize::from(grain == Granularity::File);
                 }
             }
         }
@@ -275,11 +286,10 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
             if !schema_fqns.contains(fqn.as_str()) {
                 continue;
             }
-            let (Some(&target), Some(caller)) =
-                (fqn_to_class.get(fqn.as_str()), enclosing(spans, *line))
-            else {
+            let Some(&target) = fqn_to_class.get(fqn.as_str()) else {
                 continue;
             };
+            let (caller, grain) = caller_at(spans, &f.module_path, *line);
             if emit(
                 &mut edges,
                 caller,
@@ -289,6 +299,7 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
                 *line,
             ) {
                 db += 1;
+                file_granular += usize::from(grain == Granularity::File);
             }
         }
     }
@@ -298,6 +309,7 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
         graphql,
         elixir_calls,
         db,
+        file_granular,
         imported,
     }
 }
@@ -327,12 +339,39 @@ fn roots_by_scope<'a>(includes: &HashMap<&'a str, Vec<&'a str>>) -> HashMap<&'a 
     out
 }
 
-/// Innermost function span containing `line` (smallest range), so a call inside
+/// Innermost definition span containing `line` (smallest range), so a call inside
 /// a nested def is attributed to that def, not an enclosing one.
-fn enclosing(spans: &[(u32, u32, SymbolId)], line: u32) -> Option<SymbolId> {
+fn enclosing(
+    spans: &[(u32, u32, SymbolId, Granularity)],
+    line: u32,
+) -> Option<(SymbolId, Granularity)> {
     spans
         .iter()
-        .filter(|(s, e, _)| line >= *s && line <= *e)
-        .min_by_key(|(s, e, _)| e - s)
-        .map(|&(.., id)| id)
+        .filter(|(s, e, ..)| line >= *s && line <= *e)
+        .min_by_key(|(s, e, ..)| e - s)
+        .map(|&(_, _, id, grain)| (id, grain))
+}
+
+/// Who to credit a cross-service call to, and whether that answer is file-granular.
+///
+/// A real call frequently sits inside no function at all: an ExUnit `test` block, a
+/// Phoenix `plug` line, a module body, a `.exs` script. Cross-service linking used
+/// to drop those, while same-file resolution attributed them to the enclosing
+/// definition or the file — so the two paths disagreed about the same construct and
+/// the coarser (but true) edges existed only for one of them. This makes both fall
+/// back the same way: enclosing definition, else the module body, else the file.
+fn caller_at(
+    spans: &[(u32, u32, SymbolId, Granularity)],
+    module_path: &str,
+    line: u32,
+) -> (SymbolId, Granularity) {
+    enclosing(spans, line).unwrap_or((SymbolId::module(module_path), Granularity::File))
+}
+
+/// Whether an attributed caller names a function or only the file it lives in.
+/// Tracked so the count of coarser edges is reported rather than blended in.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Granularity {
+    Function,
+    File,
 }

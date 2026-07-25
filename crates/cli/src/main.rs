@@ -156,6 +156,7 @@ fn index_project(roots: &[PathBuf]) -> Result<String> {
     // cross-service: TS→resolver (GraphqlCall), resolver→context (Calls), fn→schema (DbQuery)
     let mut cross = resolve::link_cross_service(&indexed.files, &nodes);
     let (graphql, db, imported) = (cross.graphql, cross.db, cross.imported);
+    let file_granular = cross.file_granular;
     edges.append(&mut cross.edges);
 
     // structural risk needs every edge, including the cross-service ones
@@ -167,10 +168,10 @@ fn index_project(roots: &[PathBuf]) -> Result<String> {
 
     let s = indexed.stats;
     Ok(format!(
-        "indexed {} files across {} root(s) ({} added, {} changed, {} unchanged, {} removed) → {} nodes, {} edges ({} co-change, {} graphql, {} db, {} imported, {} with dependents) ({})",
+        "indexed {} files across {} root(s) ({} added, {} changed, {} unchanged, {} removed) → {} nodes, {} edges ({} co-change, {} graphql, {} db, {} imported, {} file-granular, {} with dependents) ({})",
         indexed.result.files_indexed, indexed.roots.len(),
         s.added, s.changed, s.unchanged, s.removed,
-        nodes.len(), edges.len(), cochange_applied, graphql, db, imported, with_dependents,
+        nodes.len(), edges.len(), cochange_applied, graphql, db, imported, file_granular, with_dependents,
         db_path(&roots[0]).display()
     ))
 }
@@ -396,6 +397,7 @@ fn cmd_impact(args: &[String]) -> Result<()> {
             .map(|h| {
                 serde_json::json!({
                     "symbol": h.node.name, "module": h.node.module_path,
+                    "kind": format!("{:?}", h.node.kind),
                     "score": h.score, "weight": h.weight, "depth": h.depth,
                     "via": format!("{:?}", h.via), "risk": h.node.risk.composite,
                 })
@@ -410,12 +412,28 @@ fn cmd_impact(args: &[String]) -> Result<()> {
         );
         for h in &hits {
             println!(
-                "  {:.2}  {:?}<{:.2}> {} ({})",
-                h.score, h.via, h.weight, h.node.name, h.node.module_path
+                "  {:.2}  {:?}<{:.2}> {}",
+                h.score,
+                h.via,
+                h.weight,
+                hit_name(&h.node)
             );
         }
     }
     Ok(())
+}
+
+/// How a blast-radius hit is named in human output.
+///
+/// A file-level hit (`NodeKind::Module`) has no symbol name of its own — its name
+/// *is* the path, and printing `path (path)` read like a bug. Say what it is instead:
+/// these appear because a call can sit outside every function (issue #18).
+fn hit_name(node: &ir::Node) -> String {
+    if node.kind == ir::NodeKind::Module {
+        format!("[file] {}", node.module_path)
+    } else {
+        format!("{} ({})", node.name, node.module_path)
+    }
 }
 
 /// `--verify lsp`: before answering, ask the language servers about the query's
@@ -687,11 +705,22 @@ fn compare_calls(
                 Granularity::Function => (module.to_owned(), name.to_owned()),
                 Granularity::File => (module.to_owned(), String::new()),
             };
+            // A caller that is a module or a file is a file-granular claim: the call
+            // is real but sits outside every function (issue #18). At function
+            // granularity there is nothing for the server to agree or disagree with,
+            // so scoring it there measures the granularity mismatch, not the edge.
+            let comparable = |n: &ir::Node| match grain {
+                Granularity::Function => {
+                    matches!(n.kind, ir::NodeKind::Function | ir::NodeKind::Method)
+                }
+                Granularity::File => true,
+            };
             let ours: HashSet<(String, String)> = graph
                 .in_edges(target.id)
                 .iter()
                 .filter(|e| e.kind == EdgeKind::Calls)
                 .filter_map(|e| graph.get(e.src))
+                .filter(|n| comparable(n))
                 .map(|n| key(&n.module_path, &n.name))
                 .collect();
             let mut theirs: HashSet<(String, String)> = HashSet::new();

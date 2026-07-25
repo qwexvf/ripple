@@ -439,3 +439,50 @@ fn a_multi_clause_function_keeps_every_definition_site() {
     assert!(kind[0].contains_line(18), "the second clause counts too");
     assert!(!kind[0].contains_line(19));
 }
+
+/// A cross-module call that sits inside no function — a module body, an ExUnit
+/// `test` block — is attributed to the enclosing module instead of being dropped
+/// (issue #18). Same-file resolution already did this; cross-service linking didn't,
+/// so the same construct produced an edge or no edge depending on which path saw it.
+#[test]
+fn calls_outside_any_function_are_attributed_to_their_module() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/module_body");
+    let indexed = resolve::build_incremental(
+        std::slice::from_ref(&root),
+        &std::collections::HashMap::new(),
+    )
+    .unwrap();
+    // cross-module calls are linked in the cross-service pass, as in `ripple index`
+    let cross = resolve::link_cross_service(&indexed.files, &indexed.result.nodes);
+
+    let calls: Vec<(SymbolId, SymbolId)> = cross
+        .edges
+        .iter()
+        .filter(|e| e.kind == EdgeKind::Calls)
+        .map(|e| (e.src, e.dst))
+        .collect();
+
+    let me = SymbolId::of("resolver.ex", "me");
+    let follow = SymbolId::of("resolver.ex", "follow");
+    let legacy = SymbolId::of("resolver.ex", "legacy");
+    let boot = SymbolId::of("boot.ex", "App.Boot");
+    let start = SymbolId::of("boot.ex", "start");
+    let boot_test = SymbolId::of("boot_test.exs", "App.BootTest");
+
+    assert!(
+        calls.contains(&(boot, me)),
+        "a module-body call belongs to the module"
+    );
+    assert!(
+        calls.contains(&(boot_test, legacy)),
+        "a call in a `test` block belongs to the test module"
+    );
+    // and a call that *is* inside a function still names the function
+    assert!(calls.contains(&(start, follow)));
+    assert!(
+        !calls.contains(&(boot, follow)),
+        "the module must not absorb a call a function already owns"
+    );
+    // and the coarser edges are counted, not blended into the function-level ones
+    assert_eq!(cross.file_granular, 2, "the module body and the test block");
+}
