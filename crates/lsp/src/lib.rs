@@ -472,7 +472,12 @@ impl Client {
     pub fn initialize(&mut self, root: &Path, spec: &ServerSpec) -> Result<(Caps, Option<String>)> {
         let timeout = Duration::from_millis(spec.init_timeout_ms);
         let result = self.request("initialize", initialize_params(root), timeout)?;
-        self.notify("initialized", json!({}))?;
+        // fire-and-forget, so a failed write here must not fail the handshake: a
+        // server that exits right after answering `initialize` (a crash, or a stub
+        // scripted to) closed the pipe before this landed, and surfacing that as a
+        // bare "Broken pipe" hid a completed handshake behind a write error. The
+        // next request reports the death with context.
+        let _ = self.notify("initialized", json!({}));
         self.timeout = Duration::from_millis(spec.request_timeout_ms);
         self.language_id = spec.language.clone();
         let server = result
@@ -584,10 +589,12 @@ impl Client {
 
     fn send(&mut self, msg: Value) -> Result<()> {
         let body = serde_json::to_vec(&msg)?;
-        write!(self.stdin, "Content-Length: {}\r\n\r\n", body.len())?;
-        self.stdin.write_all(&body)?;
-        self.stdin.flush()?;
-        Ok(())
+        let mut write = || -> std::io::Result<()> {
+            write!(self.stdin, "Content-Length: {}\r\n\r\n", body.len())?;
+            self.stdin.write_all(&body)?;
+            self.stdin.flush()
+        };
+        write().context("writing to the language server's stdin")
     }
 
     /// The tail of the server's stderr.

@@ -154,6 +154,9 @@ fn garbage_on_the_pipe_is_reported_not_parsed() {
 fn a_server_dying_mid_session_reports_the_same_error_either_way() {
     let spec = spec("exit-after-init");
     let mut client = Client::start(&spec, &root()).expect("stub starts");
+    // the handshake must survive the server exiting before the `initialized`
+    // notification is written — that write is fire-and-forget, and racing it under
+    // load used to fail the handshake with a bare "Broken pipe"
     client.initialize(&root(), &spec).expect("handshake");
     let err = client
         .functions(Path::new("/proj/lib/target.ex"))
