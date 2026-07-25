@@ -200,3 +200,34 @@ fn probe_reports_ready_and_missing() {
     );
     let _ = std::fs::remove_file(&not_exec);
 }
+
+#[test]
+fn probe_all_bounds_the_wall_clock_and_keeps_spec_order() {
+    // three hangers with a 5s init timeout each: serially that is 15s, and the
+    // point of probing in parallel under one budget is that it isn't
+    let specs = vec![spec("hang"), spec("ok"), spec("hang")];
+    let started = std::time::Instant::now();
+    let reports = lsp::probe_all(&specs, &root(), std::time::Duration::from_millis(700));
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < std::time::Duration::from_secs(3),
+        "took {elapsed:?} — probes ran serially or ignored the budget"
+    );
+    assert_eq!(reports.len(), 3);
+    assert!(matches!(reports[0].health, Health::Failed { .. }));
+    assert!(
+        matches!(reports[1].health, Health::Ready { .. }),
+        "a healthy server still answers while others hang"
+    );
+    assert!(matches!(reports[2].health, Health::Failed { .. }));
+}
+
+#[test]
+fn probe_all_with_no_budget_left_reports_instead_of_spawning() {
+    let reports = lsp::probe_all(&[spec("ok")], &root(), std::time::Duration::ZERO);
+    match &reports[0].health {
+        Health::Failed { error, .. } => assert!(error.contains("budget")),
+        other => panic!("expected a budget failure, got {other:?}"),
+    }
+}

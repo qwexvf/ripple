@@ -31,7 +31,7 @@ fn main() -> Result<()> {
     }
 }
 
-const USAGE: &str = "usage:\n  ripple parse <file> [--json]\n  ripple index <path>...\n  ripple neighbors <symbol> [--in|--out] [--depth N] [--root <path>] [--json]\n  ripple impact <symbol>... [--budget N] [--root <path>] [--json] [--verify lsp]\n  ripple review [<base>] [--budget N] [--root <path>] [--json] [--verify lsp]\n    --verify lsp [--verify-budget 2s] [--floor-contradicted|--drop-contradicted]  (upgrade call edges from a language server)\n  ripple risk <symbol|file> [--root <path>] [--json]\n  ripple mcp [--root <path>]   (MCP server over stdio for AI agents)\n  ripple lsp doctor [--root <path>] [--json]   (are language servers usable here?)";
+const USAGE: &str = "usage:\n  ripple parse <file> [--json]\n  ripple index <path>...\n  ripple neighbors <symbol> [--in|--out] [--depth N] [--root <path>] [--json]\n  ripple impact <symbol>... [--budget N] [--root <path>] [--json] [--verify lsp]\n  ripple review [<base>] [--budget N] [--root <path>] [--json] [--verify lsp]\n    --verify lsp [--verify-budget 2s] [--floor-contradicted|--drop-contradicted]  (upgrade call edges from a language server)\n  ripple risk <symbol|file> [--root <path>] [--json]\n  ripple mcp [--root <path>]   (MCP server over stdio for AI agents)\n  ripple lsp doctor [--root <path>] [--budget 10s] [--json]   (are language servers usable here?)";
 
 fn db_path(root: &Path) -> PathBuf {
     root.join(".ripple").join("graph.redb")
@@ -227,10 +227,17 @@ fn cmd_lsp_doctor(args: &[String]) -> Result<()> {
     let adapters: Vec<String> = lang::registry().iter().map(|a| a.id().to_owned()).collect();
     let specs = lsp::load(&root)?;
 
+    // one budget for the whole command, split across roots: a hung server must not
+    // be able to hold the output back, and every probe is clamped so no handshake
+    // outlives the call
+    let budget = parse_duration(flag_value(args, "--budget"))
+        .unwrap_or_else(|| std::time::Duration::from_secs(10));
+    let deadline = std::time::Instant::now() + budget;
     let mut checked = Vec::new();
     for (tag, path) in &roots {
         let indexed = indexed_languages(graph.as_ref(), tag);
-        let reports: Vec<lsp::Report> = specs.iter().map(|spec| lsp::probe(spec, path)).collect();
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        let reports = lsp::probe_all(&specs, path, left);
         checked.push((path.clone(), indexed, reports));
     }
 

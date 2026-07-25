@@ -35,9 +35,9 @@ pub struct ServerSpec {
     /// May a query block on this server?
     #[serde(default)]
     pub inline: bool,
-    /// Parallel requests allowed once verification lands (phase 3 in
-    /// docs/11-lsp-integration.md). Recorded but not yet enforced — `doctor` only
-    /// ever runs one request at a time.
+    /// Parallel requests one client may have in flight. Recorded, not yet
+    /// enforced: both `doctor` and `--verify lsp` send one request at a time per
+    /// server (they fan out across *servers*, not within one).
     #[serde(default = "default_concurrency")]
     pub max_concurrency: usize,
     #[serde(default = "default_init_timeout_ms")]
@@ -243,6 +243,64 @@ pub fn probe(spec: &ServerSpec, root: &Path) -> Report {
             error: format!("{e:#}"),
             log,
         }),
+    }
+}
+
+/// Probe every spec concurrently and return within `budget`.
+///
+/// Serial probing cost `init_timeout_ms` per unresponsive server — five hung
+/// servers meant 2.5 minutes before a single line of output. Each probe's own init
+/// timeout is also clamped to the time left in the budget, so every thread finishes
+/// on its own: nothing is abandoned mid-handshake and no server process is left
+/// running after the call returns.
+///
+/// Results keep the order of `specs`, so output stays deterministic regardless of
+/// which server answers first. Fan-out is the size of the server table (~6), which
+/// is why it needs no pool.
+pub fn probe_all(specs: &[ServerSpec], root: &Path, budget: Duration) -> Vec<Report> {
+    let budget_ms = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX);
+    if budget_ms == 0 {
+        // an earlier root spent the budget; say so rather than spawning servers
+        // only to kill them at a 0ms timeout
+        return specs
+            .iter()
+            .map(|s| failed(s, "the doctor budget was already spent"))
+            .collect();
+    }
+    let bounded: Vec<ServerSpec> = specs
+        .iter()
+        .map(|spec| ServerSpec {
+            init_timeout_ms: spec.init_timeout_ms.min(budget_ms),
+            request_timeout_ms: spec.request_timeout_ms.min(budget_ms),
+            ..spec.clone()
+        })
+        .collect();
+
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = bounded
+            .iter()
+            .map(|spec| scope.spawn(|| probe(spec, root)))
+            .collect();
+        handles
+            .into_iter()
+            .zip(&bounded)
+            .map(|(h, spec)| {
+                h.join()
+                    .unwrap_or_else(|_| failed(spec, "the probe thread panicked"))
+            })
+            .collect()
+    })
+}
+
+fn failed(spec: &ServerSpec, error: &str) -> Report {
+    Report {
+        language: spec.language.clone(),
+        command: spec.command.clone(),
+        inline: spec.inline,
+        health: Health::Failed {
+            error: error.to_owned(),
+            log: Vec::new(),
+        },
     }
 }
 
