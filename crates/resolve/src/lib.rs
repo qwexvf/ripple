@@ -394,12 +394,63 @@ fn link(
     ws: &Workspace,
 ) -> Vec<Edge> {
     let mut edges = Vec::new();
+    // a barrel file has to be looked up by path when an import lands on it
+    let by_path: HashMap<&Path, &CachedFile> =
+        files.iter().map(|f| (f.canonical.as_path(), f)).collect();
     for f in files {
         let module_id = module_symbol(&f.module_path);
-        let bindings = resolve_imports(f, idx, registry, ws, &mut edges);
+        let bindings = resolve_imports(f, idx, &by_path, registry, ws, &mut edges);
         resolve_calls(f, idx, module_id, &bindings, &mut edges);
     }
     edges
+}
+
+/// How many re-export hops to follow. Barrels nest (a package index re-exporting
+/// feature indexes), but not deeply, and a cycle must not cost anything.
+const MAX_REEXPORT_HOPS: usize = 4;
+
+/// The symbol a file exposes under `name`, following `export … from` chains.
+///
+/// A barrel defines nothing: `import { getFragmentData } from "@/generated/graphql"`
+/// lands on an `index.ts` whose entire content is `export * from "./masking"`. Without
+/// following that, the import resolves to nothing and every consumer edge is lost —
+/// 693 of them on one real app, all through a single generated barrel (issue #27).
+fn resolve_export(
+    idx: &DefIndex,
+    by_path: &HashMap<&Path, &CachedFile>,
+    registry: &[Box<dyn LanguageAdapter>],
+    ws: &Workspace,
+    file: &Path,
+    name: &str,
+    hops: usize,
+) -> Option<SymbolId> {
+    if let Some(&sym) = idx.export_table.get(&(file.to_path_buf(), name.to_owned())) {
+        return Some(sym);
+    }
+    if hops == 0 {
+        return None;
+    }
+    let barrel = by_path.get(file)?;
+    let adapter = lang::adapter_for(registry, file)?;
+    for re in &barrel.extract.reexports {
+        // `export { a as b } from` exposes `b`; the source file knows it as `a`.
+        // `export * from` passes every name through unchanged.
+        let source_name = match re.exposed_as.as_str() {
+            "*" => name,
+            exposed if exposed == name => re.name.as_str(),
+            _ => continue,
+        };
+        let Some(next) = adapter.resolve_import(&re.specifier, file, ws) else {
+            continue;
+        };
+        // `next` differs from `file` for any real re-export, so a chain shortens the
+        // hop budget and a cycle terminates
+        if let Some(sym) = resolve_export(idx, by_path, registry, ws, &next, source_name, hops - 1)
+        {
+            return Some(sym);
+        }
+    }
+    None
 }
 
 /// Resolve a file's imports to symbols, emit Imports edges, and return the
@@ -407,6 +458,7 @@ fn link(
 fn resolve_imports(
     f: &CachedFile,
     idx: &DefIndex,
+    by_path: &HashMap<&Path, &CachedFile>,
     registry: &[Box<dyn LanguageAdapter>],
     ws: &Workspace,
     edges: &mut Vec<Edge>,
@@ -423,9 +475,15 @@ fn resolve_imports(
         let resolved = if imp.imported_name == "default" {
             default_export(idx, &target)
         } else {
-            idx.export_table
-                .get(&(target, imp.imported_name.clone()))
-                .copied()
+            resolve_export(
+                idx,
+                by_path,
+                registry,
+                ws,
+                &target,
+                &imp.imported_name,
+                MAX_REEXPORT_HOPS,
+            )
         };
         if let Some(sym) = resolved {
             bindings.insert(imp.local_name.clone(), sym);

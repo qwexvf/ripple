@@ -67,10 +67,30 @@ pub struct BindRec {
     pub type_name: String,
 }
 
+/// A symbol this file passes through from another one: `export { a } from "./x"`,
+/// `export { a as b } from "./x"`, or `export * from "./x"` (name `*`).
+///
+/// A barrel file defines nothing, so an import that resolves to it finds nothing
+/// unless the chain is followed. One generated GraphQL barrel cost 693 edges on a
+/// real app, because everything imports through it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReexportRec {
+    /// The name as the *source* file knows it, or `*` for a whole-module re-export.
+    pub name: String,
+    /// The name consumers of *this* file import (differs only when aliased).
+    pub exposed_as: String,
+    pub specifier: String,
+    pub site: Span,
+}
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct FileExtract {
     pub defs: Vec<Node>,
     pub imports: Vec<ImportRec>,
+    /// Symbols re-exported from another module. No `serde(default)` on purpose: a
+    /// cache row written before this field existed must be a miss, not a silent
+    /// "this file re-exports nothing".
+    pub reexports: Vec<ReexportRec>,
     pub refs: Vec<RefRec>,
     pub bindings: Vec<BindRec>,
     /// Cross-service facts (Absinthe fields, GraphQL ops, TS Document usage, …),
@@ -137,6 +157,12 @@ pub fn extract_file(
         .map(|q| extract_imports(&tree, q, src))
         .transpose()?
         .unwrap_or_default();
+    let reexports = queries
+        .imports
+        .as_ref()
+        .map(|q| extract_reexports(&tree, q, src))
+        .transpose()?
+        .unwrap_or_default();
     let refs = queries
         .refs
         .as_ref()
@@ -154,6 +180,7 @@ pub fn extract_file(
     Ok(FileExtract {
         defs,
         imports,
+        reexports,
         refs,
         bindings,
         cross,
@@ -211,6 +238,52 @@ fn extract_defs(
         }
     }
     Ok(nodes)
+}
+
+/// Re-export statements, from the same query as imports (`reexport.*` captures).
+fn extract_reexports(tree: &Tree, query: &Query, src: &[u8]) -> Result<Vec<ReexportRec>> {
+    let names = query.capture_names();
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(query, tree.root_node(), src);
+
+    let mut out = Vec::new();
+    while let Some(m) = matches.next() {
+        if !predicates_hold(query, m, src) {
+            continue;
+        }
+        let mut specifier = None;
+        let mut named: Vec<(String, Span)> = Vec::new();
+        let mut alias: Option<String> = None;
+        let mut star: Option<Span> = None;
+        for cap in m.captures {
+            let text = cap.node.utf8_text(src).unwrap_or("").to_owned();
+            match names[cap.index as usize] {
+                "reexport.source" => specifier = Some(text),
+                "reexport.name" => named.push((text, span_of(cap.node))),
+                "reexport.alias" => alias = Some(text),
+                "reexport.star" => star = Some(span_of(cap.node)),
+                _ => {}
+            }
+        }
+        let Some(specifier) = specifier else { continue };
+        if let Some(site) = star {
+            out.push(ReexportRec {
+                name: "*".to_owned(),
+                exposed_as: "*".to_owned(),
+                specifier: specifier.clone(),
+                site,
+            });
+        }
+        for (name, site) in named {
+            out.push(ReexportRec {
+                exposed_as: alias.clone().unwrap_or_else(|| name.clone()),
+                name,
+                specifier: specifier.clone(),
+                site,
+            });
+        }
+    }
+    Ok(out)
 }
 
 fn extract_imports(tree: &Tree, query: &Query, src: &[u8]) -> Result<Vec<ImportRec>> {

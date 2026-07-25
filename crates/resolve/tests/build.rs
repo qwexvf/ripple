@@ -546,3 +546,32 @@ fn a_rendered_component_is_a_caller() {
         "a .tsx file importing a .ts file must resolve"
     );
 }
+
+/// An import that lands on a barrel file must follow the re-export chain: the barrel
+/// defines nothing, so a direct lookup finds nothing and every consumer edge is lost
+/// (issue #27 — 693 of them on one real app, through a single generated barrel).
+#[test]
+fn an_import_through_a_barrel_reaches_the_real_definition() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/barrel");
+    let r = resolve::build(&root).unwrap();
+
+    let render = SymbolId::of("page.ts", "render");
+    let get_fragment_data = SymbolId::of("gen/masking.ts", "getFragmentData");
+    let unmask = SymbolId::of("gen/masking.ts", "unmask");
+
+    let calls: Vec<(SymbolId, SymbolId)> = r
+        .edges
+        .iter()
+        .filter(|e| e.kind == EdgeKind::Calls)
+        .map(|e| (e.src, e.dst))
+        .collect();
+
+    assert!(
+        calls.contains(&(render, get_fragment_data)),
+        "`export * from` passes the name through"
+    );
+    assert!(
+        calls.contains(&(render, unmask)),
+        "`export {{ unmask as reveal }} from` renames it on the way out"
+    );
+}
