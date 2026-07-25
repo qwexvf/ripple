@@ -89,9 +89,28 @@ fn run_contract(store: &mut dyn GraphStore) {
     assert_eq!(store.read_roots().unwrap(), roots);
 
     // writing the graph again must not wipe the extract cache or the roots
-    store.write(&[caller], &[]).unwrap();
+    store.write(std::slice::from_ref(&caller), &[]).unwrap();
     assert_eq!(store.read_extracts().unwrap().len(), 1);
     assert_eq!(store.read_roots().unwrap(), roots);
+
+    // write_index replaces all three at once — what `ripple index` uses, so that a
+    // crash can't leave a graph, a cache and a root list describing different runs
+    let cf2 = CachedFile {
+        canonical: PathBuf::from("/proj/b.ts"),
+        module_path: "b.ts".to_owned(),
+        hash: "cafe".to_owned(),
+        extract: FileExtract::default(),
+    };
+    let roots2 = vec![("solo".to_owned(), PathBuf::from("/proj"))];
+    store
+        .write_index(&[caller, callee], &[], &[cf2], &roots2)
+        .unwrap();
+    let graph = store.load().unwrap();
+    assert_eq!(graph.node_count(), 2);
+    let cache = store.read_extracts().unwrap();
+    assert_eq!(cache.len(), 1, "the old cache row is replaced, not merged");
+    assert_eq!(cache["b.ts"].hash, "cafe");
+    assert_eq!(store.read_roots().unwrap(), roots2);
 }
 
 /// Edges are stored as JSON, so a graph written before `source` existed must still

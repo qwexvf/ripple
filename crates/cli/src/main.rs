@@ -160,9 +160,9 @@ fn index_project(roots: &[PathBuf]) -> Result<String> {
     // structural risk needs every edge, including the cross-service ones
     let with_dependents = overlay::score_structure(&mut nodes, &edges);
 
-    store.write(&nodes, &edges)?;
-    store.write_extracts(&indexed.files)?;
-    store.write_roots(&indexed.roots)?;
+    // one transaction: a crash between these three would leave the graph, the
+    // extract cache and the roots describing different indexes
+    store.write_index(&nodes, &edges, &indexed.files, &indexed.roots)?;
 
     let s = indexed.stats;
     Ok(format!(

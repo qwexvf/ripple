@@ -18,6 +18,18 @@ const ROOTS: TableDefinition<u64, &[u8]> = TableDefinition::new("roots");
 /// Also persists the per-file extract cache for incremental re-indexing.
 pub trait GraphStore {
     fn write(&mut self, nodes: &[Node], edges: &[Edge]) -> Result<()>;
+    /// Persist graph, extract cache and roots as one unit.
+    ///
+    /// Indexing produces all three from the same pass, so they must land or fail
+    /// together: written separately, a crash in between leaves a graph whose cache
+    /// claims files it doesn't contain, or roots that name a graph that isn't there.
+    fn write_index(
+        &mut self,
+        nodes: &[Node],
+        edges: &[Edge],
+        files: &[CachedFile],
+        roots: &[(String, PathBuf)],
+    ) -> Result<()>;
     fn load(&self) -> Result<InMemoryGraph>;
     /// Persist the per-file extract cache (overwrites the previous one).
     fn write_extracts(&mut self, files: &[CachedFile]) -> Result<()>;
@@ -39,50 +51,86 @@ impl RedbStore {
     pub fn open(path: impl Into<PathBuf>) -> Self {
         RedbStore { path: path.into() }
     }
+
+    /// Open the database, creating the parent directory if needed. Every write path
+    /// goes through this so the "create dir, then create db" pairing lives once.
+    fn db(&self) -> Result<Database> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        Database::create(&self.path).context("create redb")
+    }
+}
+
+/// Replace the graph tables inside an open write transaction. The extract cache and
+/// roots tables are left alone.
+fn put_graph(wtx: &redb::WriteTransaction, nodes: &[Node], edges: &[Edge]) -> Result<()> {
+    let _ = wtx.delete_table(NODES);
+    let _ = wtx.delete_table(EDGES);
+    {
+        let mut t = wtx.open_table(NODES)?;
+        for n in nodes {
+            let bytes = serde_json::to_vec(n)?;
+            t.insert(n.id.0, bytes.as_slice())?;
+        }
+    }
+    let mut t = wtx.open_table(EDGES)?;
+    for (i, e) in edges.iter().enumerate() {
+        let bytes = serde_json::to_vec(e)?;
+        t.insert(i as u64, bytes.as_slice())?;
+    }
+    Ok(())
+}
+
+fn put_extracts(wtx: &redb::WriteTransaction, files: &[CachedFile]) -> Result<()> {
+    let _ = wtx.delete_table(EXTRACTS);
+    let mut t = wtx.open_table(EXTRACTS)?;
+    for f in files {
+        let bytes = serde_json::to_vec(f)?;
+        t.insert(f.module_path.as_str(), bytes.as_slice())?;
+    }
+    Ok(())
+}
+
+fn put_roots(wtx: &redb::WriteTransaction, roots: &[(String, PathBuf)]) -> Result<()> {
+    let _ = wtx.delete_table(ROOTS);
+    let mut t = wtx.open_table(ROOTS)?;
+    for (i, r) in roots.iter().enumerate() {
+        let bytes = serde_json::to_vec(r)?;
+        t.insert(i as u64, bytes.as_slice())?;
+    }
+    Ok(())
 }
 
 impl GraphStore for RedbStore {
     fn write(&mut self, nodes: &[Node], edges: &[Edge]) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent).ok();
-        }
-        let db = Database::create(&self.path).context("create redb")?;
+        let db = self.db()?;
         let wtx = db.begin_write()?;
-        // clear stale graph tables (the extract cache table is left intact)
-        let _ = wtx.delete_table(NODES);
-        let _ = wtx.delete_table(EDGES);
-        {
-            let mut t = wtx.open_table(NODES)?;
-            for n in nodes {
-                let bytes = serde_json::to_vec(n)?;
-                t.insert(n.id.0, bytes.as_slice())?;
-            }
-        }
-        {
-            let mut t = wtx.open_table(EDGES)?;
-            for (i, e) in edges.iter().enumerate() {
-                let bytes = serde_json::to_vec(e)?;
-                t.insert(i as u64, bytes.as_slice())?;
-            }
-        }
+        put_graph(&wtx, nodes, edges)?;
+        wtx.commit()?;
+        Ok(())
+    }
+
+    fn write_index(
+        &mut self,
+        nodes: &[Node],
+        edges: &[Edge],
+        files: &[CachedFile],
+        roots: &[(String, PathBuf)],
+    ) -> Result<()> {
+        let db = self.db()?;
+        let wtx = db.begin_write()?;
+        put_graph(&wtx, nodes, edges)?;
+        put_extracts(&wtx, files)?;
+        put_roots(&wtx, roots)?;
         wtx.commit()?;
         Ok(())
     }
 
     fn write_extracts(&mut self, files: &[CachedFile]) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent).ok();
-        }
-        let db = Database::create(&self.path).context("create redb")?;
+        let db = self.db()?;
         let wtx = db.begin_write()?;
-        let _ = wtx.delete_table(EXTRACTS);
-        {
-            let mut t = wtx.open_table(EXTRACTS)?;
-            for f in files {
-                let bytes = serde_json::to_vec(f)?;
-                t.insert(f.module_path.as_str(), bytes.as_slice())?;
-            }
-        }
+        put_extracts(&wtx, files)?;
         wtx.commit()?;
         Ok(())
     }
@@ -108,19 +156,9 @@ impl GraphStore for RedbStore {
     }
 
     fn write_roots(&mut self, roots: &[(String, PathBuf)]) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent).ok();
-        }
-        let db = Database::create(&self.path).context("create redb")?;
+        let db = self.db()?;
         let wtx = db.begin_write()?;
-        let _ = wtx.delete_table(ROOTS);
-        {
-            let mut t = wtx.open_table(ROOTS)?;
-            for (i, r) in roots.iter().enumerate() {
-                let bytes = serde_json::to_vec(r)?;
-                t.insert(i as u64, bytes.as_slice())?;
-            }
-        }
+        put_roots(&wtx, roots)?;
         wtx.commit()?;
         Ok(())
     }
