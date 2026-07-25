@@ -74,6 +74,49 @@ candidates — check it before acting on it.
 - Type-level Absinthe fields aren't joined to consumers: only *root* fields are, so a
   nested selection (`player { team { … } }`) does not reach `team`'s resolver yet.
 
+## End of every phase: the ritual
+
+Run this when a phase lands, before starting the next one. It exists because each
+step below has already caught something the others missed.
+
+**1. Gates.** `cargo fmt --all --check`, `cargo clippy --all-targets` (0 warnings),
+`cargo test`. Non-negotiable.
+
+**2. Review the diff yourself** — `git diff <phase-start>..HEAD`. Look specifically
+for the failure shapes this project keeps producing:
+
+- a fix for one language silently damaging another (the Elixir guard deleted a
+  TypeScript edge)
+- a **silent zero or empty result** reported as a finding (`eval` printed 0.0%)
+- a **mislabelled number** (the index summary counted `graphql + db` as "graphql")
+- **inflated counts** from indexing things nobody will change (deps were 74% of the graph)
+- a test that passes whether or not the fix is present — disable the fix and confirm
+  the test actually fails
+
+**3. Re-measure on real code, and write the numbers down.** Index the 5noobs stack and
+record files / nodes / edges / graphql / db / cold+warm time. A number that moves
+unexpectedly is the cheapest bug detector we have — every big find today started as a
+count that didn't add up. If a count changes, explain *why* before moving on.
+
+**4. Check token cost.** `/caveman-stats` for this session's real usage. Note it
+against what the phase delivered. A phase that burned a lot of context for a small
+diff usually means the approach was wrong, not that the work was hard.
+
+**5. Sanity-check ripple's risk output on your own change** — this is the dogfood
+step that matters most:
+
+```
+cargo run -p ripple-cli -- review --root <indexed repo>     # what it says to review first
+cargo run -p ripple-cli -- risk <file-you-changed> --root <p>
+```
+
+Ask: does the ranking match where the danger actually was? If a file you know is
+risky ranks low, or something trivial ranks top, **that is a finding** — the risk
+formula's weights are hand-set constants, never fit to data, so this is the only
+feedback they get. Log it.
+
+**6. Log, commit, then next phase.** One concern per commit.
+
 ## Dogfood log — the point of all this
 
 When ripple gives a wrong, missing, or confusing answer, append to
