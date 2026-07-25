@@ -54,13 +54,30 @@ pub fn diff_lines(root: &Path, base: Option<&str>) -> HashMap<String, Vec<(u32, 
     try_diff(root, base).unwrap_or_default()
 }
 
-/// The changed file sets (index-root-relative) of the most recent `k` non-merge
-/// commits, skipping bulk commits. For evaluating blast-radius prediction.
-pub fn recent_commit_files(root: &Path, k: usize) -> Vec<Vec<String>> {
-    try_recent(root, k).unwrap_or_default()
+/// A train/test split of the repo's history, so co-change can be scored on
+/// commits it was never mined from.
+#[derive(Default)]
+pub struct Holdout {
+    /// Changed file sets (index-root-relative) of the held-out commits, newest first.
+    pub test: Vec<Vec<String>>,
+    /// Signals mined strictly from commits *older* than the held-out window.
+    pub train: GitOverlay,
+    /// How many commits fed `train` (0 = history too short to train on).
+    pub train_commits: usize,
 }
 
-fn try_recent(root: &Path, k: usize) -> Result<Vec<Vec<String>>, git2::Error> {
+/// Split `root`'s history at the `k`th most recent eligible commit: those `k`
+/// become the test set, everything older is mined into `train`.
+///
+/// Every commit newer than the split point is withheld from mining, including
+/// ones ineligible as test cases (merges, single-file, bulk) — otherwise the
+/// co-change score would be measured on commits it learned from, which is
+/// exactly the leak this exists to close.
+pub fn holdout(root: &Path, k: usize) -> Holdout {
+    try_holdout(root, k).unwrap_or_default()
+}
+
+fn try_holdout(root: &Path, k: usize) -> Result<Holdout, git2::Error> {
     let repo = git2::Repository::discover(root)?;
     let workdir = repo
         .workdir()
@@ -71,9 +88,11 @@ fn try_recent(root: &Path, k: usize) -> Result<Vec<Vec<String>>, git2::Error> {
     revwalk.push_head()?;
     revwalk.set_sorting(git2::Sort::TIME)?;
 
-    let mut out = Vec::new();
+    let mut test = Vec::new();
+    let mut acc = Accum::default();
+    let mut train_commits = 0usize;
     for oid in revwalk {
-        if out.len() >= k {
+        if train_commits >= COMMIT_WINDOW {
             break;
         }
         let Ok(commit) = repo.find_commit(oid?) else {
@@ -83,11 +102,23 @@ fn try_recent(root: &Path, k: usize) -> Result<Vec<Vec<String>>, git2::Error> {
             continue; // skip merges and root
         }
         let files = changed_files(&repo, &commit, &workdir, &index_root);
-        if files.len() >= 2 && files.len() <= MAX_FILES_PER_COMMIT {
-            out.push(files);
+        if test.len() < k {
+            if files.len() >= 2 && files.len() <= MAX_FILES_PER_COMMIT {
+                test.push(files);
+            }
+            continue; // inside the holdout window: trains nothing
         }
+        if files.is_empty() || files.len() > MAX_FILES_PER_COMMIT {
+            continue;
+        }
+        acc.add(&files, is_fix(commit.message().unwrap_or("")), &commit);
+        train_commits += 1;
     }
-    Ok(out)
+    Ok(Holdout {
+        test,
+        train: acc.finalize(),
+        train_commits,
+    })
 }
 
 fn try_diff(
@@ -144,8 +175,7 @@ fn try_mine(root: &Path) -> Result<GitOverlay, git2::Error> {
     revwalk.push_head()?;
     revwalk.set_sorting(git2::Sort::TIME)?;
 
-    let mut raw: HashMap<String, RawMetrics> = HashMap::new();
-    let mut pair_shared: HashMap<(String, String), u32> = HashMap::new();
+    let mut acc = Accum::default();
 
     for oid in revwalk.take(COMMIT_WINDOW) {
         let Ok(oid) = oid else { continue };
@@ -155,15 +185,28 @@ fn try_mine(root: &Path) -> Result<GitOverlay, git2::Error> {
         if commit.parent_count() != 1 {
             continue; // skip merges (noisy) and the root commit (diffs vs empty tree = all files)
         }
-        let is_fix = is_fix(commit.message().unwrap_or(""));
-        let author = commit.author().name().unwrap_or("?").to_owned();
-
         let files = changed_files(&repo, &commit, &workdir, &index_root);
         if files.is_empty() || files.len() > MAX_FILES_PER_COMMIT {
             continue;
         }
-        for f in &files {
-            let m = raw.entry(f.clone()).or_default();
+        acc.add(&files, is_fix(commit.message().unwrap_or("")), &commit);
+    }
+
+    Ok(acc.finalize())
+}
+
+/// Per-file counters and co-change pair counts, accumulated commit by commit.
+#[derive(Default)]
+struct Accum {
+    raw: HashMap<String, RawMetrics>,
+    pair_shared: HashMap<(String, String), u32>,
+}
+
+impl Accum {
+    fn add(&mut self, files: &[String], is_fix: bool, commit: &git2::Commit) {
+        let author = commit.author().name().unwrap_or("?").to_owned();
+        for f in files {
+            let m = self.raw.entry(f.clone()).or_default();
             m.commits += 1;
             m.fix_commits += u32::from(is_fix);
             m.authors.insert(author.clone());
@@ -172,12 +215,14 @@ fn try_mine(root: &Path) -> Result<GitOverlay, git2::Error> {
         for i in 0..files.len() {
             for j in (i + 1)..files.len() {
                 let (a, b) = order(&files[i], &files[j]);
-                *pair_shared.entry((a, b)).or_default() += 1;
+                *self.pair_shared.entry((a, b)).or_default() += 1;
             }
         }
     }
 
-    Ok(finalize(raw, pair_shared))
+    fn finalize(self) -> GitOverlay {
+        finalize(self.raw, self.pair_shared)
+    }
 }
 
 /// Normalize raw metrics to [0,1] percentiles and build co-change edges.
@@ -510,6 +555,88 @@ mod tests {
             is_exported: false,
             risk: RiskScores::default(),
         }
+    }
+
+    /// Commit `files` (each written with fresh content) on top of HEAD.
+    fn commit(repo: &git2::Repository, n: u32, files: &[&str]) {
+        let workdir = repo.workdir().expect("workdir").to_path_buf();
+        let mut index = repo.index().expect("index");
+        for f in files {
+            std::fs::write(workdir.join(f), format!("v{n}\n")).expect("write");
+            index.add_path(Path::new(f)).expect("add");
+        }
+        index.write().expect("write index");
+        let tree = repo
+            .find_tree(index.write_tree().expect("write_tree"))
+            .expect("tree");
+        // explicit, increasing timestamps: commits made in the same second sort
+        // arbitrarily under Sort::TIME, which would make the split point random
+        let sig = git2::Signature::new(
+            "t",
+            "t@e",
+            &git2::Time::new(1_700_000_000 + i64::from(n) * 60, 0),
+        )
+        .expect("sig");
+        let parents = repo
+            .head()
+            .ok()
+            .and_then(|h| h.peel_to_commit().ok())
+            .map(|c| vec![c])
+            .unwrap_or_default();
+        repo.commit(
+            Some("HEAD"),
+            &sig,
+            &sig,
+            &format!("c{n}"),
+            &tree,
+            &parents.iter().collect::<Vec<_>>(),
+        )
+        .expect("commit");
+    }
+
+    #[test]
+    fn holdout_trains_only_on_commits_older_than_the_test_window() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = git2::Repository::init(dir.path()).expect("init");
+        commit(&repo, 0, &["seed.ts"]); // root commit: no parent, never eligible
+        for n in 1..=3 {
+            commit(&repo, n, &["a.ts", "b.ts"]); // training-window coupling
+        }
+        for n in 4..=5 {
+            commit(&repo, n, &["c.ts", "d.ts"]); // inside the holdout window
+        }
+
+        let split = holdout(dir.path(), 2);
+        assert_eq!(split.test.len(), 2, "the two newest eligible commits");
+        assert!(split.test.iter().all(|f| f.contains(&"c.ts".to_owned())));
+        assert_eq!(split.train_commits, 3);
+
+        let pairs: Vec<(&str, &str)> = split
+            .train
+            .cochange
+            .iter()
+            .map(|(a, b, _)| (a.as_str(), b.as_str()))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![("a.ts", "b.ts")],
+            "c.ts/d.ts is what the test set is scored on — mining it is the leak"
+        );
+    }
+
+    #[test]
+    fn holdout_reports_an_empty_training_window() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = git2::Repository::init(dir.path()).expect("init");
+        commit(&repo, 0, &["a.ts"]);
+        commit(&repo, 1, &["a.ts", "b.ts"]);
+
+        // asking for more test commits than exist leaves nothing to train on;
+        // callers need to tell that apart from a real 0%
+        let split = holdout(dir.path(), 50);
+        assert_eq!(split.test.len(), 1);
+        assert_eq!(split.train_commits, 0);
+        assert!(split.train.cochange.is_empty());
     }
 
     #[test]

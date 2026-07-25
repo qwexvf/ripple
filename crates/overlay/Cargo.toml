@@ -8,3 +8,6 @@ license.workspace = true
 ir = { workspace = true }
 anyhow = { workspace = true }
 git2 = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

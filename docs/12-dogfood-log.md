@@ -8,6 +8,35 @@ the roadmap beforehand. Using the tool finds different bugs than reading it.
 
 ---
 
+## 2026-07-25 — the headline number was 34 points of leakage
+
+**Asked:** `ripple eval --commits 300 --root <web>` — the project's headline recall
+figure, quoted as static 6.5% / co-change 35.4% / fused 40.4%.
+
+**Said:** the same, for months. Nothing looked wrong: the static baseline was known
+to be leakage-free and the co-change lift was the doc-02 differentiator, "measured".
+
+**Was true:** co-change was scored on the commits its own `ChangesWith` edges were
+mined from. `eval` read the edges out of the persisted graph, and the graph is mined
+from the newest 3000 commits — which contains the entire 300-commit test window. With
+mining restricted to commits older than the test window: **co-change 3.4%, fused
+10.5%** (50 test / 500 training commits). The lift is ~3 points, not ~34.
+
+**Implication (fixed).** `overlay::holdout` splits history at the k-th newest
+eligible commit and mines only the older side; `eval` scores against that instead of
+the graph. It also prints the trained-pair count, which immediately showed the second
+trap: at `--commits 300` only 148 training commits remain and they yield **15** usable
+pairs, so the 1.3% there is a starved training set, not a worse model. `docs/11`'s
+"34 of ripple's 40 recall points come from evolution" was load-bearing for the LSP
+plan and is now wrong in the other direction — call-graph coverage is the binding
+constraint.
+
+**Lesson:** an evaluation that reads its predictions out of the artifact it is
+evaluating will always flatter it. The one number nobody re-derived was the one
+number that mattered.
+
+---
+
 ## 2026-07-25 — rust path calls: 0 hits → 4, after two wrong turns
 
 **Asked:** `impact link_cross_service --root .` reported 0 hits (see the entry

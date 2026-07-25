@@ -21,9 +21,11 @@ an explanation is the cheapest bug signal this project has, so re-measure and di
 1153 files → 10099 nodes, 14153 edges
   (2461 co-change, 343 graphql, 820 db, 31 imported, 4576 with dependents)
 cold index ~1.7s, warm ~0.9s
-eval (5noobs-web, 300 commits, 4188 same-commit pairs):
-  static 6.5% (leakage-free) | co-change 35.4% | fused 40.4%   ← fused is optimistic
-                                                                 until the holdout lands
+eval (5noobs-web, held out — co-change mined only from commits older than the test window):
+  --commits 50  (500 train, 2078 pairs): static 7.1% | co-change 3.4% | fused 10.5%
+  --commits 300 (148 train, 4188 pairs): static 6.5% | co-change 1.3% | fused  7.8%
+  ↑ prefer the 50 line: a 300-commit test window leaves only 148 training commits
+    (15 trained pairs), so co-change is starved, not wrong
 eval --oracle lsp vs dexter 0.7.1, 40 files:
   145/165 (87.9%) identical caller sets, 1 possible false positive, 19 possible misses
 ```
@@ -65,7 +67,7 @@ neighbors <symbol> [--in|--out] [--depth N] [--root P] [--json]
 impact <symbol>... [--budget N] [--root P] [--json]     # ranked blast radius
 review [<base-rev>] [--budget N] [--root P] [--json]    # hunks to look at first
 risk <symbol|file> [--root P] [--json]
-eval [--commits N] [--root P]                           # static vs co-change recall
+eval [--commits N] [--root P]        # static vs co-change recall on N held-out commits
 ```
 
 - `--in` = callers/importers (what breaks if this changes). `--out` = dependencies.

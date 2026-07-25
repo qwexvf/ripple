@@ -713,18 +713,33 @@ fn cmd_eval(args: &[String]) -> Result<()> {
         EdgeKind::GraphqlCall,
         EdgeKind::DbQuery,
     ];
-    let cochange = |a: &str, b: &str| {
-        let (ma, mb) = (ir::SymbolId::module(a), ir::SymbolId::module(b));
-        graph
-            .out_edges(ma)
-            .iter()
-            .any(|e| e.kind == EdgeKind::ChangesWith && e.dst == mb)
-    };
-    // cache each test file's statically-reachable file set (from all its symbols)
-    let commits: Vec<Vec<String>> = overlay::recent_commit_files(&root, k)
-        .into_iter()
+    // co-change is scored on held-out commits: the newest k commits are the test
+    // set, and the pair counts come from older history only. Reading the graph's
+    // own ChangesWith edges instead would score the mining window against itself.
+    let split = overlay::holdout(&root, k);
+    let trained: std::collections::HashSet<(String, String)> = split
+        .train
+        .cochange
+        .iter()
+        .flat_map(|(a, b, _)| {
+            let (a, b) = (resolve::namespace(&tag, a), resolve::namespace(&tag, b));
+            [(a.clone(), b.clone()), (b, a)]
+        })
+        .collect();
+    let cochange = |a: &str, b: &str| trained.contains(&(a.to_owned(), b.to_owned()));
+    // pairs the training window could actually score: both ends indexed. Separates
+    // "co-change learned nothing" from "co-change learned the wrong pairs".
+    let trained_pairs = trained
+        .iter()
+        .filter(|(a, b)| a < b && indexed(a) && indexed(b))
+        .count();
+    let commits: Vec<Vec<String>> = split
+        .test
+        .iter()
         .map(|files| files.iter().map(|p| resolve::namespace(&tag, p)).collect())
         .collect();
+    let test_commits = commits.len();
+    // cache each test file's statically-reachable file set (from all its symbols)
     let mut reach: std::collections::HashMap<String, std::collections::HashSet<String>> =
         std::collections::HashMap::new();
     let mut reach_of = |file: &str| -> std::collections::HashSet<String> {
@@ -745,7 +760,7 @@ fn cmd_eval(args: &[String]) -> Result<()> {
                 let (a, b) = (&idx[i], &idx[j]);
                 pairs += 1;
                 let s = reach_of(a).contains(b.as_str()) || reach_of(b).contains(a.as_str());
-                let c = cochange(a, b) || cochange(b, a);
+                let c = cochange(a, b);
                 if s {
                     stat += 1;
                 }
@@ -768,7 +783,7 @@ fn cmd_eval(args: &[String]) -> Result<()> {
     if pairs == 0 {
         println!(
             "no same-commit file pairs among indexed files — nothing to evaluate.\n  \
-             checked {k} recent commits of {}; the graph holds {} files.",
+             held out {test_commits} of {k} requested commits of {}; the graph holds {} files.",
             root.display(),
             graph
                 .nodes()
@@ -778,18 +793,26 @@ fn cmd_eval(args: &[String]) -> Result<()> {
         return Ok(());
     }
     println!(
-        "historical co-change prediction over recent commits ({pairs} same-commit file pairs):"
+        "held-out co-change prediction ({test_commits} test commits, \
+         {} training commits, {pairs} same-commit file pairs):",
+        split.train_commits
     );
+    println!("  static edges alone : {:.1}%  ({stat})", pct(stat));
     println!(
-        "  static edges alone : {:.1}%  ({stat})   ← leakage-free baseline",
-        pct(stat)
+        "  co-change alone    : {:.1}%  ({co})   ← from {trained_pairs} trained pairs",
+        pct(co)
     );
-    println!("  co-change alone    : {:.1}%  ({co})", pct(co));
     println!("  fused (either)     : {:.1}%  ({either})", pct(either));
     println!(
         "  → co-change lifts recall by {:.1} pts over static-only",
         pct(either) - pct(stat)
     );
+    if split.train_commits == 0 {
+        println!(
+            "  note: no commits older than the {test_commits}-commit test window, so \
+             co-change had nothing to learn from — the 0.0% above is not a result."
+        );
+    }
     Ok(())
 }
 

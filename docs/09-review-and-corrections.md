@@ -66,7 +66,7 @@ Design-level issues found in review and the fix now reflected in the spec:
 4. Exact `kind_weight` / decay / weight defaults — to be tuned against a labelled repo, not guessed.
 5. **Tier-2 reference resolution** (the thinnest core piece) — **designed for TS** in [`v0-plan.md`](v0-plan.md) (scope-tree name resolution + shallow member-call resolution with `1/N` candidate edges, honest confidence ladder). Other languages inherit the pattern per adapter.
 
-~~Still genuinely open: **evaluation methodology**~~ **Built** — `ripple eval` does historical co-change prediction (static-only baseline is leakage-free). On 5noobs-web: static edges alone link ~6.5% of same-commit file pairs, co-change lifts recall to ~40% — the doc-02 gap, measured. (Holdout for a leakage-free co-change number is a follow-up.)
+~~Still genuinely open: **evaluation methodology**~~ **Built** — `ripple eval` does historical co-change prediction on a **held-out** window: the newest `--commits N` commits are the test set and co-change is mined only from older history. On 5noobs-web (50 test commits, 500 training commits, 2078 pairs): static 7.1%, co-change 3.4%, fused 10.5%. The earlier ~40% fused figure was measured over the same commits the co-change edges were mined from — **the leak was worth ~30 points**, which is most of what that number claimed. Static recall was always leakage-free and did not move.
 
 ## Design-review round 2 (post-v2, as-built)
 

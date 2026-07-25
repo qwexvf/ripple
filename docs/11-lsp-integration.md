@@ -36,7 +36,7 @@ bug in either side. Compiler tracers remain the only true ground truth.
 | 0–1 symbols, imports, modules | tree-sitter `.scm` | no build, no server, works on code that doesn't compile |
 | **2 call resolution** | **LSP where available**, tree-sitter as fallback | correctness for the price of config, not code |
 | 3 cross-service (GraphQL, Ecto, HTTP) | ripple only | no server knows the TS↔Absinthe join |
-| evolution (churn, ownership, co-change) | ripple only (git) | 34 of ripple's 40 recall points |
+| evolution (churn, ownership, co-change) | ripple only (git) | risk ranking; ~3 held-out recall points on top of static |
 | decisions (blast radius, review targeting, risk) | ripple only | the actual product |
 
 A server knows one language, in one workspace, that compiles. Ripple knows *N*
@@ -151,7 +151,8 @@ Built-in defaults cover `elixir` (dexter), `typescript`, `go`, `python`, and
 
 ## What this does not fix
 
-Recall stays ~40% and is dominated by non-static coupling (co-change), not
-call-graph precision. This raises Tier-2 *precision*. It does not widen coverage,
-and no server will ever produce the cross-repo cross-service edges that are
-ripple's actual differentiator.
+Held-out recall stays ~10% and most of it is static — co-change adds ~3 points,
+not the ~34 assumed before the holdout landed. So call-graph coverage is the
+binding constraint, and this raises Tier-2 *precision* on top of it, not coverage.
+No server will ever produce the cross-repo cross-service edges that are ripple's
+actual differentiator.
