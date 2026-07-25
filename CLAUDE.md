@@ -27,6 +27,35 @@ cargo test                          # unit + golden-fixture + contract tests
 cargo run -p ripple-cli -- <cmd>    # parse <file> | index <path> | neighbors <symbol>
 ```
 
+## Picking the next task
+
+Work is tracked on **GitHub Projects board 7** (`https://github.com/users/qwexvf/projects/7`),
+not in any file in this repo. At the start of a session, read it — don't infer priorities
+from the code or from `docs/`:
+
+```
+gh issue list --repo qwexvf/ripple --label next-up --state open   # ranked shortlist
+gh project item-list 7 --owner qwexvf --format json               # full board + Status
+gh issue view <n> --repo qwexvf/ripple                            # the actual context
+```
+
+- **`next-up`** is the ranked shortlist. Take the lowest-numbered unblocked one unless
+  the user says otherwise, and re-rank openly if the reasoning has changed.
+- **In Progress** items have partial work already committed; the issue comments say what
+  landed and what's left.
+- Each issue body carries the measurement or failure that motivated it. Read it before
+  starting — several were opened precisely because a plausible-looking fix made a number
+  worse.
+
+When work finishes: comment the **evidence** on the issue (measured numbers, not "done"),
+set Status, close it, and move `next-up` to whatever is now top. When something new is
+found, open an issue instead of keeping a local list — `PROGRESS.txt` was deleted on
+purpose and must not come back.
+
+`docs/12-dogfood-log.md` is the running record of what ripple got wrong when used for
+real; it has produced more committed fixes than the roadmap has, and its open entries are
+usually the best candidates for new issues.
+
 ## Architecture invariants (do not break)
 
 These are the load-bearing rules the design depends on. A change that violates one needs a design discussion, not a patch.
