@@ -249,12 +249,20 @@ fn extract_imports(tree: &Tree, query: &Query, src: &[u8]) -> Result<Vec<ImportR
     Ok(out)
 }
 
+/// Reference sites, from `ref.call` / `ref.member` / `ref.recv` captures.
+///
+/// A `ref.ignore` capture marks a region where references don't count. Patterns
+/// in a tree-sitter query match independently, so a broad pattern can't be
+/// narrowed by a more specific one — an adapter marks the exceptions instead
+/// (Elixir: everything inside `@spec get(id :: String.t()) :: t()` parses as
+/// calls, but names types).
 fn extract_refs(tree: &Tree, query: &Query, src: &[u8]) -> Result<Vec<RefRec>> {
     let names = query.capture_names();
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(query, tree.root_node(), src);
 
     let mut out = Vec::new();
+    let mut ignored: Vec<((u32, u32), (u32, u32))> = Vec::new();
     while let Some(m) = matches.next() {
         if !predicates_hold(query, m, src) {
             continue;
@@ -267,6 +275,10 @@ fn extract_refs(tree: &Tree, query: &Query, src: &[u8]) -> Result<Vec<RefRec>> {
                 "ref.call" => call = Some(cap.node),
                 "ref.member" => member = Some(cap.node),
                 "ref.recv" => recv = Some(cap.node),
+                "ref.ignore" => {
+                    let s = span_of(cap.node);
+                    ignored.push(((s.start_line, s.start_col), (s.end_line, s.end_col)));
+                }
                 _ => {}
             }
         }
@@ -290,6 +302,10 @@ fn extract_refs(tree: &Tree, query: &Query, src: &[u8]) -> Result<Vec<RefRec>> {
             }
         }
     }
+    out.retain(|r| {
+        let at = (r.site.start_line, r.site.start_col);
+        !ignored.iter().any(|&(start, end)| at >= start && at <= end)
+    });
     Ok(out)
 }
 

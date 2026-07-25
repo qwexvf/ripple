@@ -387,6 +387,14 @@ fn resolve_calls(
         let enclosing = enclosing_def(&defs_by_start, r.site);
         let src_id = enclosing.map_or(module_id, |n| n.id);
 
+        // In languages where a definition is itself a call (Elixir's `def f(x)`),
+        // the definition's own name parses as a call in its header. Such a ref
+        // names the definition, so drop it — otherwise every function gains a
+        // self-edge, and every multi-clause function links its clauses together.
+        if enclosing.is_some_and(|d| d.name == r.name && r.site.start_line == d.span.start_line) {
+            continue;
+        }
+
         let (targets, base_conf) = match r.kind {
             RefKind::Call => {
                 let t = match local.get(&r.name) {
@@ -400,8 +408,16 @@ fn resolve_calls(
             }
         };
 
+        // several definitions can share one id — Elixir's multi-clause functions
+        // and default args all key to (module, name). They are one target, so
+        // dedup before counting or the confidence is diluted by a phantom
+        // ambiguity and the same edge is emitted once per clause.
+        let mut targets = targets;
+        targets.sort_unstable();
+        targets.dedup();
+
         let n = targets.len() as f32;
-        for t in targets {
+        for t in targets.into_iter().filter(|&t| t != src_id) {
             edges.push(Edge {
                 src: src_id,
                 dst: t,

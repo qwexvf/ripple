@@ -38,6 +38,10 @@ impl LanguageAdapter for Adapter {
         include_str!("queries/tags.scm")
     }
 
+    fn refs_query(&self) -> Option<&'static str> {
+        Some(include_str!("queries/refs.scm"))
+    }
+
     fn extract_cross(&self, root: tree_sitter::Node, src: &[u8]) -> crate::cross::CrossFacts {
         crate::cross::elixir(root, src)
     }

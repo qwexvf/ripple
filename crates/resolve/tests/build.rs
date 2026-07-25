@@ -223,6 +223,72 @@ fn ambiguous_root_field_splits_confidence() {
     );
 }
 
+/// Elixir definitions are macro calls, so local calls need the ref pipeline plus
+/// two guards: a definition's own name in its header is not a call to itself, and
+/// clauses of a multi-clause function are not calls to each other.
+#[test]
+fn resolves_elixir_local_calls() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/elixir");
+    let r = resolve::build(&root).unwrap();
+
+    let get_player = SymbolId::of("players.ex", "get_player");
+    let list_players = SymbolId::of("players.ex", "list_players");
+    let normalize = SymbolId::of("players.ex", "normalize");
+    let fetch = SymbolId::of("players.ex", "fetch");
+    let kind = SymbolId::of("players.ex", "kind");
+    let countdown = SymbolId::of("players.ex", "countdown");
+
+    let calls: Vec<(SymbolId, SymbolId)> = r
+        .edges
+        .iter()
+        .filter(|e| e.kind == EdgeKind::Calls)
+        .map(|e| (e.src, e.dst))
+        .collect();
+
+    // piped local calls resolve, including to a private helper
+    assert!(
+        calls.contains(&(get_player, normalize)),
+        "get_player |> normalize"
+    );
+    assert!(calls.contains(&(get_player, fetch)), "get_player |> fetch");
+    assert!(
+        calls.contains(&(list_players, normalize)),
+        "list_players |> normalize"
+    );
+
+    // A typespec names types, not call sites. Its refs sit outside any function,
+    // so they would attach to whatever encloses them — the `defmodule` node.
+    let defmodule = SymbolId::of("players.ex", "App.Players");
+    for (dst, what) in [
+        (get_player, "@spec get_player(String.t())"),
+        (normalize, "@type ... normalize(term())"),
+    ] {
+        assert!(
+            !calls.contains(&(defmodule, dst)),
+            "{what} must not be a call site"
+        );
+    }
+
+    // the whole graph for this fixture, so new noise can't slip in unnoticed
+    assert_eq!(
+        calls.len(),
+        3,
+        "expected exactly the 3 real local calls, got {calls:?}"
+    );
+
+    // no definition-header artifacts: no self-edges, no clause-to-clause edges
+    assert!(
+        !calls.iter().any(|(s, d)| s == d),
+        "a definition must not call itself: {calls:?}"
+    );
+    for sym in [kind, countdown] {
+        assert!(
+            !calls.contains(&(sym, sym)),
+            "multi-clause function linked to its own clauses"
+        );
+    }
+}
+
 #[test]
 fn deterministic_build() {
     let a = resolve::build(&fixture()).unwrap();
