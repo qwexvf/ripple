@@ -8,6 +8,60 @@
 use crate::{resolve_import, LanguageAdapter, Workspace};
 use std::path::{Path, PathBuf};
 
+/// Is this definition named by a separate `export { … }` statement?
+///
+/// `function Input() {…}` followed by `export { Input };` is the shadcn/ui
+/// convention — 24 files in one real app — and the ancestor walk cannot see it,
+/// because the export is a sibling statement, not a parent. Without this the
+/// component is not in the export table, so no importer can resolve it and a
+/// component's callers come back empty.
+fn exported_by_a_list(def: tree_sitter::Node, src: &[u8]) -> bool {
+    let Some(name) = def
+        .child_by_field_name("name")
+        .and_then(|n| n.utf8_text(src).ok())
+    else {
+        return false;
+    };
+    // top-level statements only: a nested `export` is not a module export
+    let mut program = def;
+    while let Some(parent) = program.parent() {
+        program = parent;
+    }
+    let mut cursor = program.walk();
+    let statements: Vec<tree_sitter::Node> = program
+        .named_children(&mut cursor)
+        .filter(|n| n.kind() == "export_statement")
+        .collect();
+    statements
+        .into_iter()
+        .any(|stmt| names_in_export_clause(stmt, src).any(|n| n == name))
+}
+
+/// The *local* names an `export { a, b as c }` statement re-exports. `b as c`
+/// yields `b`: the local definition is what is being marked exported (the alias a
+/// consumer imports under is issue #1).
+fn names_in_export_clause<'a>(
+    stmt: tree_sitter::Node<'a>,
+    src: &'a [u8],
+) -> impl Iterator<Item = &'a str> + 'a {
+    let mut cursor = stmt.walk();
+    let specifiers: Vec<tree_sitter::Node<'a>> = stmt
+        .named_children(&mut cursor)
+        .filter(|n| n.kind() == "export_clause")
+        .flat_map(|clause| {
+            let mut c = clause.walk();
+            clause
+                .named_children(&mut c)
+                .filter(|n| n.kind() == "export_specifier")
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    specifiers.into_iter().filter_map(move |spec| {
+        spec.child_by_field_name("name")
+            .and_then(|n| n.utf8_text(src).ok())
+    })
+}
+
 /// Every extension an import from TypeScript may land on, regardless of which
 /// flavour is doing the importing.
 const TS_FAMILY: &[&str] = &["*.ts", "*.tsx", "*.mts", "*.cts"];
@@ -108,8 +162,9 @@ impl LanguageAdapter for Adapter {
     }
 
     /// Exported if an ancestor is an `export_statement` (covers `export fn/class/
-    /// const`, `export default`); a class member is never a module export.
-    fn is_exported(&self, def: tree_sitter::Node, _src: &[u8]) -> bool {
+    /// const`, `export default`), or if a top-level `export { … }` list names it.
+    /// A class member is never a module export.
+    fn is_exported(&self, def: tree_sitter::Node, src: &[u8]) -> bool {
         let mut cur = def.parent();
         while let Some(n) = cur {
             match n.kind() {
@@ -120,7 +175,7 @@ impl LanguageAdapter for Adapter {
             }
             cur = n.parent();
         }
-        false
+        exported_by_a_list(def, src)
     }
 
     /// Methods/fields are qualified by their enclosing type (`Class.method`).

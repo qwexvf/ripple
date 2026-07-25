@@ -518,8 +518,9 @@ fn a_call_in_a_variable_initialiser_belongs_to_the_function() {
     );
 }
 
-/// Rendering a component is a call, and an import from a `.tsx` file lands on `.ts`
-/// files too. Both had to hold before a React component had any callers (issue #26).
+/// Rendering a component is a call, an export list is still an export, and an import
+/// from a `.tsx` file lands on `.ts` files too. All three had to hold before a React
+/// component had any callers at all.
 #[test]
 fn a_rendered_component_is_a_caller() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/jsx");
@@ -538,7 +539,7 @@ fn a_rendered_component_is_a_caller() {
 
     assert!(
         calls.contains(&(search, panel)),
-        "<Panel /> renders it, which is a call"
+        "<Panel /> renders it, and `export {{ Panel }}` exports it"
     );
     assert!(
         calls.contains(&(search, classes)),
