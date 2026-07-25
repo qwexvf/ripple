@@ -19,14 +19,15 @@ const MIN_SHARED: u32 = 2;
 /// Minimum coupling score to emit a co-change edge.
 const MIN_COUPLING: f32 = 0.3;
 
-// composite risk weights (git-only terms for now; churn + bugs carry most signal)
-const W_CHURN: f32 = 0.4;
-const W_BUG: f32 = 0.4;
-const W_OWN: f32 = 0.2;
+// composite risk weights. Public so `eval --risk` can score the blend that actually
+// ships rather than a copy of it that drifts.
+pub const W_CHURN: f32 = 0.4;
+pub const W_BUG: f32 = 0.4;
+pub const W_OWN: f32 = 0.2;
 /// Structural dependents. Weighted comparably to churn: a symbol many things
 /// depend on is risky to change even with a calm history — the case the static
 /// graph exists to catch.
-const W_FANOUT: f32 = 0.4;
+pub const W_FANOUT: f32 = 0.4;
 
 #[derive(Default)]
 struct RawMetrics {
@@ -54,12 +55,20 @@ pub fn diff_lines(root: &Path, base: Option<&str>) -> HashMap<String, Vec<(u32, 
     try_diff(root, base).unwrap_or_default()
 }
 
+/// One held-out commit: what it touched, and whether it looks like a fix.
+pub struct TestCommit {
+    /// Changed files, index-root-relative.
+    pub files: Vec<String>,
+    /// Message looks like a fix — the label risk scoring is judged against.
+    pub is_fix: bool,
+}
+
 /// A train/test split of the repo's history, so co-change can be scored on
 /// commits it was never mined from.
 #[derive(Default)]
 pub struct Holdout {
-    /// Changed file sets (index-root-relative) of the held-out commits, newest first.
-    pub test: Vec<Vec<String>>,
+    /// The held-out commits, newest first.
+    pub test: Vec<TestCommit>,
     /// Signals mined strictly from commits *older* than the held-out window.
     pub train: GitOverlay,
     /// How many commits fed `train` (0 = history too short to train on).
@@ -74,10 +83,20 @@ pub struct Holdout {
 /// co-change score would be measured on commits it learned from, which is
 /// exactly the leak this exists to close.
 pub fn holdout(root: &Path, k: usize) -> Holdout {
-    try_holdout(root, k).unwrap_or_default()
+    holdout_at(root, 0, k)
 }
 
-fn try_holdout(root: &Path, k: usize) -> Result<Holdout, git2::Error> {
+/// `holdout`, but skipping the newest `skip` eligible commits first.
+///
+/// Every "newest k" window contains every smaller one, so comparing k=30 against
+/// k=50 compares a window with a subset of itself. `skip` makes two windows genuinely
+/// disjoint, which is what fitting on one and grading on the other requires. Skipped
+/// commits are excluded from training too — they are newer than the test window.
+pub fn holdout_at(root: &Path, skip: usize, k: usize) -> Holdout {
+    try_holdout(root, skip, k).unwrap_or_default()
+}
+
+fn try_holdout(root: &Path, skip: usize, k: usize) -> Result<Holdout, git2::Error> {
     let repo = git2::Repository::discover(root)?;
     let workdir = repo
         .workdir()
@@ -91,6 +110,7 @@ fn try_holdout(root: &Path, k: usize) -> Result<Holdout, git2::Error> {
     let mut test = Vec::new();
     let mut acc = Accum::default();
     let mut train_commits = 0usize;
+    let mut skipped = 0usize;
     for oid in revwalk {
         if train_commits >= COMMIT_WINDOW {
             break;
@@ -102,9 +122,17 @@ fn try_holdout(root: &Path, k: usize) -> Result<Holdout, git2::Error> {
             continue; // skip merges and root
         }
         let files = changed_files(&repo, &commit, &workdir, &index_root);
+        let eligible = files.len() >= 2 && files.len() <= MAX_FILES_PER_COMMIT;
+        if skipped < skip {
+            skipped += usize::from(eligible);
+            continue; // newer than the test window: neither tested nor trained on
+        }
         if test.len() < k {
-            if files.len() >= 2 && files.len() <= MAX_FILES_PER_COMMIT {
-                test.push(files);
+            if eligible {
+                test.push(TestCommit {
+                    is_fix: is_fix(commit.message().unwrap_or("")),
+                    files,
+                });
             }
             continue; // inside the holdout window: trains nothing
         }
@@ -611,7 +639,10 @@ mod tests {
 
         let split = holdout(dir.path(), 2);
         assert_eq!(split.test.len(), 2, "the two newest eligible commits");
-        assert!(split.test.iter().all(|f| f.contains(&"c.ts".to_owned())));
+        assert!(split
+            .test
+            .iter()
+            .all(|c| c.files.contains(&"c.ts".to_owned())));
         assert_eq!(split.train_commits, 3);
 
         let pairs: Vec<(&str, &str)> = split
@@ -624,6 +655,34 @@ mod tests {
             pairs,
             vec![("a.ts", "b.ts")],
             "c.ts/d.ts is what the test set is scored on — mining it is the leak"
+        );
+    }
+
+    #[test]
+    fn skip_makes_two_windows_disjoint() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = git2::Repository::init(dir.path()).expect("init");
+        commit(&repo, 0, &["seed.ts"]);
+        for n in 1..=6 {
+            commit(
+                &repo,
+                n,
+                &[if n % 2 == 0 { "even.ts" } else { "odd.ts" }, "shared.ts"],
+            );
+        }
+
+        // every "newest k" window contains the smaller ones, so a fit graded against
+        // one of its own subsets grades itself
+        let newest = holdout_at(dir.path(), 0, 2);
+        let older = holdout_at(dir.path(), 2, 2);
+        assert_eq!(newest.test.len(), 2);
+        assert_eq!(older.test.len(), 2);
+        // c6,c5 vs c4,c3 — the parity of the non-shared file tells them apart
+        assert!(newest.test[0].files.contains(&"even.ts".to_owned()));
+        assert!(older.test[0].files.contains(&"even.ts".to_owned()));
+        assert_eq!(
+            older.train_commits, 2,
+            "the skipped commits train nothing either — they are newer than the test window"
         );
     }
 

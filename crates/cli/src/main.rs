@@ -3,6 +3,7 @@
 //!   ripple index <path>            M1: build graph → .ripple/graph.redb
 //!   ripple neighbors <symbol>      M1: traverse the persisted graph
 
+mod riskeval;
 mod verify;
 
 use anyhow::{bail, Context, Result};
@@ -58,6 +59,8 @@ const VALUE_FLAGS: &[&str] = &[
     "--granularity",
     "--verify",
     "--verify-budget",
+    "--weights",
+    "--skip",
 ];
 
 /// Positional args, correctly skipping `--flag value` pairs (so `--root X` never
@@ -548,6 +551,15 @@ fn verify_upgrade(
     Ok(InMemoryGraph::from_parts(nodes, outcome.edges))
 }
 
+/// `churn,bug,ownership,fanout` — four numbers, for grading a candidate weighting.
+fn parse_weights(spec: &str) -> Option<[f32; 4]> {
+    let parts: Vec<f32> = spec
+        .split(',')
+        .filter_map(|p| p.trim().parse().ok())
+        .collect();
+    <[f32; 4]>::try_from(parts.as_slice()).ok()
+}
+
 /// `2s`, `500ms`, or a bare number of milliseconds.
 fn parse_duration(v: Option<&str>) -> Option<std::time::Duration> {
     let v = v?.trim();
@@ -960,9 +972,90 @@ fn report_oracle(
     }
 }
 
+/// `eval --risk`: does the risk score rank the files a held-out fix commit touched?
+/// See `riskeval` for why that label and not co-change.
+fn cmd_eval_risk(args: &[String]) -> Result<()> {
+    let root: PathBuf = flag_value(args, "--root").map_or_else(|| ".".into(), PathBuf::from);
+    let k: usize = flag_value(args, "--commits")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50);
+    let store = RedbStore::open(db_path(&root));
+    let graph = store.load()?;
+    let tag = root_tag(&store, &root)?;
+
+    let skip: usize = flag_value(args, "--skip")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let split = overlay::holdout_at(&root, skip, k);
+    // risk from training history only, namespaced the way indexing did
+    let trained: std::collections::HashMap<String, ir::RiskScores> = split
+        .train
+        .file_risk
+        .iter()
+        .map(|(path, r)| (resolve::namespace(&tag, path), *r))
+        .filter(|(path, _)| !graph.nodes_in_file(path).is_empty())
+        .collect();
+    // structural fanout is a property of the graph, not of history — no leakage
+    let mut fanout: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
+    for n in graph.nodes() {
+        let slot = fanout.entry(n.module_path.clone()).or_default();
+        *slot = slot.max(n.risk.fanout);
+    }
+    let fixed: HashSet<String> = split
+        .test
+        .iter()
+        .filter(|c| c.is_fix)
+        .flat_map(|c| c.files.iter().map(|p| resolve::namespace(&tag, p)))
+        .filter(|p| trained.contains_key(p))
+        .collect();
+
+    let indexed_files = graph
+        .nodes()
+        .filter(|n| n.kind == ir::NodeKind::Module)
+        .count();
+    let terms = riskeval::terms_for(&trained, &fanout);
+    if terms.is_empty() || fixed.is_empty() {
+        println!(
+            "not enough held-out history to judge risk: {} scorable files, {} touched by a              fix in {} test commits",
+            terms.len(),
+            fixed.len(),
+            split.test.len()
+        );
+        return Ok(());
+    }
+    if let Some(spec) = flag_value(args, "--weights") {
+        let w = parse_weights(spec)
+            .with_context(|| format!("--weights wants four numbers like 0,0.2,0.1,0.3: {spec}"))?;
+        let (p, lift) = riskeval::score_weights(&terms, &fixed, w);
+        println!(
+            "weights churn {:.1} bug {:.1} own {:.1} fanout {:.1} on {} test commits              ({} files, {} fixed): p@25% {:.1}%, lift {:.2}×",
+            w[0],
+            w[1],
+            w[2],
+            w[3],
+            split.test.len(),
+            terms.len(),
+            fixed.len(),
+            100.0 * p,
+            lift
+        );
+        return Ok(());
+    }
+    riskeval::print(
+        &terms,
+        &fixed,
+        split.test.len(),
+        indexed_files.saturating_sub(terms.len()),
+    );
+    Ok(())
+}
+
 fn cmd_eval(args: &[String]) -> Result<()> {
     if flag_value(args, "--oracle") == Some("lsp") {
         return cmd_eval_oracle(args);
+    }
+    if args.iter().any(|a| a == "--risk") {
+        return cmd_eval_risk(args);
     }
     let root: PathBuf = flag_value(args, "--root").map_or_else(|| ".".into(), PathBuf::from);
     let k: usize = flag_value(args, "--commits")
@@ -1004,7 +1097,12 @@ fn cmd_eval(args: &[String]) -> Result<()> {
     let commits: Vec<Vec<String>> = split
         .test
         .iter()
-        .map(|files| files.iter().map(|p| resolve::namespace(&tag, p)).collect())
+        .map(|c| {
+            c.files
+                .iter()
+                .map(|p| resolve::namespace(&tag, p))
+                .collect()
+        })
         .collect();
     let test_commits = commits.len();
     // cache each test file's statically-reachable file set (from all its symbols)
