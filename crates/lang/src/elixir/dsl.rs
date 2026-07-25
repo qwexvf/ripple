@@ -74,12 +74,17 @@ pub fn cross_facts(scan: &Scan) -> CrossFacts {
 }
 
 fn schema_facts(scan: &Scan, dsl: &SchemaDsl, out: &mut ElixirFacts) {
-    // block-form resolvers are their own macro call inside the member's block,
-    // so index them by the scope chain they sit in
-    let mut block_resolvers: HashMap<Vec<String>, &FunRef> = HashMap::new();
+    // block-form resolvers are their own macro call inside the member's block, so
+    // index them by the scope chain they sit in. A scope can hold more than one
+    // (two `resolve` calls in one field): keep them all, because last-write-wins
+    // silently dropped one and then reported the survivor as certain.
+    let mut block_resolvers: HashMap<Vec<String>, Vec<&FunRef>> = HashMap::new();
     for call in scan.calls.iter().filter(|c| c.name == dsl.resolver) {
         if let Some(r) = call.fun_refs.first() {
-            block_resolvers.insert(call.scope.clone(), r);
+            let found = block_resolvers.entry(call.scope.clone()).or_default();
+            if !found.contains(&r) {
+                found.push(r);
+            }
         }
     }
 
@@ -113,14 +118,18 @@ fn schema_facts(scan: &Scan, dsl: &SchemaDsl, out: &mut ElixirFacts) {
 
 /// The resolver a member declares, in either spelling: nested `resolve(&M.f/3)`
 /// or inline `resolve: &M.f/3`. `None` when it names no single function
-/// (`dataloader(...)`, an inline `fn`) — under-link rather than invent an edge.
+/// (`dataloader(...)`, an inline `fn`, or two different `resolve` calls in one
+/// block) — under-link rather than invent an edge.
 fn resolver_of(
     call: &MacroCall,
     dsl: &SchemaDsl,
-    block_resolvers: &HashMap<Vec<String>, &FunRef>,
+    block_resolvers: &HashMap<Vec<String>, Vec<&FunRef>>,
 ) -> Option<FunRef> {
-    if let Some(r) = block_resolvers.get(&call.inner_scope()) {
-        return Some((*r).clone());
+    match block_resolvers.get(&call.inner_scope()).map(Vec::as_slice) {
+        // ambiguous: naming one of them would be a coin flip presented as a fact
+        Some([]) | Some([_, _, ..]) => return None,
+        Some([r]) => return Some((*r).clone()),
+        None => {}
     }
     call.keyword_fun_refs
         .iter()
@@ -165,5 +174,53 @@ fn data_facts(scan: &Scan, dsl: &DataDsl, out: &mut ElixirFacts) {
             out.schema_refs
                 .extend(rc.modules.iter().map(|m| (m.clone(), rc.line)));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::LanguageAdapter;
+
+    fn fields(src: &str) -> Vec<AbsintheField> {
+        let mut p = tree_sitter::Parser::new();
+        p.set_language(&crate::elixir::Adapter::new().grammar())
+            .expect("elixir grammar");
+        let tree = p.parse(src, None).expect("parse");
+        let scan = super::super::macros::scan(tree.root_node(), src.as_bytes());
+        cross_facts(&scan).elixir.expect("elixir facts").fields
+    }
+
+    #[test]
+    fn a_block_resolver_names_its_field() {
+        let f = fields(
+            "defmodule S do\n  alias App.PlayerResolver\n  query do\n    field :current_player, :player do\n      resolve(&PlayerResolver.current/3)\n    end\n  end\nend\n",
+        );
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].field, "currentPlayer");
+        assert_eq!(f[0].module, "App.PlayerResolver");
+        assert_eq!(f[0].func, "current");
+    }
+
+    #[test]
+    fn two_resolvers_in_one_field_yield_no_edge() {
+        // picking one of them was a coin flip reported as a fact: the map was
+        // last-write-wins, so `first` vanished silently
+        let f = fields(
+            "defmodule S do\n  alias App.PlayerResolver\n  query do\n    field :current_player, :player do\n      resolve(&PlayerResolver.first/3)\n      resolve(&PlayerResolver.second/3)\n    end\n  end\nend\n",
+        );
+        assert!(
+            f.is_empty(),
+            "ambiguous resolver must under-link, got {f:?}"
+        );
+    }
+
+    #[test]
+    fn the_same_resolver_twice_is_not_ambiguous() {
+        let f = fields(
+            "defmodule S do\n  alias App.PlayerResolver\n  query do\n    field :current_player, :player do\n      resolve(&PlayerResolver.current/3)\n      resolve(&PlayerResolver.current/3)\n    end\n  end\nend\n",
+        );
+        assert_eq!(f.len(), 1, "one distinct target is still one answer");
+        assert_eq!(f[0].func, "current");
     }
 }
