@@ -391,7 +391,14 @@ fn resolve_calls(
         // the definition's own name parses as a call in its header. Such a ref
         // names the definition, so drop it — otherwise every function gains a
         // self-edge, and every multi-clause function links its clauses together.
-        if enclosing.is_some_and(|d| d.name == r.name && r.site.start_line == d.span.start_line) {
+        //
+        // Unqualified calls only: a member call is never a definition header, and
+        // treating it as one silently dropped `class A { foo() { b.foo(); } }`,
+        // where the real call to `B.foo` shares a line with `A.foo`'s definition.
+        let is_def_header = r.kind == RefKind::Call
+            && enclosing
+                .is_some_and(|d| d.name == r.name && r.site.start_line == d.span.start_line);
+        if is_def_header {
             continue;
         }
 

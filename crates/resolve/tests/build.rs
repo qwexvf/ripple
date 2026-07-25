@@ -65,6 +65,17 @@ fn resolves_member_calls_by_type() {
         "typed receiver must not hit the other class's method"
     );
 
+    // A one-line method calling the same-named method of another class. The
+    // definition-header guard (for languages where `def f(x)` parses as a call)
+    // must not swallow it just because it shares the definition's line.
+    let inline_handle = SymbolId::of("svc.ts", "Inline.handle");
+    assert!(
+        r.edges.iter().any(|e| e.src == inline_handle
+            && e.dst == service_handle
+            && e.kind == EdgeKind::Calls),
+        "a one-line Inline.handle calling s.handle() should still reach Service.handle"
+    );
+
     // `new Service().handle()` resolves to Service.handle
     assert!(r
         .edges
