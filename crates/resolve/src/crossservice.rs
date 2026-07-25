@@ -4,7 +4,7 @@
 //! function → Ecto schema (`DbQuery`). No parsing here; extraction lives in
 //! `lang::cross`. See docs/10-cross-service-resolution.md.
 
-use ir::{Edge, EdgeKind, Node, NodeKind, Span, SymbolId};
+use ir::{Edge, EdgeKind, EdgeSource, Node, NodeKind, Span, SymbolId};
 use parse::CachedFile;
 use std::collections::{HashMap, HashSet};
 
@@ -145,6 +145,7 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
                     end_line: line,
                     end_col: 1,
                 },
+                source: EdgeSource::Extracted,
             });
             true
         } else {

@@ -8,7 +8,7 @@
 //! become candidate edges at confidence 1/N.
 
 use anyhow::{Context, Result};
-use ir::{Edge, EdgeKind, Node, NodeKind, Span, SymbolId};
+use ir::{Edge, EdgeKind, EdgeSource, Node, NodeKind, Span, SymbolId};
 use lang::{LanguageAdapter, Workspace};
 use parse::{CachedFile, Queries, Receiver, RefKind};
 use rayon::prelude::*;
@@ -418,6 +418,7 @@ fn resolve_imports(
                 kind: EdgeKind::Imports,
                 confidence: CONF_IMPORT,
                 site: imp.site,
+                source: EdgeSource::Extracted,
             });
         }
     }
@@ -501,6 +502,7 @@ fn resolve_calls(
                 kind: EdgeKind::Calls,
                 confidence: if n <= 1.0 { base_conf } else { base_conf / n },
                 site: r.site,
+                source: EdgeSource::Extracted,
             });
         }
     }

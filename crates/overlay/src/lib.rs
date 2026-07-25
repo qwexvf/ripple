@@ -6,7 +6,7 @@
 //! File granularity, so it works for any language and even Tier-0 support.
 //! Best-effort: no git / shallow clone → an empty overlay, never an error.
 
-use ir::{Edge, EdgeKind, Node, RiskScores, Span, SymbolId};
+use ir::{Edge, EdgeKind, EdgeSource, Node, RiskScores, Span, SymbolId};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -321,6 +321,7 @@ fn edge(src: SymbolId, dst: SymbolId, score: f32, site: Span) -> Edge {
         kind: EdgeKind::ChangesWith,
         confidence: score,
         site,
+        source: EdgeSource::CoChange,
     }
 }
 
@@ -506,6 +507,7 @@ mod tests {
                 end_line: 1,
                 end_col: 1,
             },
+            source: EdgeSource::Extracted,
         };
         // two distinct dependents on hub, none on leaf; a duplicate edge must not
         // count twice

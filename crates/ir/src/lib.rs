@@ -136,6 +136,24 @@ pub enum EdgeKind {
     DbQuery,
 }
 
+/// Where an edge's claim came from.
+///
+/// Provenance is separate from `confidence` on purpose: confidence says how sure
+/// we are, `source` says who said so. Determinism is an invariant and language
+/// servers answer differently across versions and index states, so a server's
+/// answer is persisted with its provenance rather than re-derived per query.
+/// See docs/11-lsp-integration.md.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EdgeSource {
+    /// Read out of the AST by a language adapter — the always-available base tier.
+    #[default]
+    Extracted,
+    /// Confirmed or supplied by a language server.
+    LspVerified,
+    /// Mined from git history, not from code.
+    CoChange,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Edge {
     pub src: SymbolId,
@@ -144,4 +162,8 @@ pub struct Edge {
     /// 1.0 = EXTRACTED, <1.0 = INFERRED / AMBIGUOUS (e.g. 1/N over candidates).
     pub confidence: f32,
     pub site: Span,
+    /// Who produced this claim. Defaults to `Extracted`, so graphs written before
+    /// provenance existed load unchanged.
+    #[serde(default)]
+    pub source: EdgeSource,
 }

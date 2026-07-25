@@ -47,6 +47,7 @@ fn run_contract(store: &mut dyn GraphStore) {
         kind: EdgeKind::Calls,
         confidence: 0.95,
         site: span(),
+        source: ir::EdgeSource::Extracted,
     };
 
     store
@@ -91,6 +92,16 @@ fn run_contract(store: &mut dyn GraphStore) {
     store.write(&[caller], &[]).unwrap();
     assert_eq!(store.read_extracts().unwrap().len(), 1);
     assert_eq!(store.read_roots().unwrap(), roots);
+}
+
+/// Edges are stored as JSON, so a graph written before `source` existed must still
+/// load — as `Extracted`, since that's what produced every pre-provenance edge.
+#[test]
+fn an_edge_without_provenance_loads_as_extracted() {
+    let old = r#"{"src":1,"dst":2,"kind":"Calls","confidence":0.95,
+                  "site":{"start_line":1,"start_col":1,"end_line":1,"end_col":1}}"#;
+    let e: Edge = serde_json::from_str(old).expect("pre-provenance edge must deserialize");
+    assert_eq!(e.source, ir::EdgeSource::Extracted);
 }
 
 #[test]

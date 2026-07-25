@@ -908,7 +908,7 @@ fn mcp_tools() -> Value {
         },
         {
             "name": "explain_edge",
-            "description": "Why are two symbols connected? Returns the edge kind, confidence, and site between them.",
+            "description": "Why are two symbols connected? Returns the edge kind, confidence, provenance (Extracted/LspVerified/CoChange), and site between them.",
             "inputSchema": obj(json!({ "from": { "type": "string" }, "to": { "type": "string" } }), json!(["from", "to"]))
         },
         {
@@ -1069,6 +1069,7 @@ fn mcp_call(
                     if to_ids.contains(&other) {
                         out.push(json!({
                             "kind": format!("{:?}", e.kind), "confidence": e.confidence,
+                            "source": format!("{:?}", e.source),
                             "direction": if e.src == f.id { "from→to" } else { "to→from" },
                             "site_line": e.site.start_line,
                         }));
