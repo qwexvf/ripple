@@ -4,7 +4,7 @@
 //! mid-session. Phase 2 of docs/11-lsp-integration.md builds on these.
 
 use lsp::{Caps, Client, Health, ServerSpec};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 fn spec(mode: &str) -> ServerSpec {
     // mode travels as an argument, not an env var: these tests run in parallel in
@@ -22,14 +22,18 @@ fn spec(mode: &str) -> ServerSpec {
     }
 }
 
-fn root() -> &'static Path {
-    Path::new("/proj")
+/// A real directory: the client spawns the server with the root as its working
+/// directory (servers with an on-disk index locate it from cwd), so a fake path
+/// fails at spawn time. The stub still reports `/proj/...` uris, which is what the
+/// path-mapping assertions check.
+fn root() -> PathBuf {
+    std::env::temp_dir()
 }
 
 fn connect(mode: &str) -> (Client, Caps) {
     let spec = spec(mode);
-    let mut client = Client::start(&spec).expect("stub starts");
-    let (caps, server) = client.initialize(root(), &spec).expect("handshake");
+    let mut client = Client::start(&spec, &root()).expect("stub starts");
+    let (caps, server) = client.initialize(&root(), &spec).expect("handshake");
     assert_eq!(server.as_deref(), Some("stub 1.2.3"));
     (client, caps)
 }
@@ -109,7 +113,7 @@ fn an_unknown_symbol_is_none_not_an_empty_set() {
 #[test]
 fn a_server_that_never_answers_times_out() {
     let spec = spec("hang");
-    let mut client = Client::start(&spec).expect("stub starts");
+    let mut client = Client::start(&spec, &root()).expect("stub starts");
     let started = std::time::Instant::now();
     let err = client
         .request(
@@ -126,7 +130,7 @@ fn a_server_that_never_answers_times_out() {
 #[test]
 fn garbage_on_the_pipe_is_reported_not_parsed() {
     let spec = spec("garbage");
-    let mut client = Client::start(&spec).expect("stub starts");
+    let mut client = Client::start(&spec, &root()).expect("stub starts");
     let err = client
         .request(
             "initialize",
@@ -149,8 +153,8 @@ fn garbage_on_the_pipe_is_reported_not_parsed() {
 #[test]
 fn a_server_dying_mid_session_reports_the_same_error_either_way() {
     let spec = spec("exit-after-init");
-    let mut client = Client::start(&spec).expect("stub starts");
-    client.initialize(root(), &spec).expect("handshake");
+    let mut client = Client::start(&spec, &root()).expect("stub starts");
+    client.initialize(&root(), &spec).expect("handshake");
     let err = client
         .functions(Path::new("/proj/lib/target.ex"))
         .expect_err("the server is gone");
@@ -166,7 +170,7 @@ fn a_server_dying_mid_session_reports_the_same_error_either_way() {
 /// `probe` is what `doctor` reports, so its verdicts are part of the contract.
 #[test]
 fn probe_reports_ready_and_missing() {
-    let report = lsp::probe(&spec("ok"), root());
+    let report = lsp::probe(&spec("ok"), &root());
     match report.health {
         Health::Ready { caps, server, .. } => {
             assert!(caps.call_hierarchy);
@@ -178,7 +182,7 @@ fn probe_reports_ready_and_missing() {
     let mut missing = spec("ok");
     missing.command = "/nonexistent/definitely-not-a-server".to_owned();
     assert!(matches!(
-        lsp::probe(&missing, root()).health,
+        lsp::probe(&missing, &root()).health,
         Health::BinaryMissing
     ));
 
@@ -188,7 +192,7 @@ fn probe_reports_ready_and_missing() {
     let mut fake = spec("ok");
     fake.command = not_exec.display().to_string();
     assert!(
-        matches!(lsp::probe(&fake, root()).health, Health::BinaryMissing),
+        matches!(lsp::probe(&fake, &root()).health, Health::BinaryMissing),
         "a non-executable file must not be reported as a usable server"
     );
     let _ = std::fs::remove_file(&not_exec);

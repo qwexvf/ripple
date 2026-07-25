@@ -268,9 +268,11 @@ fn collect_alias(call: TsNode, src: &[u8], out: &mut Scan) {
     match arg.kind() {
         "alias" => {
             let fqn = text(arg, src);
-            if let Some(last) = fqn.rsplit('.').next() {
-                out.aliases.insert(last.to_owned(), fqn.to_owned());
-            }
+            // `alias A.B.C, as: X` binds X, not C. Missing this made every call
+            // through a renamed alias unresolvable.
+            let local = alias_rename(call, src)
+                .unwrap_or_else(|| fqn.rsplit('.').next().unwrap_or(fqn).to_owned());
+            out.aliases.insert(local, fqn.to_owned());
         }
         // `alias A.{B, C}`
         "dot" => {
@@ -295,6 +297,28 @@ fn collect_alias(call: TsNode, src: &[u8], out: &mut Scan) {
         }
         _ => {}
     }
+}
+
+/// The name bound by `as:`, if the alias renames itself.
+fn alias_rename(call: TsNode, src: &[u8]) -> Option<String> {
+    let args = args_node(call)?;
+    let mut c = args.walk();
+    let keywords = args
+        .named_children(&mut c)
+        .find(|n| n.kind() == "keywords")?;
+    let mut kc = keywords.walk();
+    for pair in keywords.named_children(&mut kc) {
+        let (Some(k), Some(v)) = (
+            pair.child_by_field_name("key"),
+            pair.child_by_field_name("value"),
+        ) else {
+            continue;
+        };
+        if text(k, src).trim().trim_end_matches(':') == "as" && v.kind() == "alias" {
+            return Some(text(v, src).to_owned());
+        }
+    }
+    None
 }
 
 /// Expand local alias names to FQNs once the whole alias table is known, so no
@@ -394,6 +418,29 @@ mod tests {
             "App.Resolvers.PlayerResolver.Nested"
         );
         assert_eq!(resolve_module("Unknown", &al), "Unknown");
+    }
+
+    /// Found by `eval --oracle lsp`: a renamed alias made every call through it
+    /// unresolvable, so ripple silently missed those edges.
+    #[test]
+    fn alias_as_binds_the_new_name() {
+        let s = scan_src(
+            "defmodule S do\n  alias App.PubSub.Events, as: PubSubEvents\n  alias App.Plain.Thing\n  def go(x) do\n    PubSubEvents.publish(x)\n    Thing.use(x)\n  end\nend\n",
+        );
+        assert_eq!(
+            s.aliases.get("PubSubEvents").map(String::as_str),
+            Some("App.PubSub.Events")
+        );
+        // the un-renamed form still binds its last segment
+        assert_eq!(
+            s.aliases.get("Thing").map(String::as_str),
+            Some("App.Plain.Thing")
+        );
+        // and the call through the renamed alias now resolves to the full module
+        assert!(s
+            .remote_calls
+            .iter()
+            .any(|r| r.module == "App.PubSub.Events" && r.func == "publish"));
     }
 
     #[test]

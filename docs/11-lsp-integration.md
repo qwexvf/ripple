@@ -129,10 +129,21 @@ Built-in defaults cover `elixir` (dexter), `typescript`, `go`, `python`, and
    `gopls`: 128ms handshake, `callHierarchy=true`.
    Still to add here: UTF-16↔byte position conversion, once something actually
    sends positions.
-2. **`ripple eval --oracle lsp --sample N`.** Diff server call edges against ours
-   on a sample; report precision/recall per language. Decides whether phase 3 is
-   worth it, and becomes the permanent regression harness for `.scm` changes —
-   the thing missing when the 20.4k Elixir edges landed.
+2. **`ripple eval --oracle lsp --sample N`.** ✅ **done.** Samples files evenly
+   across a root, asks the server for each function's callers via
+   `documentSymbol` → `prepareCallHierarchy` → `incomingCalls`, and diffs against
+   ripple's `Calls` edges. Callers in files ripple doesn't index are dropped (a
+   server that also indexes stdlib would otherwise look infinitely better), and
+   self-recursion is excluded because ripple drops it deliberately.
+
+   Comparability is most of the work: servers spell one function three ways
+   (`changeset`, `changeset/2`, `FiveNoobs.Players.PlayerReport.changeset`), and
+   "the server can't resolve this symbol" must stay distinct from "this symbol has
+   no callers". First result against dexter on 5noobs: **144/165 (87.3%) identical
+   caller sets**, 1 possible false positive, 20 possible misses. It immediately
+   found two real bugs — a renamed `alias ... as:` that made calls through it
+   unresolvable (fixed), and Elixir `import` being unhandled (open). See
+   [`12-dogfood-log.md`](12-dogfood-log.md).
 3. **On-demand verification.** `impact` / `review_focus --verify lsp` over the
    seed set plus one hop, with the budget and cache above.
 4. **Breadth proof.** Add Go or Python with `tags.scm` only and all call edges

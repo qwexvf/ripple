@@ -8,6 +8,43 @@ the roadmap beforehand. Using the tool finds different bugs than reading it.
 
 ---
 
+## 2026-07-25 — the oracle's first number: 87.3%, and two real bugs behind it
+
+**Asked:** `eval --oracle lsp --sample 40` against dexter on the Elixir backend —
+the first precision measurement the tree-sitter call graph has ever had.
+
+**Said (after three false starts, all mine):** 40 files, 165 symbols judged,
+**144/165 (87.3%) identical caller sets**, 1 ripple-only edge, 20 server-only, 98
+self-recursive edges excluded, 53 symbols dexter couldn't resolve.
+
+The three false starts are the finding as much as the number is:
+1. **0 judged, 46 unknown** — one counter for "server doesn't know it" and "ripple
+   doesn't know it" made the failure undiagnosable. Splitting them showed dexter
+   names functions `changeset/2`, with the arity ripple doesn't distinguish.
+2. **0/5 agreement, every edge in both columns** — dexter returns call-hierarchy
+   callers fully qualified (`FiveNoobs.Players.PlayerReport.changeset`) where ripple
+   stores `changeset`. Both sides had found the identical call; only the spelling
+   differed. A comparison tool that hasn't proven it can *agree* is measuring nothing.
+3. **73.3% → 86.7%** once self-recursion was excluded: dexter reports `X → X`, ripple
+   drops it by design. 98 of the disagreements were that one documented choice.
+
+**Two ripple bugs it then exposed:**
+
+- **`alias A.B.C, as: X` was ignored.** Aliases were keyed by last segment, so every
+  call through a renamed alias was unresolvable and its edges silently missing.
+  Fixed; 87.3% and +5 edges on this repo.
+- **Elixir `import` is not handled at all** (open). `import FiveNoobs.PlayersFixtures`
+  then a bare `player_fixture(...)` is a cross-module call with no qualifier, and
+  ripple resolves unqualified calls only against same-file definitions. This is the
+  dominant remaining class — test, fixture and Phoenix code lean on `import` heavily.
+  Needs `import` recorded as a fact and unqualified calls resolved against the
+  imported modules' exports.
+
+**Lesson:** most of the work in building an oracle is proving the two sides are
+talking about the same thing. Every one of the three false starts *looked* like a
+ripple defect and was a comparison defect — if I'd trusted the first run, I'd have
+"discovered" that ripple's call graph was worthless.
+
 ## 2026-07-25 — the risk score is git-only, and capped on single-author repos
 
 **Asked:** step 5 of the phase ritual — `risk crates/resolve/src/lib.rs`, the file I

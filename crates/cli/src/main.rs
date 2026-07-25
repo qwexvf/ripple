@@ -6,6 +6,7 @@
 use anyhow::{bail, Context, Result};
 use ir::EdgeKind;
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use store::{Dir, GraphStore, InMemoryGraph, RedbStore};
@@ -43,7 +44,15 @@ const NEIGHBOR_KINDS: [EdgeKind; 5] = [
 ];
 
 /// Flags that consume the following token as their value.
-const VALUE_FLAGS: &[&str] = &["--root", "--depth", "--budget", "--ignore", "--commits"];
+const VALUE_FLAGS: &[&str] = &[
+    "--root",
+    "--depth",
+    "--budget",
+    "--ignore",
+    "--commits",
+    "--oracle",
+    "--sample",
+];
 
 /// Positional args, correctly skipping `--flag value` pairs (so `--root X` never
 /// leaks `X` as a positional).
@@ -397,7 +406,296 @@ fn cmd_impact(args: &[String]) -> Result<()> {
 /// Historical validation: over recent commits, how many same-commit file pairs
 /// does the graph link? Static edges are leakage-free (independent of commit
 /// history); the static-vs-co-change gap shows why co-change is needed.
+/// `eval --oracle lsp`: compare ripple's call edges against a language server's,
+/// on a sample. The number this produces is the only precision measurement the
+/// tree-sitter call graph has — see docs/11-lsp-integration.md phase 2.
+///
+/// Deliberately a *comparison*, not a scoring: a tree-sitter-based server like
+/// dexter is a peer, so a disagreement localises a bug in one of the two, and
+/// agreement proves neither correct.
+fn cmd_eval_oracle(args: &[String]) -> Result<()> {
+    let root: PathBuf = flag_value(args, "--root").map_or_else(|| ".".into(), PathBuf::from);
+    let root = root
+        .canonicalize()
+        .with_context(|| format!("cannot access {}", root.display()))?;
+    let sample: usize = flag_value(args, "--sample")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(25);
+
+    let store = RedbStore::open(db_path(&root));
+    let graph = store.load()?;
+    let mut roots = store.read_roots()?;
+    if roots.is_empty() {
+        roots.push((String::new(), root.clone()));
+    }
+    let specs = lsp::load(&root)?;
+    let registry = lang::registry();
+
+    let mut any = false;
+    for (tag, path) in &roots {
+        let indexed = indexed_languages(Some(&graph), tag);
+        for spec in specs.iter().filter(|s| indexed.contains(&s.language)) {
+            if !lsp::applies(spec, path) {
+                continue;
+            }
+            let mut client = match lsp::Client::start(spec, path) {
+                Ok(c) => c,
+                Err(e) => {
+                    println!("{}: cannot start {} ({e:#})", spec.language, spec.command);
+                    continue;
+                }
+            };
+            let (caps, server) = match client.initialize(path, spec) {
+                Ok(v) => v,
+                Err(e) => {
+                    println!("{}: handshake failed ({e:#})", spec.language);
+                    continue;
+                }
+            };
+            if !caps.call_hierarchy {
+                println!(
+                    "{}: {} has no callHierarchy — cannot compare",
+                    spec.language,
+                    server.as_deref().unwrap_or(&spec.command)
+                );
+                continue;
+            }
+            any = true;
+            let files = sample_files(&graph, tag, &spec.language, &registry, sample);
+            let cmp = compare_calls(&graph, &mut client, path, tag, &files);
+            report_oracle(spec, server.as_deref(), &files, &cmp);
+            client.stop();
+        }
+    }
+    if !any {
+        println!("no usable server for any indexed language — `ripple lsp doctor` explains why");
+    }
+    Ok(())
+}
+
+/// Reduce a server's symbol name to the bare function name ripple stores.
+///
+/// Servers spell the same function several ways: `changeset/2` carries the arity
+/// ripple doesn't distinguish, and a call-hierarchy caller comes back fully
+/// qualified as `FiveNoobs.Players.PlayerReport.changeset`. Comparing raw names
+/// reported every edge as a disagreement when both sides had found exactly the same
+/// call.
+fn bare_name(name: &str) -> &str {
+    let no_arity = name.split('/').next().unwrap_or(name).trim();
+    no_arity.rsplit('.').next().unwrap_or(no_arity)
+}
+
+/// A `documentSymbol` entry that isn't a callable function. dexter reports Ecto
+/// `schema "players" do` blocks as function-kind symbols named `schema players`,
+/// and asking for their callers is meaningless.
+fn is_callable_name(name: &str) -> bool {
+    !name.is_empty() && !name.contains(char::is_whitespace)
+}
+
+/// Evenly spread `n` files of one language across the root, so the sample isn't
+/// all of one directory. Deterministic: module paths are sorted first.
+fn sample_files(
+    graph: &InMemoryGraph,
+    tag: &str,
+    language: &str,
+    registry: &[Box<dyn lang::LanguageAdapter>],
+    n: usize,
+) -> Vec<String> {
+    let prefix = if tag.is_empty() {
+        String::new()
+    } else {
+        format!("{tag}/")
+    };
+    let mut modules: Vec<&str> = graph
+        .nodes()
+        .filter(|node| node.module_path.starts_with(&prefix))
+        .filter(|node| {
+            lang::adapter_for(registry, Path::new(&node.module_path))
+                .is_some_and(|a| a.id() == language)
+        })
+        .map(|node| node.module_path.as_str())
+        .collect();
+    modules.sort_unstable();
+    modules.dedup();
+    if modules.len() <= n {
+        return modules.into_iter().map(str::to_owned).collect();
+    }
+    let step = modules.len() / n;
+    modules
+        .into_iter()
+        .step_by(step.max(1))
+        .take(n)
+        .map(str::to_owned)
+        .collect()
+}
+
+#[derive(Default)]
+struct Comparison {
+    /// symbols the server could resolve, so a verdict is possible
+    judged: usize,
+    /// symbols the server couldn't resolve a call-hierarchy item for
+    server_unknown: usize,
+    /// symbols the server reported but ripple has no node for
+    ripple_unknown: usize,
+    /// a few names from each side, to diagnose a mismatch in naming convention
+    server_names: Vec<String>,
+    /// self-recursion the server reports and ripple drops on purpose
+    self_edges: usize,
+    agreed: usize,
+    /// ripple has an edge the server doesn't
+    ripple_only: Vec<String>,
+    /// the server has an edge ripple lacks
+    server_only: Vec<String>,
+}
+
+/// For each function the server finds in each sampled file, compare its callers
+/// with ripple's. Callers in files ripple doesn't index are dropped: a server that
+/// also indexes stdlib and dependencies would otherwise look infinitely better.
+fn compare_calls(
+    graph: &InMemoryGraph,
+    client: &mut lsp::Client,
+    root: &Path,
+    tag: &str,
+    files: &[String],
+) -> Comparison {
+    let mut cmp = Comparison::default();
+    for module in files {
+        let rel = module.strip_prefix(&format!("{tag}/")).unwrap_or(module);
+        let abs = root.join(rel);
+        if client.open(&abs).is_err() {
+            continue;
+        }
+        let Ok(symbols) = client.functions(&abs) else {
+            continue;
+        };
+        for sym in symbols {
+            let name = bare_name(&sym.name).to_owned();
+            if !is_callable_name(&name) {
+                continue;
+            }
+            let Ok(found) = client.incoming_calls(&abs, sym.line, sym.character) else {
+                continue;
+            };
+            if cmp.server_names.len() < 6 {
+                cmp.server_names.push(name.clone());
+            }
+            let Some(sites) = found else {
+                cmp.server_unknown += 1;
+                continue;
+            };
+            let Some(target) = graph
+                .nodes_in_file(module)
+                .into_iter()
+                .find(|n| n.name == name)
+            else {
+                cmp.ripple_unknown += 1;
+                continue;
+            };
+
+            let ours: HashSet<(String, String)> = graph
+                .in_edges(target.id)
+                .iter()
+                .filter(|e| e.kind == EdgeKind::Calls)
+                .filter_map(|e| graph.get(e.src))
+                .map(|n| (n.module_path.clone(), n.name.clone()))
+                .collect();
+            let mut theirs: HashSet<(String, String)> = HashSet::new();
+
+            for site in sites {
+                let Ok(rel) = site.path.strip_prefix(root) else {
+                    continue;
+                };
+                let module = resolve::namespace(tag, &rel.to_string_lossy());
+                if graph.nodes_in_file(&module).is_empty() {
+                    continue; // not indexed by ripple; not a fair miss
+                }
+                let caller = bare_name(&site.name).to_owned();
+                // ripple drops X → X deliberately (a blast radius from a symbol to
+                // itself says nothing), so counting it as a miss measures a
+                // documented choice rather than a defect
+                if module == target.module_path && caller == target.name {
+                    cmp.self_edges += 1;
+                    continue;
+                }
+                theirs.insert((module, caller));
+            }
+
+            cmp.judged += 1;
+            if ours == theirs {
+                cmp.agreed += 1;
+            }
+            let describe = |(module, name): &(String, String)| {
+                format!("{}:{} ← {module}:{name}", target.module_path, target.name)
+            };
+            cmp.ripple_only
+                .extend(ours.difference(&theirs).map(describe));
+            cmp.server_only
+                .extend(theirs.difference(&ours).map(describe));
+        }
+    }
+    cmp
+}
+
+fn report_oracle(spec: &lsp::ServerSpec, server: Option<&str>, files: &[String], cmp: &Comparison) {
+    let pct = |n: usize, d: usize| {
+        if d == 0 {
+            0.0
+        } else {
+            100.0 * n as f32 / d as f32
+        }
+    };
+    println!(
+        "{} vs {} — {} files, {} symbols judged ({} unresolved by server, {} unknown to ripple)",
+        spec.language,
+        server.unwrap_or(&spec.command),
+        files.len(),
+        cmp.judged,
+        cmp.server_unknown,
+        cmp.ripple_unknown
+    );
+    if cmp.judged == 0 && !cmp.server_names.is_empty() {
+        println!(
+            "  server named: {} — if these don't look like ripple's symbol names, the two sides disagree on naming, not on edges",
+            cmp.server_names.join(", ")
+        );
+    }
+    println!(
+        "  identical caller sets : {}/{} ({:.1}%)",
+        cmp.agreed,
+        cmp.judged,
+        pct(cmp.agreed, cmp.judged)
+    );
+    println!(
+        "  ripple-only edges     : {} (possible false positives)",
+        cmp.ripple_only.len()
+    );
+    println!(
+        "  server-only edges     : {} (possible missed edges)",
+        cmp.server_only.len()
+    );
+    if cmp.self_edges > 0 {
+        println!(
+            "  excluded              : {} self-recursive edges ripple drops by design",
+            cmp.self_edges
+        );
+    }
+    for (label, examples) in [
+        ("ripple-only", &cmp.ripple_only),
+        ("server-only", &cmp.server_only),
+    ] {
+        for e in examples.iter().take(5) {
+            println!("    {label}: {e}");
+        }
+        if examples.len() > 5 {
+            println!("    {label}: … {} more", examples.len() - 5);
+        }
+    }
+}
+
 fn cmd_eval(args: &[String]) -> Result<()> {
+    if flag_value(args, "--oracle") == Some("lsp") {
+        return cmd_eval_oracle(args);
+    }
     let root: PathBuf = flag_value(args, "--root").map_or_else(|| ".".into(), PathBuf::from);
     let k: usize = flag_value(args, "--commits")
         .and_then(|s| s.parse().ok())

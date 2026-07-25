@@ -250,7 +250,7 @@ fn handshake(
     spec: &ServerSpec,
     root: &Path,
 ) -> Result<(Caps, Option<String>), (anyhow::Error, Vec<String>)> {
-    let mut client = match Client::start(spec) {
+    let mut client = match Client::start(spec, root) {
         Ok(c) => c,
         Err(e) => return Err((e, Vec::new())),
     };
@@ -416,9 +416,12 @@ pub struct Client {
 }
 
 impl Client {
-    pub fn start(spec: &ServerSpec) -> Result<Client> {
+    /// `cwd` is the project root: servers that keep an on-disk index locate it
+    /// relative to the working directory, not from `rootUri` alone.
+    pub fn start(spec: &ServerSpec, cwd: &Path) -> Result<Client> {
         let mut child = Command::new(&spec.command)
             .args(&spec.args)
+            .current_dir(cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
