@@ -43,11 +43,13 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
             }
             NodeKind::Function | NodeKind::Method => {
                 fn_by_loc.insert((n.module_path.as_str(), n.name.as_str()), n.id);
-                fn_spans.entry(n.module_path.as_str()).or_default().push((
-                    n.span.start_line,
-                    n.span.end_line,
-                    n.id,
-                ));
+                // every definition site, not just the first: one symbol can be
+                // written as several clauses or overloads, and a call in the second
+                // one belongs to it just as much
+                let spans = fn_spans.entry(n.module_path.as_str()).or_default();
+                for s in n.definition_spans() {
+                    spans.push((s.start_line, s.end_line, n.id));
+                }
             }
             _ => {}
         }

@@ -402,20 +402,73 @@ fn callers(pass: &Pass, target: SymbolId, sites: &[lsp::CallSite]) -> HashSet<Sy
             continue;
         };
         let module = resolve::namespace(pass.cov.tag, &rel.to_string_lossy());
-        let name = bare_name(&site.name);
-        let Some(caller) = pass
-            .graph
-            .nodes_in_file(&module)
-            .into_iter()
-            .find(|n| n.name == name)
-        else {
-            continue;
-        };
-        if caller.id != target {
-            out.insert(caller.id);
+        for attributed in attribute(pass.graph, &module, site) {
+            match attributed {
+                Attribution::Symbol(id) if id != target => {
+                    out.insert(id);
+                }
+                // a call in the file but inside no indexed symbol (a module body, an
+                // ExUnit `test` block) has no node to hang an edge on — issue #18
+                Attribution::Symbol(_) | Attribution::OutsideAnySymbol => {}
+            }
         }
     }
     out
+}
+
+/// Which ripple symbol a server-reported call belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Attribution {
+    Symbol(SymbolId),
+    /// The call's position falls inside the file but inside no indexed symbol.
+    OutsideAnySymbol,
+}
+
+/// Attribute one reported call to ripple's symbols, by *position* rather than by
+/// the name the server gave it.
+///
+/// The server's `name`/`line` describe the caller it decided on, and that decision
+/// can be wrong: dexter credits a call inside an ExUnit `test` block to the
+/// preceding `defp`, which really does not contain it. `fromRanges` carries the
+/// call's own line, so the innermost enclosing ripple symbol is a fact we can check
+/// instead of a claim we have to trust. A server that sends no `fromRanges` leaves
+/// nothing to check, so its naming is used as before.
+///
+/// Returns one attribution per distinct call site (a caller can call the target
+/// several times, and in Elixir those sites can be in different clauses).
+pub fn attribute(graph: &InMemoryGraph, module: &str, site: &lsp::CallSite) -> Vec<Attribution> {
+    if site.call_lines.is_empty() {
+        let name = bare_name(&site.name);
+        return graph
+            .nodes_in_file(module)
+            .into_iter()
+            .find(|n| n.name == name)
+            .map(|n| vec![Attribution::Symbol(n.id)])
+            .unwrap_or_default();
+    }
+    // only a callable can contain a call. An Elixir module's own node spans the whole
+    // file, so including it would turn every call sitting outside a function into
+    // "the module called it" — precisely the case issue #18 is about, and the one
+    // that has to stay visible.
+    let nodes: Vec<&ir::Node> = graph
+        .nodes_in_file(module)
+        .into_iter()
+        .filter(|n| matches!(n.kind, ir::NodeKind::Function | ir::NodeKind::Method))
+        .collect();
+    site.call_lines
+        .iter()
+        .map(|&line| {
+            // innermost containing definition site, so a clause or nested definition
+            // is credited over a wider one
+            nodes
+                .iter()
+                .filter_map(|n| n.containing_span(line).map(|s| (n, s)))
+                .min_by_key(|(_, s)| s.end_line - s.start_line)
+                .map_or(Attribution::OutsideAnySymbol, |(n, _)| {
+                    Attribution::Symbol(n.id)
+                })
+        })
+        .collect()
 }
 
 /// `target ← caller`, for a report line a human can go and check.
@@ -519,6 +572,7 @@ mod tests {
             qualified_name: name.to_owned(),
             module_path: module.to_owned(),
             span: span(1),
+            extra_spans: Vec::new(),
             is_exported: true,
             risk: ir::RiskScores::default(),
         }
@@ -694,7 +748,7 @@ mod tests {
     }
 
     #[test]
-    fn a_server_only_edge_is_added_at_full_confidence() {
+    fn a_server_only_edge_is_added_below_the_extracted_band() {
         let mut f = fixture();
         let theirs: HashSet<SymbolId> = [
             SymbolId::of("api/caller.ex", "call_it"),
@@ -718,6 +772,105 @@ mod tests {
             "a server-only claim is not as good as an agreement"
         );
         assert_eq!(added.source, EdgeSource::LspVerified);
+    }
+
+    fn site(name: &str, call_lines: &[u32]) -> lsp::CallSite {
+        lsp::CallSite {
+            path: std::path::PathBuf::from("/repo/api/caller.ex"),
+            name: name.to_owned(),
+            line: 10,
+            call_lines: call_lines.to_vec(),
+        }
+    }
+
+    /// A file with one two-clause function (20-24, 30-34) and one single-clause
+    /// function (40-44), plus the module node that spans the whole file.
+    fn spanned_graph() -> InMemoryGraph {
+        let mut clauses = node("api/caller.ex", "call_it");
+        clauses.span = Span {
+            start_line: 20,
+            start_col: 1,
+            end_line: 24,
+            end_col: 1,
+        };
+        clauses.extra_spans = vec![Span {
+            start_line: 30,
+            start_col: 1,
+            end_line: 34,
+            end_col: 1,
+        }];
+        let mut other = node("api/caller.ex", "also_calls");
+        other.span = Span {
+            start_line: 40,
+            start_col: 1,
+            end_line: 44,
+            end_col: 1,
+        };
+        let mut module = node("api/caller.ex", "Api.Caller");
+        module.kind = NodeKind::Class;
+        module.span = Span {
+            start_line: 1,
+            start_col: 1,
+            end_line: 99,
+            end_col: 1,
+        };
+        InMemoryGraph::from_parts(vec![clauses, other, module], Vec::new())
+    }
+
+    #[test]
+    fn a_call_is_attributed_by_position_including_later_clauses() {
+        let g = spanned_graph();
+        let call_it = SymbolId::of("api/caller.ex", "call_it");
+        for line in [21, 32] {
+            assert_eq!(
+                attribute(
+                    &g,
+                    "api/caller.ex",
+                    &site("whatever_the_server_said", &[line])
+                ),
+                vec![Attribution::Symbol(call_it)],
+                "line {line} is inside a clause of call_it, whatever the server named"
+            );
+        }
+    }
+
+    #[test]
+    fn a_call_outside_every_function_is_not_credited_to_the_module() {
+        // the module node spans the whole file, so trusting containment alone would
+        // report "the module called it" and hide the issue-#18 gap
+        let g = spanned_graph();
+        assert_eq!(
+            attribute(&g, "api/caller.ex", &site("also_calls", &[7])),
+            vec![Attribution::OutsideAnySymbol]
+        );
+    }
+
+    #[test]
+    fn each_call_site_is_attributed_separately() {
+        let g = spanned_graph();
+        let got = attribute(&g, "api/caller.ex", &site("call_it", &[21, 42, 7]));
+        assert_eq!(
+            got,
+            vec![
+                Attribution::Symbol(SymbolId::of("api/caller.ex", "call_it")),
+                Attribution::Symbol(SymbolId::of("api/caller.ex", "also_calls")),
+                Attribution::OutsideAnySymbol,
+            ]
+        );
+    }
+
+    #[test]
+    fn without_call_positions_the_servers_naming_is_used() {
+        // a server that sends no fromRanges leaves nothing to check
+        let g = spanned_graph();
+        assert_eq!(
+            attribute(&g, "api/caller.ex", &site("call_it/2", &[])),
+            vec![Attribution::Symbol(SymbolId::of(
+                "api/caller.ex",
+                "call_it"
+            ))]
+        );
+        assert!(attribute(&g, "api/caller.ex", &site("nope", &[])).is_empty());
     }
 
     #[test]

@@ -55,6 +55,7 @@ const VALUE_FLAGS: &[&str] = &[
     "--commits",
     "--oracle",
     "--sample",
+    "--granularity",
     "--verify",
     "--verify-budget",
 ];
@@ -503,6 +504,11 @@ fn cmd_eval_oracle(args: &[String]) -> Result<()> {
     let sample: usize = flag_value(args, "--sample")
         .and_then(|s| s.parse().ok())
         .unwrap_or(25);
+    let grain = match flag_value(args, "--granularity") {
+        Some("file") => Granularity::File,
+        Some("function") | None => Granularity::Function,
+        Some(other) => bail!("--granularity takes function or file, not {other}"),
+    };
 
     let store = RedbStore::open(db_path(&root));
     let graph = store.load()?;
@@ -544,8 +550,8 @@ fn cmd_eval_oracle(args: &[String]) -> Result<()> {
             }
             any = true;
             let files = sample_files(&graph, tag, &spec.language, &registry, sample);
-            let cmp = compare_calls(&graph, &mut client, path, tag, &files);
-            report_oracle(spec, server.as_deref(), &files, &cmp);
+            let cmp = compare_calls(&graph, &mut client, path, tag, &files, grain);
+            report_oracle(spec, server.as_deref(), &files, &cmp, grain);
             client.stop();
         }
     }
@@ -592,6 +598,19 @@ fn sample_files(
         .collect()
 }
 
+/// What a caller identity means when the two sides are compared.
+///
+/// The server names functions; ripple sometimes only knows the file (a call in a
+/// module body or an ExUnit `test` block belongs to no indexed symbol — issue #18).
+/// Scoring a file-granular edge against a function-granular oracle counted a
+/// correct-but-coarser answer as a disagreement, so the granularity is now stated
+/// rather than assumed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Granularity {
+    Function,
+    File,
+}
+
 #[derive(Default)]
 struct Comparison {
     /// symbols the server could resolve, so a verdict is possible
@@ -604,6 +623,14 @@ struct Comparison {
     server_names: Vec<String>,
     /// self-recursion the server reports and ripple drops on purpose
     self_edges: usize,
+    /// call sites the server credited to a function that does not contain them
+    misattributed: usize,
+    /// call sites inside no indexed ripple symbol — the size of the issue-#18 gap,
+    /// measured from the server's side
+    outside_any_symbol: usize,
+    /// a few `module:line` positions of those, so the gap can be characterised
+    /// rather than guessed at
+    outside_examples: Vec<String>,
     agreed: usize,
     /// ripple has an edge the server doesn't
     ripple_only: Vec<String>,
@@ -620,6 +647,7 @@ fn compare_calls(
     root: &Path,
     tag: &str,
     files: &[String],
+    grain: Granularity,
 ) -> Comparison {
     let mut cmp = Comparison::default();
     for module in files {
@@ -655,12 +683,16 @@ fn compare_calls(
                 continue;
             };
 
+            let key = |module: &str, name: &str| match grain {
+                Granularity::Function => (module.to_owned(), name.to_owned()),
+                Granularity::File => (module.to_owned(), String::new()),
+            };
             let ours: HashSet<(String, String)> = graph
                 .in_edges(target.id)
                 .iter()
                 .filter(|e| e.kind == EdgeKind::Calls)
                 .filter_map(|e| graph.get(e.src))
-                .map(|n| (n.module_path.clone(), n.name.clone()))
+                .map(|n| key(&n.module_path, &n.name))
                 .collect();
             let mut theirs: HashSet<(String, String)> = HashSet::new();
 
@@ -672,15 +704,49 @@ fn compare_calls(
                 if graph.nodes_in_file(&module).is_empty() {
                     continue; // not indexed by ripple; not a fair miss
                 }
-                let caller = bare_name(&site.name).to_owned();
-                // ripple drops X → X deliberately (a blast radius from a symbol to
-                // itself says nothing), so counting it as a miss measures a
-                // documented choice rather than a defect
-                if module == target.module_path && caller == target.name {
-                    cmp.self_edges += 1;
-                    continue;
+                let named = bare_name(&site.name).to_owned();
+                for attributed in verify::attribute(graph, &module, &site) {
+                    let caller = match attributed {
+                        verify::Attribution::Symbol(id) => {
+                            let Some(n) = graph.get(id) else { continue };
+                            if n.name != named {
+                                // the server credited a function that does not
+                                // contain the call: judging ripple against that
+                                // manufactures disagreements in both directions
+                                cmp.misattributed += 1;
+                            }
+                            n.name.clone()
+                        }
+                        verify::Attribution::OutsideAnySymbol => {
+                            cmp.outside_any_symbol += 1;
+                            if cmp.outside_examples.len() < 8 {
+                                let lines = site
+                                    .call_lines
+                                    .iter()
+                                    .map(u32::to_string)
+                                    .collect::<Vec<_>>()
+                                    .join(",");
+                                cmp.outside_examples
+                                    .push(format!("{module}:{lines} (server said {named})"));
+                            }
+                            // ripple has no symbol here, so at function granularity
+                            // there is nothing to compare; at file granularity the
+                            // file itself is the answer
+                            match grain {
+                                Granularity::Function => continue,
+                                Granularity::File => String::new(),
+                            }
+                        }
+                    };
+                    // ripple drops X → X deliberately (a blast radius from a symbol
+                    // to itself says nothing), so counting it as a miss measures a
+                    // documented choice rather than a defect
+                    if module == target.module_path && caller == target.name {
+                        cmp.self_edges += 1;
+                        continue;
+                    }
+                    theirs.insert(key(&module, &caller));
                 }
-                theirs.insert((module, caller));
             }
 
             cmp.judged += 1;
@@ -699,7 +765,13 @@ fn compare_calls(
     cmp
 }
 
-fn report_oracle(spec: &lsp::ServerSpec, server: Option<&str>, files: &[String], cmp: &Comparison) {
+fn report_oracle(
+    spec: &lsp::ServerSpec,
+    server: Option<&str>,
+    files: &[String],
+    cmp: &Comparison,
+    grain: Granularity,
+) {
     let pct = |n: usize, d: usize| {
         if d == 0 {
             0.0
@@ -723,6 +795,13 @@ fn report_oracle(spec: &lsp::ServerSpec, server: Option<&str>, files: &[String],
         );
     }
     println!(
+        "  compared at           : {} granularity",
+        match grain {
+            Granularity::Function => "function",
+            Granularity::File => "file",
+        }
+    );
+    println!(
         "  identical caller sets : {}/{} ({:.1}%)",
         cmp.agreed,
         cmp.judged,
@@ -741,6 +820,25 @@ fn report_oracle(spec: &lsp::ServerSpec, server: Option<&str>, files: &[String],
             "  excluded              : {} self-recursive edges ripple drops by design",
             cmp.self_edges
         );
+    }
+    if cmp.misattributed > 0 {
+        println!(
+            "  server misattributed  : {} call sites credited to a function that doesn't contain them",
+            cmp.misattributed
+        );
+    }
+    if cmp.outside_any_symbol > 0 {
+        println!(
+            "  outside any symbol    : {} call sites inside no indexed symbol (issue #18{})",
+            cmp.outside_any_symbol,
+            match grain {
+                Granularity::Function => "; not comparable here",
+                Granularity::File => "; compared as their file",
+            }
+        );
+        for e in &cmp.outside_examples {
+            println!("    outside: {e}");
+        }
     }
     for (label, examples) in [
         ("ripple-only", &cmp.ripple_only),

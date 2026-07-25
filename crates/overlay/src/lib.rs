@@ -554,6 +554,7 @@ mod tests {
                 end_line: 1,
                 end_col: 1,
             },
+            extra_spans: Vec::new(),
             is_exported: false,
             risk: RiskScores::default(),
         }

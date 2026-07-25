@@ -413,3 +413,29 @@ fn deterministic_build() {
     assert_eq!(a.nodes.len(), b.nodes.len());
     assert_eq!(a.edges.len(), b.edges.len());
 }
+
+/// One symbol written as several clauses keeps every definition site. Identity is
+/// (path, qualified name), so the clauses share an id and used to overwrite each
+/// other — leaving only one span, which silently breaks "which symbol contains this
+/// line?" for everything downstream (LSP verification, review attribution).
+#[test]
+fn a_multi_clause_function_keeps_every_definition_site() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/elixir");
+    let r = resolve::build(&root).unwrap();
+
+    let kind: Vec<&ir::Node> = r
+        .nodes
+        .iter()
+        .filter(|n| n.id == SymbolId::of("players.ex", "kind"))
+        .collect();
+    assert_eq!(kind.len(), 1, "one node per symbol, not one per clause");
+
+    // `def kind(:admin)` on line 17, `def kind(_other)` on 18
+    let spans: Vec<(u32, u32)> = kind[0]
+        .definition_spans()
+        .map(|s| (s.start_line, s.end_line))
+        .collect();
+    assert_eq!(spans, vec![(17, 17), (18, 18)]);
+    assert!(kind[0].contains_line(18), "the second clause counts too");
+    assert!(!kind[0].contains_line(19));
+}

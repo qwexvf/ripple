@@ -24,6 +24,7 @@ fn node(module: &str, name: &str, kind: NodeKind) -> Node {
         qualified_name: name.to_owned(),
         module_path: module.to_owned(),
         span: span(),
+        extra_spans: Vec::new(),
         is_exported: true,
         risk: ir::RiskScores::default(),
     }

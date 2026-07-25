@@ -324,7 +324,13 @@ fn last_segment(path: &str) -> &str {
 /// Phase 2: emit def + module nodes and build the lookup tables.
 fn index_defs(files: &[CachedFile]) -> (DefIndex, Vec<Node>) {
     let mut idx = DefIndex::default();
-    let mut nodes = Vec::new();
+    let mut nodes: Vec<Node> = Vec::new();
+    // identity is (path, qualified name), so several definitions of one symbol share
+    // an id — clauses, overloads, a reopened class. They used to be pushed as
+    // separate nodes and then silently overwrite each other in the store's id-keyed
+    // table, losing every definition site but the last. Collapse here instead, and
+    // keep the spans.
+    let mut at: HashMap<SymbolId, usize> = HashMap::new();
 
     for f in files {
         let by_name = idx.file_defs.entry(f.canonical.clone()).or_default();
@@ -362,7 +368,18 @@ fn index_defs(files: &[CachedFile]) -> (DefIndex, Vec<Node>) {
                         .push(d.id);
                 }
             }
-            nodes.push(d.clone());
+            match at.get(&d.id) {
+                Some(&i) => {
+                    let node: &mut Node = &mut nodes[i];
+                    if !node.definition_spans().any(|s| s == d.span) {
+                        node.extra_spans.push(d.span);
+                    }
+                }
+                None => {
+                    at.insert(d.id, nodes.len());
+                    nodes.push(d.clone());
+                }
+            }
         }
         nodes.push(module_node(&f.module_path));
     }
@@ -637,6 +654,7 @@ fn module_node(module_path: &str) -> Node {
             end_line: 1,
             end_col: 1,
         },
+        extra_spans: Vec::new(),
         is_exported: false,
         risk: ir::RiskScores::default(),
     }

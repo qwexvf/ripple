@@ -112,10 +112,39 @@ pub struct Node {
     /// Module-relative path of the file the symbol lives in.
     pub module_path: String,
     pub span: Span,
+    /// Further definition sites of the *same* symbol, in source order.
+    ///
+    /// One symbol is written more than once in plenty of languages — Elixir and
+    /// Erlang function clauses, overloads that share a name, a class reopened in a
+    /// second block — and identity is (path, qualified name), so they collapse to one
+    /// id. Keeping only `span` meant every definition site but the first was lost,
+    /// which silently breaks anything that asks "which symbol contains this line?".
+    #[serde(default)]
+    pub extra_spans: Vec<Span>,
     pub is_exported: bool,
     /// Overlay-derived risk; zero until the git overlay runs. See docs/06.
     #[serde(default)]
     pub risk: RiskScores,
+}
+
+impl Node {
+    /// Does any of this symbol's definition sites contain `line` (1-based)?
+    pub fn contains_line(&self, line: u32) -> bool {
+        self.definition_spans()
+            .any(|s| s.start_line <= line && line <= s.end_line)
+    }
+
+    /// The span containing `line`, if any — the caller needs its size to pick the
+    /// innermost symbol when several contain the same line.
+    pub fn containing_span(&self, line: u32) -> Option<Span> {
+        self.definition_spans()
+            .find(|s| s.start_line <= line && line <= s.end_line)
+    }
+
+    /// Every definition site, primary first.
+    pub fn definition_spans(&self) -> impl Iterator<Item = Span> + '_ {
+        std::iter::once(self.span).chain(self.extra_spans.iter().copied())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

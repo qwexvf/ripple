@@ -204,6 +204,7 @@ fn extract_defs(
                 qualified_name,
                 module_path: module_path.to_owned(),
                 span: span_of(def_node),
+                extra_spans: Vec::new(),
                 is_exported: adapter.is_exported(def_node, src),
                 risk: ir::RiskScores::default(),
             });
