@@ -20,7 +20,9 @@ fn read_tsconfig(root: &Path, ws: &mut Workspace) {
     let Ok(text) = std::fs::read_to_string(root.join("tsconfig.json")) else {
         return;
     };
-    let Some(json) = parse_jsonc(&text) else { return };
+    let Some(json) = parse_jsonc(&text) else {
+        return;
+    };
     let opts = json.get("compilerOptions");
 
     let base_rel = opts
@@ -30,11 +32,18 @@ fn read_tsconfig(root: &Path, ws: &mut Workspace) {
     let base = root.join(base_rel);
     ws.base_url = base.canonicalize().ok().or(Some(base));
 
-    if let Some(paths) = opts.and_then(|o| o.get("paths")).and_then(|p| p.as_object()) {
+    if let Some(paths) = opts
+        .and_then(|o| o.get("paths"))
+        .and_then(|p| p.as_object())
+    {
         for (pattern, targets) in paths {
             let targets: Vec<String> = targets
                 .as_array()
-                .map(|a| a.iter().filter_map(|t| t.as_str().map(str::to_owned)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|t| t.as_str().map(str::to_owned))
+                        .collect()
+                })
                 .unwrap_or_default();
             if !targets.is_empty() {
                 ws.paths.push((pattern.clone(), targets));
@@ -56,7 +65,9 @@ fn read_packages(root: &Path, ws: &mut Workspace) {
         let Ok(text) = std::fs::read_to_string(entry.path()) else {
             continue;
         };
-        let Some(json) = parse_jsonc(&text) else { continue };
+        let Some(json) = parse_jsonc(&text) else {
+            continue;
+        };
         if let Some(name) = json.get("name").and_then(|n| n.as_str()) {
             if let Some(dir) = entry.path().parent() {
                 if let Ok(dir) = dir.canonicalize() {

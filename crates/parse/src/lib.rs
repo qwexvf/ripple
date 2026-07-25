@@ -87,13 +87,23 @@ impl Queries {
     pub fn compile(adapter: &dyn LanguageAdapter) -> Result<Queries> {
         let lang = adapter.grammar();
         let compile = |src: &str, what: &str| {
-            Query::new(&lang, src).with_context(|| format!("invalid {what} query for {}", adapter.id()))
+            Query::new(&lang, src)
+                .with_context(|| format!("invalid {what} query for {}", adapter.id()))
         };
         Ok(Queries {
             tags: compile(adapter.tags_query(), "tags.scm")?,
-            imports: adapter.imports_query().map(|q| compile(q, "imports.scm")).transpose()?,
-            refs: adapter.refs_query().map(|q| compile(q, "refs.scm")).transpose()?,
-            bindings: adapter.bindings_query().map(|q| compile(q, "bindings.scm")).transpose()?,
+            imports: adapter
+                .imports_query()
+                .map(|q| compile(q, "imports.scm"))
+                .transpose()?,
+            refs: adapter
+                .refs_query()
+                .map(|q| compile(q, "refs.scm"))
+                .transpose()?,
+            bindings: adapter
+                .bindings_query()
+                .map(|q| compile(q, "bindings.scm"))
+                .transpose()?,
         })
     }
 }
@@ -311,7 +321,9 @@ fn extract_bindings(tree: &Tree, query: &Query, src: &[u8]) -> Result<Vec<BindRe
 }
 
 fn receiver_of(node: Option<TsNode>, src: &[u8]) -> Receiver {
-    let Some(node) = node else { return Receiver::Other };
+    let Some(node) = node else {
+        return Receiver::Other;
+    };
     match node.kind() {
         "this" => Receiver::This,
         "identifier" => Receiver::Ident(node.utf8_text(src).unwrap_or("").to_owned()),
@@ -359,9 +371,9 @@ fn predicates_hold(query: &Query, m: &QueryMatch, src: &[u8]) -> bool {
                         .iter()
                         .find(|c| c.index == *id)
                         .and_then(|c| c.node.utf8_text(src).ok());
-                    let found = rest.iter().any(|a| {
-                        matches!(a, QueryPredicateArg::String(s) if Some(s.as_ref()) == v)
-                    });
+                    let found = rest.iter().any(
+                        |a| matches!(a, QueryPredicateArg::String(s) if Some(s.as_ref()) == v),
+                    );
                     if found != (&*pred.operator == "any-of?") {
                         return false;
                     }

@@ -8,7 +8,12 @@ use std::path::PathBuf;
 use store::{Dir, GraphStore, RedbStore};
 
 fn span() -> Span {
-    Span { start_line: 1, start_col: 1, end_line: 1, end_col: 1 }
+    Span {
+        start_line: 1,
+        start_col: 1,
+        end_line: 1,
+        end_col: 1,
+    }
 }
 
 fn node(module: &str, name: &str, kind: NodeKind) -> Node {
@@ -25,7 +30,11 @@ fn node(module: &str, name: &str, kind: NodeKind) -> Node {
 }
 
 fn tmp(tag: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("ripple-contract-{}-{}.redb", tag, std::process::id()))
+    std::env::temp_dir().join(format!(
+        "ripple-contract-{}-{}.redb",
+        tag,
+        std::process::id()
+    ))
 }
 
 /// The reusable contract every GraphStore impl must satisfy.
@@ -40,7 +49,9 @@ fn run_contract(store: &mut dyn GraphStore) {
         site: span(),
     };
 
-    store.write(&[caller.clone(), callee.clone()], &[edge]).unwrap();
+    store
+        .write(&[caller.clone(), callee.clone()], &[edge])
+        .unwrap();
     let graph = store.load().unwrap();
 
     // nodes round-trip

@@ -21,8 +21,17 @@ mod workspace;
 
 pub use crossservice::{link_cross_service, CrossEdges};
 
-const IGNORED_DIRS: &[&str] =
-    &["node_modules", "dist", "build", "out", ".git", ".ripple", ".claude", ".next", "coverage"];
+const IGNORED_DIRS: &[&str] = &[
+    "node_modules",
+    "dist",
+    "build",
+    "out",
+    ".git",
+    ".ripple",
+    ".claude",
+    ".next",
+    "coverage",
+];
 
 // Edge confidences, ordered by how much syntax pins the target (see docs/06).
 const CONF_IMPORT: f32 = 0.95; // resolved import → exported symbol
@@ -65,7 +74,10 @@ pub fn build(root: &Path) -> Result<BuildResult> {
 /// independently (imports never cross repos by file path — that's cross-service,
 /// v1 #5); module paths are namespaced by a per-root tag so same-relative-path
 /// files in different repos don't collide on SymbolId. See docs/08-roadmap.md.
-pub fn build_incremental(roots: &[PathBuf], cached: &HashMap<String, CachedFile>) -> Result<Indexed> {
+pub fn build_incremental(
+    roots: &[PathBuf],
+    cached: &HashMap<String, CachedFile>,
+) -> Result<Indexed> {
     let registry = lang::registry();
     // compile queries once, shared across all roots + rayon threads
     let queries: HashMap<&str, Queries> = registry
@@ -87,7 +99,11 @@ pub fn build_incremental(roots: &[PathBuf], cached: &HashMap<String, CachedFile>
         let root = root
             .canonicalize()
             .with_context(|| format!("cannot access {}", root.display()))?;
-        let tag = if single { String::new() } else { unique_tag(&root, &mut tags) };
+        let tag = if single {
+            String::new()
+        } else {
+            unique_tag(&root, &mut tags)
+        };
 
         let (files, s) = discover(&root, &tag, &registry, &queries, cached, &mut seen_canon)?;
         let ws = workspace::discover(&root);
@@ -179,7 +195,9 @@ fn discover(
 
     let parsed: Vec<(CachedFile, Change)> = candidates
         .par_iter()
-        .map(|(canonical, module_path)| parse_one(registry, queries, cached, canonical, module_path))
+        .map(|(canonical, module_path)| {
+            parse_one(registry, queries, cached, canonical, module_path)
+        })
         .collect::<Result<Vec<_>>>()?;
 
     let mut stats = IndexStats::default();
@@ -263,7 +281,10 @@ fn index_defs(files: &[CachedFile]) -> (DefIndex, Vec<Node>) {
             if d.is_exported {
                 idx.export_table
                     .insert((f.canonical.clone(), d.name.clone()), d.id);
-                idx.file_exports.entry(f.canonical.clone()).or_default().push(d.id);
+                idx.file_exports
+                    .entry(f.canonical.clone())
+                    .or_default()
+                    .push(d.id);
             }
             if d.kind == NodeKind::Method {
                 if let Some((class, method)) = d.qualified_name.split_once('.') {
@@ -451,7 +472,12 @@ fn module_node(module_path: &str) -> Node {
         name: module_path.to_owned(),
         qualified_name: module_path.to_owned(),
         module_path: module_path.to_owned(),
-        span: Span { start_line: 1, start_col: 1, end_line: 1, end_col: 1 },
+        span: Span {
+            start_line: 1,
+            start_col: 1,
+            end_line: 1,
+            end_col: 1,
+        },
         is_exported: false,
         risk: ir::RiskScores::default(),
     }

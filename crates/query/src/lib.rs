@@ -45,7 +45,11 @@ pub fn impact(graph: &InMemoryGraph, seeds: &[SymbolId], budget: usize) -> Vec<I
     let mut best: HashMap<SymbolId, (f32, usize, EdgeKind)> = HashMap::new();
     let mut heap: BinaryHeap<QItem> = BinaryHeap::new();
     for &s in seeds {
-        heap.push(QItem { weight: 1.0, id: s, depth: 0 });
+        heap.push(QItem {
+            weight: 1.0,
+            id: s,
+            depth: 0,
+        });
     }
 
     while let Some(QItem { weight, id, depth }) = heap.pop() {
@@ -58,7 +62,11 @@ pub fn impact(graph: &InMemoryGraph, seeds: &[SymbolId], budget: usize) -> Vec<I
             let improved = best.get(&e.src).is_none_or(|&(bw, ..)| w > bw);
             if improved {
                 best.insert(e.src, (w, depth + 1, e.kind));
-                heap.push(QItem { weight: w, id: e.src, depth: depth + 1 });
+                heap.push(QItem {
+                    weight: w,
+                    id: e.src,
+                    depth: depth + 1,
+                });
             }
         }
     }
@@ -71,7 +79,13 @@ pub fn impact(graph: &InMemoryGraph, seeds: &[SymbolId], budget: usize) -> Vec<I
         .filter_map(|(id, (weight, depth, via))| {
             let node = graph.get(id)?.clone();
             let score = weight * (1.0 + node.risk.composite);
-            Some(ImpactHit { node, weight, score, depth, via })
+            Some(ImpactHit {
+                node,
+                weight,
+                score,
+                depth,
+                via,
+            })
         })
         .collect();
 
@@ -181,7 +195,12 @@ pub fn review_focus(
             untested.push(sym.clone());
         }
 
-        focus.push(FocusItem { node: sym.clone(), review_priority, downstream: downstream.len(), reasons });
+        focus.push(FocusItem {
+            node: sym.clone(),
+            review_priority,
+            downstream: downstream.len(),
+            reasons,
+        });
     }
     focus.sort_by(|a, b| {
         b.review_priority
@@ -210,7 +229,11 @@ pub fn review_focus(
     missing.sort_by(|a, b| a.module_path.cmp(&b.module_path));
     untested.sort_by_key(|n| n.id.0);
 
-    ReviewResult { focus, missing_cochange: missing, untested }
+    ReviewResult {
+        focus,
+        missing_cochange: missing,
+        untested,
+    }
 }
 
 struct QItem {

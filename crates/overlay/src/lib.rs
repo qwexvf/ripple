@@ -72,7 +72,9 @@ fn try_recent(root: &Path, k: usize) -> Result<Vec<Vec<String>>, git2::Error> {
         if out.len() >= k {
             break;
         }
-        let Ok(commit) = repo.find_commit(oid?) else { continue };
+        let Ok(commit) = repo.find_commit(oid?) else {
+            continue;
+        };
         if commit.parent_count() != 1 {
             continue; // skip merges and root
         }
@@ -84,7 +86,10 @@ fn try_recent(root: &Path, k: usize) -> Result<Vec<Vec<String>>, git2::Error> {
     Ok(out)
 }
 
-fn try_diff(root: &Path, base: Option<&str>) -> Result<HashMap<String, Vec<(u32, u32)>>, git2::Error> {
+fn try_diff(
+    root: &Path,
+    base: Option<&str>,
+) -> Result<HashMap<String, Vec<(u32, u32)>>, git2::Error> {
     let repo = git2::Repository::discover(root)?;
     let workdir = repo
         .workdir()
@@ -140,7 +145,9 @@ fn try_mine(root: &Path) -> Result<GitOverlay, git2::Error> {
 
     for oid in revwalk.take(COMMIT_WINDOW) {
         let Ok(oid) = oid else { continue };
-        let Ok(commit) = repo.find_commit(oid) else { continue };
+        let Ok(commit) = repo.find_commit(oid) else {
+            continue;
+        };
         if commit.parent_count() != 1 {
             continue; // skip merges (noisy) and the root commit (diffs vs empty tree = all files)
         }
@@ -235,7 +242,12 @@ pub fn apply(overlay: &GitOverlay, nodes: &mut [Node], edges: &mut Vec<Edge>) ->
         }
     }
     let indexed: HashSet<&str> = nodes.iter().map(|n| n.module_path.as_str()).collect();
-    let zero = Span { start_line: 0, start_col: 0, end_line: 0, end_col: 0 };
+    let zero = Span {
+        start_line: 0,
+        start_col: 0,
+        end_line: 0,
+        end_col: 0,
+    };
     let mut applied = 0;
     for (a, b, score) in &overlay.cochange {
         if !indexed.contains(a.as_str()) || !indexed.contains(b.as_str()) {
@@ -265,7 +277,9 @@ fn changed_files(
     workdir: &Path,
     index_root: &Path,
 ) -> Vec<String> {
-    let Ok(tree) = commit.tree() else { return Vec::new() };
+    let Ok(tree) = commit.tree() else {
+        return Vec::new();
+    };
     let parent_tree = commit.parent(0).ok().and_then(|p| p.tree().ok());
     let Ok(diff) = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None) else {
         return Vec::new();
@@ -333,7 +347,7 @@ mod tests {
         let vals = vec![1.0, 2.0, 3.0, 4.0];
         assert_eq!(percentile(&vals, 1.0), 0.0); // minimum → 0
         assert_eq!(percentile(&vals, 4.0), 0.75); // 3 of 4 are smaller
-        // the acute case: most files have bug_density 0 → they score 0, not the tie fraction
+                                                  // the acute case: most files have bug_density 0 → they score 0, not the tie fraction
         let bug = vec![0.0, 0.0, 0.0, 0.5];
         assert_eq!(percentile(&bug, 0.0), 0.0);
         assert_eq!(percentile(&[], 5.0), 0.0);
@@ -346,7 +360,12 @@ mod tests {
             name: path.to_owned(),
             qualified_name: path.to_owned(),
             module_path: path.to_owned(),
-            span: Span { start_line: 1, start_col: 1, end_line: 1, end_col: 1 },
+            span: Span {
+                start_line: 1,
+                start_col: 1,
+                end_line: 1,
+                end_col: 1,
+            },
             is_exported: false,
             risk: RiskScores::default(),
         }
@@ -357,11 +376,17 @@ mod tests {
         let mut overlay = GitOverlay::default();
         overlay.file_risk.insert(
             "a.ts".into(),
-            RiskScores { composite: 0.9, churn: 0.9, ..Default::default() },
+            RiskScores {
+                composite: 0.9,
+                churn: 0.9,
+                ..Default::default()
+            },
         );
         // one pair fully in graph, one pointing at an unindexed file
         overlay.cochange.push(("a.ts".into(), "b.ts".into(), 0.7));
-        overlay.cochange.push(("a.ts".into(), "external.ex".into(), 0.8));
+        overlay
+            .cochange
+            .push(("a.ts".into(), "external.ex".into(), 0.8));
 
         let mut nodes = vec![module_node("a.ts"), module_node("b.ts")];
         let mut edges = Vec::new();

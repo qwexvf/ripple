@@ -96,7 +96,9 @@ fn enclosing_type_name(node: tree_sitter::Node, src: &[u8]) -> Option<String> {
     let mut cur = node.parent();
     while let Some(n) = cur {
         match n.kind() {
-            "class_declaration" | "abstract_class_declaration" | "interface_declaration"
+            "class_declaration"
+            | "abstract_class_declaration"
+            | "interface_declaration"
             | "enum_declaration" => {
                 return n
                     .child_by_field_name("name")

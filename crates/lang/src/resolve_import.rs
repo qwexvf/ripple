@@ -25,7 +25,8 @@ pub fn tsconfig_paths(spec: &str, ws: &Workspace, globs: &[&str]) -> Option<Path
 pub fn workspace_package(spec: &str, ws: &Workspace, globs: &[&str]) -> Option<PathBuf> {
     for (name, dir) in &ws.packages {
         if spec == name {
-            return probe(&dir.join("index"), globs).or_else(|| probe(&dir.join("src/index"), globs));
+            return probe(&dir.join("index"), globs)
+                .or_else(|| probe(&dir.join("src/index"), globs));
         }
         if let Some(sub) = spec.strip_prefix(&format!("{name}/")) {
             if let Some(p) = probe(&dir.join(sub), globs) {
