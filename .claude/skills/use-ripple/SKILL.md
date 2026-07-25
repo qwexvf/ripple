@@ -18,11 +18,11 @@ Last measured 2026-07-25 on the 5noobs stack (web + api). A count that moves wit
 an explanation is the cheapest bug signal this project has, so re-measure and diff:
 
 ```
-1153 files → 8929 nodes, 15787 edges
-  (2461 co-change, 343 graphql, 941 db, 134 imported, 1634 file-granular, 4117 with dependents)
-  ↑ nodes/with-dependents dropped on 2026-07-25 because duplicate definition nodes
-    (one per clause) stopped being counted — the store only ever kept one of each
-cold index ~1.4s, warm ~0.7s
+1153 files → 9179 nodes, 19277 edges
+  (2461 co-change, 343 graphql, 941 db, 134 imported, 1634 file-granular, 4439 with dependents)
+  ↑ +3490 edges on 2026-07-25 from three TS fixes: .tsx now uses the TSX grammar,
+    JSX rendering is a call, `export { X }` lists count as exports
+cold index ~1.5s, warm ~0.8s
 eval (5noobs-web, held out — co-change mined only from commits older than the test window):
   --commits 50  (500 train, 2078 pairs): static 7.1% | co-change 3.4% | fused 10.5%
   --commits 300 (148 train, 4188 pairs): static 6.5% | co-change 1.3% | fused  7.8%
@@ -31,9 +31,12 @@ eval (5noobs-web, held out — co-change mined only from commits older than the 
 eval --oracle lsp vs dexter 0.7.1, 40 files (compare by position, state granularity):
   elixir  --granularity function: 165/165 (100.0%) | 0 ripple-only | 0 server-only
   elixir  --granularity file    : 153/165 (92.7%)  | 44 ripple-only | 0 server-only
-  typescript vs tsgo 7.0.0-dev, 15 files: 7/11 (63.6%) | 0 ripple-only | 5 server-only
-    the 5 are issues #25 (a call inside a `const` initialiser is credited to the const)
-    and #26 (JSX usage is not a call edge) — the TS number is the untested side
+  30 files, per language (tsgo 7.0.0-dev for ts/tsx, dexter 0.7.1 for elixir):
+    elixir      161/162 (99.4%) | 1 ripple-only  | 0 server-only
+    tsx          32/35  (91.4%) | 3 ripple-only  | 0 server-only
+    typescript   34/43  (79.1%) | 0 ripple-only  | 693 server-only ← all one pattern
+    those 693 are issue #27: an import through a barrel (`export * from`) resolves to
+    nothing, and one generated GraphQL barrel is imported by the whole app
   the 44 are true edges dexter misses (it reports 1 caller for filter_posts and misses
   5 real call sites in lfg_posts_test.exs) — ripple-only at file granularity is capped
   by the oracle's own completeness, so read it with that in mind
@@ -55,6 +58,10 @@ non-interactive PATH — prefix with `PATH=~/.local/share/mise/shims:$PATH`. Its
 resolves the index from the **current directory**, so `dexter references` run from
 elsewhere silently reports nothing.
 
+`.tsx` is a **separate adapter** (`tsx`) from `.ts` (`typescript`) because JSX only
+exists in the TSX grammar — so a `.ripple/lsp.json` for a web root wants an entry for
+each, and `lsp doctor` lists both.
+
 **TypeScript oracle:** `typescript-language-server` is *not* installed; `tsgo`
 (`npm i -g @typescript/native-preview`, TS 7 preview) is, and it answers
 `callHierarchy`. It isn't the built-in default, so point ripple at it with
@@ -62,6 +69,9 @@ elsewhere silently reports nothing.
 
 ```json
 [{ "language": "typescript", "command": "tsgo", "args": ["--lsp", "--stdio"],
+   "root_markers": ["tsconfig.json", "package.json"],
+   "init_timeout_ms": 60000, "request_timeout_ms": 15000 },
+ { "language": "tsx", "command": "tsgo", "args": ["--lsp", "--stdio"],
    "root_markers": ["tsconfig.json", "package.json"],
    "init_timeout_ms": 60000, "request_timeout_ms": 15000 }]
 ```
