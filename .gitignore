@@ -2,3 +2,6 @@
 **/*.rs.bk
 Cargo.lock
 .DS_Store
+
+# ripple indexes itself now (see .claude/skills/use-ripple)
+/.ripple/
