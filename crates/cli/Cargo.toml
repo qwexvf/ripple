@@ -16,5 +16,6 @@ resolve = { workspace = true }
 store = { workspace = true }
 overlay = { workspace = true }
 query = { workspace = true }
+lsp = { workspace = true }
 anyhow = { workspace = true }
 serde_json = { workspace = true }

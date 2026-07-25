@@ -19,6 +19,16 @@ Elixir-specific alternatives (`mix xref`, compiler tracers) give the same data i
 bulk and are cheaper per repo — but they're Elixir-only. LSP is the interface
 nearly every language already implements, so it's the one worth building against.
 
+**`dexter` (remoteoss) is the Elixir case that shaped this design.** It speaks
+plain LSP with `callHierarchy/incomingCalls`/`outgoingCalls`, follows
+`defdelegate` chains, and — the important part — *requires no compilation*: it
+indexes from source, ~11s for a 57k-file monorepo, ~10ms queries. That kills the
+assumption that a language server implies a build, and it's why the built-in table
+marks Elixir `inline = true` while `rust-analyzer` (which builds its cache first)
+is background-warm only. Being tree-sitter-based, dexter is a strong *peer* rather
+than an oracle: agreement doesn't prove correctness, but disagreement localises a
+bug in either side. Compiler tracers remain the only true ground truth.
+
 ## The layering
 
 | tier | source | rationale |
@@ -90,27 +100,35 @@ a query never re-derives them mid-session. This adds a `source` field to
 
 Adding a server must not touch Rust — same rule as the `.scm` adapter seam:
 
-```toml
-# .ripple/lsp.toml
-[servers.elixir]
-command = "elixir-ls"
-root_markers = ["mix.exs"]
-inline = false          # background-warm only; too slow to block on
-max_concurrency = 2
+JSON, not TOML — `serde_json` is already a dependency and a config format isn't
+worth a new one. An entry replaces the built-in for that language; omitted fields
+take their default.
 
-[servers.typescript]
-command = "typescript-language-server"
-args = ["--stdio"]
-root_markers = ["tsconfig.json", "package.json"]
-inline = true
-max_concurrency = 8
+```json
+// .ripple/lsp.json
+[
+  { "language": "elixir", "command": "lexical", "inline": false, "max_concurrency": 2 },
+  { "language": "gleam",  "command": "gleam", "args": ["lsp"], "root_markers": ["gleam.toml"] }
+]
 ```
+
+Built-in defaults cover `elixir` (dexter), `typescript`, `go`, `python`, and
+`rust`.
 
 ## Phases
 
-1. **`crates/lsp` — client + `doctor`.** stdio JSON-RPC (initialize/shutdown,
-   concurrent request ids, per-request timeout), capability probe, UTF-16↔byte
-   position conversion *with tests* — the usual source of off-by-one bugs.
+1. **`crates/lsp` — client + `doctor`.** ✅ **done.** Synchronous stdio JSON-RPC
+   (reader thread, id-matched requests, per-request timeout, stderr drained and
+   kept as diagnostics), capability probe, and `ripple lsp doctor [--json]`, which
+   probes **every indexed root** — a cross-repo index has a different language mix
+   per root, so the Elixir server belongs to the repo with `mix.exs`, not to the
+   one holding the database. Each line states a fact about the environment:
+   `n/a` (no root marker), `missing` (and whether that language is actually
+   indexed), `broken` (with the tail of the server's stderr), or `ready` (with
+   handshake latency and the capabilities that matter). Verified against real
+   `gopls`: 128ms handshake, `callHierarchy=true`.
+   Still to add here: UTF-16↔byte position conversion, once something actually
+   sends positions.
 2. **`ripple eval --oracle lsp --sample N`.** Diff server call edges against ours
    on a sample; report precision/recall per language. Decides whether phase 3 is
    worth it, and becomes the permanent regression harness for `.scm` changes —

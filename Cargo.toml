@@ -8,6 +8,7 @@ members = [
     "crates/store",
     "crates/overlay",
     "crates/query",
+    "crates/lsp",
     "crates/cli",
 ]
 
@@ -25,6 +26,7 @@ resolve = { path = "crates/resolve" }
 store = { path = "crates/store" }
 overlay = { path = "crates/overlay" }
 query = { path = "crates/query" }
+lsp = { path = "crates/lsp" }
 git2 = { version = "0.20", default-features = false }
 tree-sitter = "0.25"
 tree-sitter-typescript = "0.23"

@@ -21,12 +21,13 @@ fn main() -> Result<()> {
         Some("risk") => cmd_risk(&args[1..]),
         Some("mcp") => cmd_mcp(&args[1..]),
         Some("eval") => cmd_eval(&args[1..]),
+        Some("lsp") => cmd_lsp(&args[1..]),
         Some(other) => bail!("unknown command: {other}\n{USAGE}"),
         None => bail!("{USAGE}"),
     }
 }
 
-const USAGE: &str = "usage:\n  ripple parse <file> [--json]\n  ripple index <path>...\n  ripple neighbors <symbol> [--in|--out] [--depth N] [--root <path>] [--json]\n  ripple impact <symbol>... [--budget N] [--root <path>] [--json]\n  ripple review [<base>] [--budget N] [--root <path>] [--json]\n  ripple risk <symbol|file> [--root <path>] [--json]\n  ripple mcp [--root <path>]   (MCP server over stdio for AI agents)";
+const USAGE: &str = "usage:\n  ripple parse <file> [--json]\n  ripple index <path>...\n  ripple neighbors <symbol> [--in|--out] [--depth N] [--root <path>] [--json]\n  ripple impact <symbol>... [--budget N] [--root <path>] [--json]\n  ripple review [<base>] [--budget N] [--root <path>] [--json]\n  ripple risk <symbol|file> [--root <path>] [--json]\n  ripple mcp [--root <path>]   (MCP server over stdio for AI agents)\n  ripple lsp doctor [--root <path>] [--json]   (are language servers usable here?)";
 
 fn db_path(root: &Path) -> PathBuf {
     root.join(".ripple").join("graph.redb")
@@ -177,6 +178,164 @@ fn root_tag(store: &RedbStore, root: &Path) -> Result<String> {
             .collect::<Vec<_>>()
             .join(", ")
     )
+}
+
+/// `ripple lsp <subcommand>`. Only `doctor` for now: report whether this project
+/// has usable language servers, so the Tier-2 accuracy layer is never a mystery.
+/// See docs/11-lsp-integration.md.
+fn cmd_lsp(args: &[String]) -> Result<()> {
+    match positional(args).map(String::as_str) {
+        Some("doctor") => cmd_lsp_doctor(&args[1..]),
+        Some(other) => bail!("unknown lsp subcommand: {other}\n{USAGE}"),
+        None => bail!("{USAGE}"),
+    }
+}
+
+fn cmd_lsp_doctor(args: &[String]) -> Result<()> {
+    let json = args.iter().any(|a| a == "--json");
+    let root: PathBuf = flag_value(args, "--root").map_or_else(|| ".".into(), PathBuf::from);
+    let root = root
+        .canonicalize()
+        .with_context(|| format!("cannot access {}", root.display()))?;
+
+    let store = RedbStore::open(db_path(&root));
+    let graph = store.load().ok();
+    // A cross-repo index spans several roots, and each root has its own language
+    // mix — the Elixir server belongs to the repo that has mix.exs, not to the one
+    // that happens to hold the database.
+    let mut roots = store.read_roots().unwrap_or_default();
+    if roots.is_empty() {
+        roots.push((String::new(), root.clone()));
+    }
+    let adapters: Vec<String> = lang::registry().iter().map(|a| a.id().to_owned()).collect();
+    let specs = lsp::load(&root)?;
+
+    let mut checked = Vec::new();
+    for (tag, path) in &roots {
+        let indexed = indexed_languages(graph.as_ref(), tag);
+        let reports: Vec<lsp::Report> = specs.iter().map(|spec| lsp::probe(spec, path)).collect();
+        checked.push((path.clone(), indexed, reports));
+    }
+
+    if json {
+        let out: Vec<Value> = checked
+            .iter()
+            .map(|(path, indexed, reports)| {
+                json!({
+                    "root": path.display().to_string(),
+                    "indexed_languages": indexed,
+                    "servers": reports,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "ripple_adapters": adapters,
+                "roots": out,
+            }))?
+        );
+        return Ok(());
+    }
+
+    for (path, indexed, reports) in &checked {
+        println!("language servers for {}", path.display());
+        if graph.is_none() {
+            println!("  (no index yet — run `ripple index` to see which languages matter here)");
+        } else if indexed.is_empty() {
+            println!("  (nothing indexed under this root)");
+        } else {
+            println!("  indexed languages: {}", indexed.join(", "));
+        }
+
+        for r in reports {
+            let no_adapter = !adapters.contains(&r.language);
+            let matters = indexed.contains(&r.language);
+            // a server for a language ripple can't index, in a project that
+            // doesn't use it either, is pure noise — skip it
+            if no_adapter && matches!(r.health, lsp::Health::NotApplicable) {
+                continue;
+            }
+            println!("\n  {} ({})", r.language, r.command);
+            if no_adapter {
+                println!(
+                    "    note     ripple has no adapter for {} yet, so this server adds nothing today",
+                    r.language
+                );
+            }
+            match &r.health {
+                lsp::Health::NotApplicable => {
+                    let note = if matters {
+                        "no root marker here — this language is indexed from another root"
+                    } else {
+                        "no root marker in this project"
+                    };
+                    println!("    n/a      {note}");
+                }
+                lsp::Health::BinaryMissing => {
+                    let note = if matters {
+                        "not installed — this language is indexed, so its edges stay tree-sitter only"
+                    } else {
+                        "not installed"
+                    };
+                    println!("    missing  {note}");
+                }
+                lsp::Health::Failed { error, log } => {
+                    println!("    broken   {error}");
+                    for l in log.iter().rev().take(3) {
+                        println!("             {l}");
+                    }
+                }
+                lsp::Health::Ready {
+                    init_ms,
+                    caps,
+                    server,
+                } => {
+                    let name = server.as_deref().unwrap_or("(unnamed)");
+                    println!("    ready    {name}, handshake {init_ms}ms");
+                    println!(
+                        "             callHierarchy={} references={} documentSymbol={} workspaceSymbol={}",
+                        caps.call_hierarchy,
+                        caps.references,
+                        caps.document_symbol,
+                        caps.workspace_symbol
+                    );
+                    let verdict = if !caps.usable_for_calls() {
+                        "cannot supply call edges (no callHierarchy or references)"
+                    } else if r.inline {
+                        "usable inline"
+                    } else {
+                        "usable, background-warm only"
+                    };
+                    println!("             {verdict}");
+                }
+            }
+        }
+        println!();
+    }
+    Ok(())
+}
+
+/// Languages indexed under one root. Module paths are namespaced by root tag in a
+/// multi-root index, so the tag selects the root's own files.
+fn indexed_languages(graph: Option<&InMemoryGraph>, tag: &str) -> Vec<String> {
+    let Some(graph) = graph else {
+        return Vec::new();
+    };
+    let prefix = if tag.is_empty() {
+        String::new()
+    } else {
+        format!("{tag}/")
+    };
+    let mut ids: Vec<String> = graph
+        .nodes()
+        .filter(|n| n.module_path.starts_with(&prefix))
+        .filter_map(|n| lang::for_path(Path::new(&n.module_path)))
+        .map(|a| a.id().to_owned())
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids
 }
 
 fn cmd_impact(args: &[String]) -> Result<()> {
