@@ -11,3 +11,4 @@ tree-sitter = { workspace = true }
 tree-sitter-typescript = { workspace = true }
 tree-sitter-elixir = { workspace = true }
 tree-sitter-graphql = { workspace = true }
+tree-sitter-rust = { workspace = true }

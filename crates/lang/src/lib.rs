@@ -6,6 +6,7 @@ pub mod cross;
 pub mod elixir;
 pub mod graphql;
 pub mod resolve_import;
+pub mod rust;
 pub mod typescript;
 
 use std::collections::HashMap;
@@ -89,6 +90,7 @@ pub fn registry() -> Vec<Box<dyn LanguageAdapter>> {
         Box::new(typescript::Adapter::new()),
         Box::new(elixir::Adapter::new()),
         Box::new(graphql::Adapter::new()),
+        Box::new(rust::Adapter::new()),
     ]
 }
 
