@@ -74,48 +74,89 @@ candidates — check it before acting on it.
 - Type-level Absinthe fields aren't joined to consumers: only *root* fields are, so a
   nested selection (`player { team { … } }`) does not reach `team`'s resolver yet.
 
-## End of every phase: the ritual
+## After every phase: the short loop (cheap)
 
-Run this when a phase lands, before starting the next one. It exists because each
-step below has already caught something the others missed.
+Four steps, no prose. Run these when a phase lands.
 
 **1. Gates.** `cargo fmt --all --check`, `cargo clippy --all-targets` (0 warnings),
 `cargo test`. Non-negotiable.
 
-**2. Review the diff yourself** — `git diff <phase-start>..HEAD`. Look specifically
-for the failure shapes this project keeps producing:
+**2. Re-measure and write the numbers down.** Index the 5noobs stack; record
+files / nodes / edges / graphql / db / cold + warm. Build first (`cargo build
+--release`) or compile time lands inside the timing — that mistake has been made
+twice. **A count that moves unexpectedly is the cheapest bug detector here** — the
+dependency-indexing bug, the duplicate-edge bug and the typespec bug were all first
+seen as a number that didn't add up. If a count changes, explain why before moving on.
 
-- a fix for one language silently damaging another (the Elixir guard deleted a
-  TypeScript edge)
-- a **silent zero or empty result** reported as a finding (`eval` printed 0.0%)
-- a **mislabelled number** (the index summary counted `graphql + db` as "graphql")
-- **inflated counts** from indexing things nobody will change (deps were 74% of the graph)
-- a test that passes whether or not the fix is present — disable the fix and confirm
-  the test actually fails
-
-**3. Re-measure on real code, and write the numbers down.** Index the 5noobs stack and
-record files / nodes / edges / graphql / db / cold+warm time. A number that moves
-unexpectedly is the cheapest bug detector we have — every big find today started as a
-count that didn't add up. If a count changes, explain *why* before moving on.
-
-**4. Check token cost.** `/caveman-stats` for this session's real usage. Note it
-against what the phase delivered. A phase that burned a lot of context for a small
-diff usually means the approach was wrong, not that the work was hard.
-
-**5. Sanity-check ripple's risk output on your own change** — this is the dogfood
-step that matters most:
+**3. Sanity-check ripple's risk output on your own change.**
 
 ```
-cargo run -p ripple-cli -- review --root <indexed repo>     # what it says to review first
 cargo run -p ripple-cli -- risk <file-you-changed> --root <p>
+cargo run -p ripple-cli -- review --root <indexed repo>
 ```
 
-Ask: does the ranking match where the danger actually was? If a file you know is
-risky ranks low, or something trivial ranks top, **that is a finding** — the risk
-formula's weights are hand-set constants, never fit to data, so this is the only
-feedback they get. Log it.
+Does the ranking match where the danger actually was? Something risky ranking low,
+or something trivial ranking top, **is a finding** — the weights are hand-set
+constants that get no other feedback. This step is what exposed that `composite` was
+missing three of its six inputs.
 
-**6. Log, commit, then next phase.** One concern per commit.
+**4. Log anything surprising, commit, next phase.** One concern per commit.
+
+## Every 2–3 phases: the full review (expensive — don't run it more often)
+
+A proper review costs real context: reading the whole diff, re-deriving claims,
+building repros. Running it after every phase wastes tokens on unchanged code, so
+batch it. Trigger it when 2–3 phases have landed, or immediately if a phase touched
+an invariant, changed a public API, or produced a number nobody can explain.
+
+Review `git diff <last-reviewed>..HEAD`. Hunt these specific failure shapes, all of
+which have already occurred here:
+
+- a fix for one language silently damaging another (an Elixir guard deleted a
+  TypeScript edge)
+- a **silent zero** reported as a result (`eval` printed 0.0% recall)
+- a **mislabelled number** (the summary counted `graphql + db` as "graphql")
+- **inflated counts** from indexing code nobody will change (deps were 74% of the graph)
+- **a claim the code doesn't honour** (`risk` documented six inputs, blended three)
+- a test that passes whether or not the fix is present — disable the fix and confirm
+  the test fails
+
+### Output format
+
+Fixed shape, so reviews are comparable over time and skimmable:
+
+```markdown
+# Code review — <scope>
+
+**Purpose.** The decision this review informs (ship? build on? revert?).
+**Scope.** `<range>` — N commits, N files, +X/−Y. Areas touched.
+**Verdict.** Ship-ready / blocked, and on what.
+
+## Must fix
+One block per finding: `file:line`, what's wrong, how it FAILS (concrete input →
+wrong output), and whether a test would have caught it.
+
+## Should fix
+Table: `#` | `file:line` | issue | failure.
+
+## Nits
+One line each. Non-blocking, labelled `nit:`.
+
+## What I checked and trust
+The claims actually verified, with the evidence (numbers, repros, byte-comparisons)
+— not a list of everything that exists.
+
+## Known-weak, honestly
+Limitations shipped on purpose, so they don't get rediscovered as bugs.
+
+## Recommended order
+Numbered, by (damage × certainty) ÷ effort.
+```
+
+Rules: every finding names a **concrete failure**, not a worry. Severity is decided
+by damage, not by how odd the code looks. No praise sections. Say plainly when a
+finding is pre-existing rather than introduced by the diff under review — it changes
+whether it blocks the push.
 
 ## Dogfood log — the point of all this
 

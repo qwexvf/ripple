@@ -31,10 +31,14 @@ edits, several commits worded as fixes). Two things behind the number are not:
    a calm git history reads as low risk, which is precisely the case the static graph
    was supposed to catch.
 
-**Implication (open).** Either renormalize the blend over the terms that actually
-carry signal, or populate `fanout` at query time (the graph already knows it) and
-`complexity` at parse time. Until then the docs overstate what risk means, and the
-weights have never been fit to anything.
+**Implication (fixed, `fdf8e2b`).** Both: `score_structure` counts distinct
+dependents per symbol after cross-service linking and percentile-ranks them into
+`fanout`, and the blend now drops terms that rank nothing and renormalizes, judging
+variance per corpus rather than per node. `complexity` and `test_proximity` drop out
+by the same rule instead of posing as measured zeros. On ripple itself the file
+changed most that day went 0.71 → 0.93, and `SymbolId` — no bug history, many
+dependents — went from invisible to 0.42. The weights are still hand-set and unfit to
+data.
 
 **Lesson:** the ritual's "does this number make sense?" step found in one query that
 the flagship risk formula is missing three of its six inputs. Nothing else today
