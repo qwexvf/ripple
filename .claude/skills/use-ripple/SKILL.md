@@ -29,8 +29,11 @@ eval (5noobs-web, held out — co-change mined only from commits older than the 
   ↑ prefer the 50 line: a 300-commit test window leaves only 148 training commits
     (15 trained pairs), so co-change is starved, not wrong
 eval --oracle lsp vs dexter 0.7.1, 40 files (compare by position, state granularity):
-  --granularity function: 165/165 (100.0%) | 0 ripple-only | 0 server-only
-  --granularity file    : 153/165 (92.7%)  | 44 ripple-only | 0 server-only
+  elixir  --granularity function: 165/165 (100.0%) | 0 ripple-only | 0 server-only
+  elixir  --granularity file    : 153/165 (92.7%)  | 44 ripple-only | 0 server-only
+  typescript vs tsgo 7.0.0-dev, 15 files: 7/11 (63.6%) | 0 ripple-only | 5 server-only
+    the 5 are issues #25 (a call inside a `const` initialiser is credited to the const)
+    and #26 (JSX usage is not a call edge) — the TS number is the untested side
   the 44 are true edges dexter misses (it reports 1 caller for filter_posts and misses
   5 real call sites in lfg_posts_test.exs) — ripple-only at file granularity is capped
   by the oracle's own completeness, so read it with that in mind
@@ -51,6 +54,21 @@ when finished.
 non-interactive PATH — prefix with `PATH=~/.local/share/mise/shims:$PATH`. Its CLI
 resolves the index from the **current directory**, so `dexter references` run from
 elsewhere silently reports nothing.
+
+**TypeScript oracle:** `typescript-language-server` is *not* installed; `tsgo`
+(`npm i -g @typescript/native-preview`, TS 7 preview) is, and it answers
+`callHierarchy`. It isn't the built-in default, so point ripple at it with
+`<web-root>/.ripple/lsp.json` — and remember `rm -rf .ripple` wipes it:
+
+```json
+[{ "language": "typescript", "command": "tsgo", "args": ["--lsp", "--stdio"],
+   "root_markers": ["tsconfig.json", "package.json"],
+   "init_timeout_ms": 60000, "request_timeout_ms": 15000 }]
+```
+
+Handshake is ~2s (dexter is 40ms), and it needs its server→client
+`client/registerCapability` request answered or it serves nothing — the client does
+that now, but a server that "never answers" is worth suspecting there first.
 
 Backlog, follow-ups and open questions live on the board:
 <https://github.com/users/qwexvf/projects/7>. Don't keep a second list.
