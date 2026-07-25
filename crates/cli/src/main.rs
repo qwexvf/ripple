@@ -3,6 +3,8 @@
 //!   ripple index <path>            M1: build graph → .ripple/graph.redb
 //!   ripple neighbors <symbol>      M1: traverse the persisted graph
 
+mod verify;
+
 use anyhow::{bail, Context, Result};
 use ir::EdgeKind;
 use serde_json::{json, Value};
@@ -10,6 +12,7 @@ use std::collections::HashSet;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use store::{Dir, GraphStore, InMemoryGraph, RedbStore};
+use verify::{bare_name, is_callable_name};
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -28,7 +31,7 @@ fn main() -> Result<()> {
     }
 }
 
-const USAGE: &str = "usage:\n  ripple parse <file> [--json]\n  ripple index <path>...\n  ripple neighbors <symbol> [--in|--out] [--depth N] [--root <path>] [--json]\n  ripple impact <symbol>... [--budget N] [--root <path>] [--json]\n  ripple review [<base>] [--budget N] [--root <path>] [--json]\n  ripple risk <symbol|file> [--root <path>] [--json]\n  ripple mcp [--root <path>]   (MCP server over stdio for AI agents)\n  ripple lsp doctor [--root <path>] [--json]   (are language servers usable here?)";
+const USAGE: &str = "usage:\n  ripple parse <file> [--json]\n  ripple index <path>...\n  ripple neighbors <symbol> [--in|--out] [--depth N] [--root <path>] [--json]\n  ripple impact <symbol>... [--budget N] [--root <path>] [--json] [--verify lsp]\n  ripple review [<base>] [--budget N] [--root <path>] [--json] [--verify lsp]\n    --verify lsp [--verify-budget 2s] [--floor-contradicted|--drop-contradicted]  (upgrade call edges from a language server)\n  ripple risk <symbol|file> [--root <path>] [--json]\n  ripple mcp [--root <path>]   (MCP server over stdio for AI agents)\n  ripple lsp doctor [--root <path>] [--json]   (are language servers usable here?)";
 
 fn db_path(root: &Path) -> PathBuf {
     root.join(".ripple").join("graph.redb")
@@ -52,6 +55,8 @@ const VALUE_FLAGS: &[&str] = &[
     "--commits",
     "--oracle",
     "--sample",
+    "--verify",
+    "--verify-budget",
 ];
 
 /// Positional args, correctly skipping `--flag value` pairs (so `--root X` never
@@ -364,7 +369,8 @@ fn cmd_impact(args: &[String]) -> Result<()> {
         bail!("{USAGE}");
     }
 
-    let graph = RedbStore::open(db_path(&root)).load()?;
+    let mut store = RedbStore::open(db_path(&root));
+    let mut graph = store.load()?;
     let seeds: Vec<_> = symbols
         .iter()
         .flat_map(|s| graph.find_by_name(s))
@@ -373,6 +379,7 @@ fn cmd_impact(args: &[String]) -> Result<()> {
     if seeds.is_empty() {
         bail!("no symbols matched: {}", symbols.join(", "));
     }
+    graph = verify_upgrade(&mut store, graph, &root, args, &seeds, json)?;
 
     let hits = query::impact(&graph, &seeds, budget);
     if json {
@@ -401,6 +408,74 @@ fn cmd_impact(args: &[String]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `--verify lsp`: before answering, ask the language servers about the query's
+/// neighborhood, persist whatever they confirm/add/contradict, and answer from the
+/// upgraded graph. Without the flag this returns the graph untouched.
+///
+/// Persisting rather than applying in-memory is what keeps determinism: LSP answers
+/// move with server version and index state, so they become stored data with a
+/// `source`, not something a later query re-derives. See docs/11.
+fn verify_upgrade(
+    store: &mut RedbStore,
+    graph: InMemoryGraph,
+    root: &Path,
+    args: &[String],
+    seeds: &[ir::SymbolId],
+    json: bool,
+) -> Result<InMemoryGraph> {
+    if flag_value(args, "--verify") != Some("lsp") {
+        return Ok(graph);
+    }
+    let budget = parse_duration(flag_value(args, "--verify-budget"))
+        .unwrap_or_else(|| std::time::Duration::from_secs(2));
+    let mut roots = store.read_roots()?;
+    if roots.is_empty() {
+        roots.push((String::new(), root.canonicalize().unwrap_or(root.into())));
+    }
+    let plan = verify::Plan {
+        focus: verify::focus_files(&graph, seeds),
+        roots: &roots,
+        budget,
+        on_denial: if args.iter().any(|a| a == "--drop-contradicted") {
+            verify::OnDenial::Drop
+        } else if args.iter().any(|a| a == "--floor-contradicted") {
+            verify::OnDenial::Floor
+        } else {
+            verify::OnDenial::Report
+        },
+    };
+    let outcome = verify::run(&graph, &plan);
+    // json output is a bare array clients parse; the report goes to stderr so it
+    // stays visible without breaking them
+    if json {
+        eprintln!("{}", outcome.summary());
+    } else {
+        println!("{}", outcome.summary());
+    }
+    if !outcome.changed() {
+        return Ok(graph);
+    }
+    let nodes: Vec<ir::Node> = graph.nodes().cloned().collect();
+    store
+        .write(&nodes, &outcome.edges)
+        .context("persisting verified edges")?;
+    Ok(InMemoryGraph::from_parts(nodes, outcome.edges))
+}
+
+/// `2s`, `500ms`, or a bare number of milliseconds.
+fn parse_duration(v: Option<&str>) -> Option<std::time::Duration> {
+    let v = v?.trim();
+    let (num, mult) = if let Some(n) = v.strip_suffix("ms") {
+        (n, 1)
+    } else if let Some(n) = v.strip_suffix('s') {
+        (n, 1000)
+    } else {
+        (v, 1)
+    };
+    let ms: u64 = num.trim().parse().ok()?;
+    Some(std::time::Duration::from_millis(ms * mult))
 }
 
 /// Historical validation: over recent commits, how many same-commit file pairs
@@ -471,25 +546,6 @@ fn cmd_eval_oracle(args: &[String]) -> Result<()> {
         println!("no usable server for any indexed language — `ripple lsp doctor` explains why");
     }
     Ok(())
-}
-
-/// Reduce a server's symbol name to the bare function name ripple stores.
-///
-/// Servers spell the same function several ways: `changeset/2` carries the arity
-/// ripple doesn't distinguish, and a call-hierarchy caller comes back fully
-/// qualified as `FiveNoobs.Players.PlayerReport.changeset`. Comparing raw names
-/// reported every edge as a disagreement when both sides had found exactly the same
-/// call.
-fn bare_name(name: &str) -> &str {
-    let no_arity = name.split('/').next().unwrap_or(name).trim();
-    no_arity.rsplit('.').next().unwrap_or(no_arity)
-}
-
-/// A `documentSymbol` entry that isn't a callable function. dexter reports Ecto
-/// `schema "players" do` blocks as function-kind symbols named `schema players`,
-/// and asking for their callers is meaningless.
-fn is_callable_name(name: &str) -> bool {
-    !name.is_empty() && !name.contains(char::is_whitespace)
 }
 
 /// Evenly spread `n` files of one language across the root, so the sample isn't
@@ -1095,7 +1151,14 @@ fn cmd_review(args: &[String]) -> Result<()> {
         println!("no changes to review (vs {})", base.map_or("HEAD", |s| s));
         return Ok(());
     }
-    let graph = RedbStore::open(db_path(&root)).load()?;
+    let mut store = RedbStore::open(db_path(&root));
+    let mut graph = store.load()?;
+    let seeds: Vec<ir::SymbolId> = changed
+        .keys()
+        .flat_map(|f| graph.nodes_in_file(f))
+        .map(|n| n.id)
+        .collect();
+    graph = verify_upgrade(&mut store, graph, &root, args, &seeds, json)?;
     let r = query::review_focus(&graph, &changed, budget);
 
     if json {
@@ -1249,6 +1312,22 @@ mod tests {
     use super::*;
     fn v(a: &[&str]) -> Vec<String> {
         a.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn verify_budget_accepts_s_ms_and_bare_millis() {
+        use std::time::Duration;
+        assert_eq!(parse_duration(Some("2s")), Some(Duration::from_secs(2)));
+        assert_eq!(
+            parse_duration(Some("500ms")),
+            Some(Duration::from_millis(500))
+        );
+        assert_eq!(
+            parse_duration(Some("750")),
+            Some(Duration::from_millis(750))
+        );
+        assert_eq!(parse_duration(Some("soon")), None);
+        assert_eq!(parse_duration(None), None);
     }
 
     #[test]

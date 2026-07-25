@@ -28,6 +28,9 @@ eval (5noobs-web, held out — co-change mined only from commits older than the 
     (15 trained pairs), so co-change is starved, not wrong
 eval --oracle lsp vs dexter 0.7.1, 40 files:
   145/165 (87.9%) identical caller sets, 1 possible false positive, 19 possible misses
+impact changeset --verify lsp (132 files, ~8s, dexter 0.7.1):
+  1516 confirmed | 145 added @0.7 | 28 contradicted (reported, not applied) | 331 unresolved
+  second run adds 1 → the pass is effectively idempotent
 ```
 
 **Build the release binary before timing anything** or compile time lands inside the
@@ -66,6 +69,7 @@ Multiple roots become one graph: `index <web> <api>`. The database lives under t
 neighbors <symbol> [--in|--out] [--depth N] [--root P] [--json]
 impact <symbol>... [--budget N] [--root P] [--json]     # ranked blast radius
 review [<base-rev>] [--budget N] [--root P] [--json]    # hunks to look at first
+  ...both accept --verify lsp [--verify-budget 2s]      # upgrade calls from a language server
 risk <symbol|file> [--root P] [--json]
 eval [--commits N] [--root P]        # static vs co-change recall on N held-out commits
 ```
@@ -74,6 +78,12 @@ eval [--commits N] [--root P]        # static vs co-change recall on N held-out 
 - `impact` seeds by name and ranks by confidence-weighted diffusion; `neighbors` is
   a raw traversal. Use `impact` to decide, `neighbors` to understand.
 - `risk` fuses churn / bug-density / ownership from git with structural fan-out.
+- `--verify lsp` asks the language server about the seed files plus one hop, then
+  **persists** what it learns (confirmed → 1.0, server-only → 0.7, both
+  `LspVerified`). It never blocks the answer: past `--verify-budget` it prints the
+  files it skipped. Contradictions are reported only — a server denial is not
+  evidence of absence, measured. `--floor-contradicted` / `--drop-contradicted`
+  act on them if you mean it. Needs the server on PATH (see dexter note above).
 
 ## Finding the exact symbol name
 
@@ -102,6 +112,8 @@ candidates — check it before acting on it.
 
 - Self-recursion edges are dropped on purpose (X → X says nothing about blast radius).
 - Elixir multi-clause functions collapse to one symbol; arity is not distinguished.
+  So an LSP answer must be unioned across clauses before it is compared — dexter
+  reports callers per clause, and comparing clause-by-clause invents contradictions.
 - Elixir `@spec`/`@type` bodies are ignored (they parse as calls but name types).
 - `dataloader(...)` and inline `fn` resolvers produce no edge — under-link over invent.
 - `deps/`, `_build/`, `vendor/`, `target/`, `.venv/` are never indexed.

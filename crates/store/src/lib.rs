@@ -218,6 +218,11 @@ impl InMemoryGraph {
         self.nodes.get(&id)
     }
 
+    /// Every edge, once. Order is unspecified — sort if you need determinism.
+    pub fn edges(&self) -> impl Iterator<Item = &Edge> {
+        self.out.values().flatten()
+    }
+
     /// Edges pointing *into* `id` (dependents — used for impact/blast-radius).
     pub fn in_edges(&self, id: SymbolId) -> &[Edge] {
         self.inc.get(&id).map_or(&[], Vec::as_slice)

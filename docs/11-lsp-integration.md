@@ -79,13 +79,33 @@ Rides on the existing `confidence` field, so `store` and `query` stay unaware:
 
 | case | action |
 |---|---|
-| our edge, confirmed by server | confidence → 1.0 |
-| server has an edge we lack | add at 1.0 — the real win |
-| we have it, server denies it, file **is** indexed | drop, or floor confidence |
+| our edge, confirmed by server | confidence → 1.0, `source = LspVerified` |
+| server has an edge we lack | add at **0.7**, `source = LspVerified` |
+| we have it, server denies it, and the server covers that file | **report only** by default; `--floor-contradicted` → 0.4, `--drop-contradicted` → delete |
 | server absent, timed out, or file unindexed | keep ours untouched |
 
-That last row is why this is safe to add: with no server, behaviour is exactly
+The last row is why this is safe to add: with no server, behaviour is exactly
 today's.
+
+Rows 2 and 3 are weaker than this doc originally specified, because the first real
+run measured why (2026-07-25, dexter 0.7.1 on 5noobs — see
+[`12-dogfood-log.md`](12-dogfood-log.md)):
+
+- **Additions are single-source, so they don't get 1.0.** dexter attributes a call
+  made inside an ExUnit `test` block to the preceding `defp`, so 5 of the first 5
+  sampled additions claimed a test helper called what the test bodies called.
+  An agreement between two independent extractions is real evidence; one
+  unconfirmed extractor is not, and invariant 5 forbids stating a guess as fact.
+- **A denial is not evidence of absence.** All 5 sampled contradictions were the
+  server's misses: for a multi-clause Elixir function dexter reports callers for
+  some clauses and not others, so `players.ex:player_in_discord?/1` really does
+  call `get_player` while dexter's caller list omits it. Acting on that by default
+  would delete true edges, so it is reported and left to the operator.
+
+A related trap on our side: ripple collapses a multi-clause function into one
+symbol, so the server's per-clause answers must be **unioned per name** before any
+verdict. Reconciling clause-by-clause manufactured 42 contradictions that vanished
+once the union landed.
 
 ## Determinism and provenance
 
@@ -144,8 +164,18 @@ Built-in defaults cover `elixir` (dexter), `typescript`, `go`, `python`, and
    found two real bugs — a renamed `alias ... as:` that made calls through it
    unresolvable (fixed), and Elixir `import` being unhandled (open). See
    [`12-dogfood-log.md`](12-dogfood-log.md).
-3. **On-demand verification.** `impact` / `review_focus --verify lsp` over the
-   seed set plus one hop, with the budget and cache above.
+3. **On-demand verification.** ✅ **done.** `impact` / `review --verify lsp
+   [--verify-budget 2s]` verifies the seed files plus one hop, reconciles per the
+   table above, and persists the result — `ir::Edge` now carries `source`
+   (`Extracted` | `LspVerified` | `CoChange`), so a later query reads a stored
+   answer instead of re-deriving one from a server whose reply moves with its
+   version. First run on 5noobs (132 files, ~8s, dexter 0.7.1): **1516 confirmed,
+   145 added, 28 contradicted, 331 symbols the server couldn't resolve**. A second
+   run adds 1, so the pass is effectively idempotent. Under-budget runs name the
+   files they skipped (`--verify-budget 1s` → 17 checked, 120 reported unverified),
+   and a root with no usable server says so and answers unchanged.
+   Still to add: the content-hash cache, so a stable file is verified once per
+   version rather than once per query.
 4. **Breadth proof.** Add Go or Python with `tags.scm` only and all call edges
    from the server; measure the cost of "adding a language".
 

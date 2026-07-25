@@ -8,6 +8,45 @@ the roadmap beforehand. Using the tool finds different bugs than reading it.
 
 ---
 
+## 2026-07-25 — the oracle's answers are wrong in both directions
+
+**Asked:** `impact changeset --root <web> --verify lsp` — the first run of on-demand
+LSP verification (docs/11 phase 3) against dexter 0.7.1 on 5noobs.
+
+**Said:** `132 files checked, 1815 confirmed, 172 added, 42 contradicted`. Following
+docs/11 as written, the 42 would have had their confidence floored and the 172 added
+at 1.0.
+
+**Was true:** three separate problems, all found by reading five examples instead of
+trusting the counts.
+
+1. **Ours.** Ripple collapses a multi-clause Elixir function into one symbol; dexter
+   returns one `documentSymbol` per clause. Reconciling clause-by-clause made the
+   callers of one clause look like a denial of the others. Unioning the server's
+   answers per name first: 42 → 28 contradictions, 172 → 145 additions.
+2. **The server's, on denial.** All 5 remaining contradictions were dexter misses.
+   `players.ex:player_in_discord?/1` does call `get_player` (line 1346, second
+   clause) — dexter's caller list omits it while including callers from other files.
+   Flooring on that would have degraded true edges.
+3. **The server's, on addition.** All 5 sampled additions claimed
+   `direct_messages_test.exs:create_player` called functions the *test bodies* call.
+   Probing dexter directly confirmed it attributes a call inside an ExUnit `test`
+   block to the preceding `defp`.
+
+**Implication (fixed).** Answers are unioned per name before any verdict.
+Contradictions are counted and printed with examples but **change nothing** unless
+`--floor-contradicted`/`--drop-contradicted` is passed. Server-only edges land at
+**0.7**, not 1.0 — one unconfirmed extractor is weaker evidence than two agreeing
+ones, and invariant 5 forbids stating a guess as fact. The report also prints the
+example pairs for both, so the next person can check rather than believe.
+
+**Lesson:** "the language server is the accuracy tier" was an assumption, not a
+measurement. It is more accurate *on average* and wrong in specific, systematic ways
+— which is exactly why provenance (`EdgeSource`) had to be a stored field rather
+than a footnote.
+
+---
+
 ## 2026-07-25 — the headline number was 34 points of leakage
 
 **Asked:** `ripple eval --commits 300 --root <web>` — the project's headline recall
