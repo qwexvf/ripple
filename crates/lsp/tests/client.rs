@@ -238,3 +238,22 @@ fn probe_all_with_no_budget_left_reports_instead_of_spawning() {
         other => panic!("expected a budget failure, got {other:?}"),
     }
 }
+
+/// A server may send *requests* of its own, and block until they are answered.
+/// tsgo does exactly this (`client/registerCapability` right after the handshake),
+/// and ignoring it is indistinguishable from a server that never replies.
+#[test]
+fn a_server_request_is_answered_so_the_session_continues() {
+    let spec = spec("needs-ack");
+    let mut client = Client::start(&spec, &root()).expect("stub starts");
+    client.initialize(&root(), &spec).expect("handshake");
+
+    let symbols = client
+        .functions(Path::new("/proj/lib/target.ex"))
+        .expect("the server serves again once its request is answered");
+    assert!(
+        !symbols.is_empty(),
+        "the stub stalls until the client answers its request"
+    );
+    client.stop();
+}

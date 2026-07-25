@@ -394,8 +394,14 @@ fn uri_to_path(uri: &str) -> Option<PathBuf> {
 /// Function-like symbols out of either `documentSymbol` shape: the hierarchical
 /// `DocumentSymbol` tree or the flat `SymbolInformation` list.
 fn collect_symbols(node: &Value, out: &mut Vec<Symbol>) {
-    // SymbolKind: 6 = Method, 12 = Function
-    const FUNCTION_KINDS: [u64; 2] = [6, 12];
+    // SymbolKind: 6 = Method, 12 = Function, 13 = Variable, 14 = Constant.
+    //
+    // Variables and constants are in because a callable is routinely declared as
+    // one — `const useAuthGuard = () => …`, `let handler = function …` — and a
+    // server reports it with that kind. Nothing is trusted on this basis alone: the
+    // caller still has to find a symbol of that name in that file, so an import
+    // binding or a plain value simply matches nothing.
+    const FUNCTION_KINDS: [u64; 4] = [6, 12, 13, 14];
     match node {
         Value::Array(items) => {
             for i in items {
@@ -653,6 +659,14 @@ impl Client {
                 Err(RecvTimeoutError::Timeout) => bail!("{method} timed out after {:?}", timeout),
                 Err(RecvTimeoutError::Disconnected) => bail!("server exited during {method}"),
             };
+            // a server → client *request* blocks the server until it is answered:
+            // tsgo sends client/registerCapability right after `initialized` and
+            // stops serving anything else until it gets a reply, so ignoring these
+            // looks exactly like a server that never answers.
+            if msg.get("method").is_some() && msg.get("id").is_some() {
+                self.answer(&msg)?;
+                continue;
+            }
             if msg.get("id").and_then(Value::as_i64) != Some(id) {
                 continue; // a notification, or an answer we're not waiting for
             }
@@ -661,6 +675,29 @@ impl Client {
             }
             return Ok(msg.get("result").cloned().unwrap_or(Value::Null));
         }
+    }
+
+    /// Reply to a request the *server* made. We implement none of them, so the
+    /// answer is the protocol's "nothing to say": `null`, except
+    /// `workspace/configuration`, which must return one entry per item asked for.
+    /// The point is only to unblock the server, so an unknown method is answered
+    /// rather than refused — a refusal makes some servers retry forever.
+    fn answer(&mut self, req: &Value) -> Result<()> {
+        let method = req
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let result = if method == "workspace/configuration" {
+            let n = req
+                .pointer("/params/items")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            Value::Array(vec![Value::Null; n])
+        } else {
+            Value::Null
+        };
+        let id = req.get("id").cloned().unwrap_or(Value::Null);
+        self.send(json!({"jsonrpc": "2.0", "id": id, "result": result}))
     }
 
     pub fn notify(&mut self, method: &str, params: Value) -> Result<()> {

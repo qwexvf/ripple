@@ -9,6 +9,8 @@
 //!   `hang`              accepts requests, never answers
 //!   `garbage`           writes non-LSP bytes instead of a frame
 //!   `exit-after-init`   answers `initialize`, then closes stdout
+//!   `needs-ack`         asks the client a question and stalls until it answers
+//!                       (what tsgo does with `client/registerCapability`)
 
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
@@ -18,7 +20,32 @@ fn main() {
     let mut input = BufReader::new(std::io::stdin());
     let mut out = std::io::stdout();
 
-    while let Some(msg) = read_message(&mut input) {
+    // `needs-ack`: after the handshake, ask the client something and refuse to serve
+    // anything else until it replies — what tsgo does, and what made it look like a
+    // server that never answers.
+    let mut awaiting_ack = false;
+    // requests that arrive while the ack is outstanding are held, not dropped — a
+    // real server queues them, and the client is allowed to pipeline
+    let mut held: std::collections::VecDeque<Value> = std::collections::VecDeque::new();
+    loop {
+        // held messages are only taken once the ack is in — popping them first and
+        // putting them back would drop one per iteration
+        let msg = if awaiting_ack || held.is_empty() {
+            match read_message(&mut input) {
+                Some(m) => m,
+                None => break,
+            }
+        } else {
+            held.pop_front().expect("checked non-empty")
+        };
+        if awaiting_ack {
+            if msg.get("id").and_then(Value::as_i64) == Some(9001) {
+                awaiting_ack = false; // the client answered; serve what was held
+            } else {
+                held.push_back(msg);
+            }
+            continue;
+        }
         let Some(method) = msg.get("method").and_then(Value::as_str) else {
             continue;
         };
@@ -52,6 +79,17 @@ fn main() {
         );
         if mode == "exit-after-init" && method == "initialize" {
             return; // drop stdout mid-session
+        }
+        if mode == "needs-ack" && method == "initialize" {
+            write_message(
+                &mut out,
+                &json!({
+                    "jsonrpc": "2.0", "id": 9001,
+                    "method": "client/registerCapability",
+                    "params": {"registrations": []}
+                }),
+            );
+            awaiting_ack = true;
         }
     }
 }
