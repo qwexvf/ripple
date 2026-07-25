@@ -68,6 +68,9 @@ pub struct ElixirFacts {
     /// know which fields are root fields. Resolved at link time because the
     /// included object usually lives in another file.
     pub scope_includes: Vec<(String, String)>,
+    /// `import Mod` — module FQNs whose functions this file may call *unqualified*.
+    /// Elixir's `import` is why a bare call can cross a module boundary at all.
+    pub imports: Vec<String>,
     /// remote calls (target module **FQN**, func, line)
     pub remote_calls: Vec<(String, String, u32)>,
     /// DB entity references (entity module **FQN**, line)

@@ -149,7 +149,7 @@ fn index_project(roots: &[PathBuf]) -> Result<String> {
 
     // cross-service: TS→resolver (GraphqlCall), resolver→context (Calls), fn→schema (DbQuery)
     let mut cross = resolve::link_cross_service(&indexed.files, &nodes);
-    let (graphql, db) = (cross.graphql, cross.db);
+    let (graphql, db, imported) = (cross.graphql, cross.db, cross.imported);
     edges.append(&mut cross.edges);
 
     // structural risk needs every edge, including the cross-service ones
@@ -161,10 +161,10 @@ fn index_project(roots: &[PathBuf]) -> Result<String> {
 
     let s = indexed.stats;
     Ok(format!(
-        "indexed {} files across {} root(s) ({} added, {} changed, {} unchanged, {} removed) → {} nodes, {} edges ({} co-change, {} graphql, {} db, {} with dependents) ({})",
+        "indexed {} files across {} root(s) ({} added, {} changed, {} unchanged, {} removed) → {} nodes, {} edges ({} co-change, {} graphql, {} db, {} imported, {} with dependents) ({})",
         indexed.result.files_indexed, indexed.roots.len(),
         s.added, s.changed, s.unchanged, s.removed,
-        nodes.len(), edges.len(), cochange_applied, graphql, db, with_dependents,
+        nodes.len(), edges.len(), cochange_applied, graphql, db, imported, with_dependents,
         db_path(&roots[0]).display()
     ))
 }

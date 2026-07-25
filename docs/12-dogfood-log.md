@@ -8,6 +8,43 @@ the roadmap beforehand. Using the tool finds different bugs than reading it.
 
 ---
 
+## 2026-07-25 — elixir `import`, and a negative result on attribution
+
+**Asked:** the oracle said 20 of ripple's misses looked import-shaped. Fix `import`
+and see if the number moves.
+
+**Result: 87.3% → 87.9%** (145/165), +31 edges on 5noobs. `import Mod` is now a fact,
+and a bare call that no local definition explains resolves against the imported
+modules' functions (candidates split confidence; a local definition always wins).
+Real but small — `import` was not the dominant class after all.
+
+**Then a negative result worth keeping.** Digging into a remaining miss showed
+`TeamContact.changeset(...)` sitting inside an ExUnit `test` block — a macro, not a
+`def` — so `enclosing()` found no function and the cross-service loops *dropped the
+edge*, while same-file resolution falls back to the module node for the same
+situation. Attributing those to the file instead looked obviously right:
+
+| | before | after attribution change |
+|---|---|---|
+| edges | 14,153 | 15,787 (+1,634) |
+| identical caller sets | 87.9% | **81.2%** |
+| ripple-only edges | 1 | **64** |
+| server-only edges | 19 | 19 (**unchanged**) |
+
+So it added 1,634 true-but-coarser edges, cost 6.7 points of measured agreement, and
+fixed **none** of the misses it was meant to fix — my prediction was simply wrong.
+Reverted. The edges are not false: that file really does call that function. They are
+file-granular where dexter is function-granular, and the oracle cannot express that
+difference, so it scores them as errors.
+
+**Implication (open).** Two separable things: calls outside any function are dropped
+by cross-service linking (a real coverage gap, measured at ~1.6k edges on this repo),
+and the oracle can only compare at one granularity. Fixing the first honestly needs
+the second, or it trades a measurable number for an unmeasurable one.
+
+**Lesson:** having the metric before the change is what turned "obviously right" into
+"measurably not yet". Without the oracle this would have shipped as an improvement.
+
 ## 2026-07-25 — the oracle's first number: 87.3%, and two real bugs behind it
 
 **Asked:** `eval --oracle lsp --sample 40` against dexter on the Elixir backend —

@@ -56,6 +56,12 @@ pub fn cross_facts(scan: &Scan) -> CrossFacts {
     };
     schema_facts(scan, &ABSINTHE, &mut f);
     data_facts(scan, &ECTO, &mut f);
+    f.imports = scan
+        .calls
+        .iter()
+        .filter(|c| c.name == "import")
+        .flat_map(|c| c.modules.iter().cloned())
+        .collect();
     f.remote_calls = scan
         .remote_calls
         .iter()

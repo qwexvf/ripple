@@ -12,12 +12,15 @@ use std::collections::{HashMap, HashSet};
 const CONF_GRAPHQL: f32 = 0.9; // TS operation ↔ Absinthe resolver, name-matched
 const CONF_ELIXIR_CALL: f32 = 0.9; // resolved remote call (alias → module → fn)
 const CONF_DB_QUERY: f32 = 0.85; // function → Ecto schema reference
+const CONF_IMPORTED_CALL: f32 = 0.9; // bare call resolved through an explicit `import`
 
 pub struct CrossEdges {
     pub edges: Vec<Edge>,
     pub graphql: usize,
     pub elixir_calls: usize,
     pub db: usize,
+    /// bare calls resolved through an `import`
+    pub imported: usize,
 }
 
 /// Link cross-service edges from the per-file facts already on each `CachedFile`.
@@ -175,6 +178,67 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
         }
     }
 
+    // Bare calls that cross a module boundary through an explicit `import`.
+    //
+    // Unqualified call resolution is same-file by nature — a bare name normally
+    // can't reach another module. Elixir's `import Mod` breaks that, and test,
+    // fixture and Phoenix code lean on it, so without this the callers of those
+    // functions are simply absent (measured with `eval --oracle lsp`).
+    let mut names_in_file: HashMap<&str, HashSet<&str>> = HashMap::new();
+    for n in nodes {
+        if matches!(n.kind, NodeKind::Function | NodeKind::Method) {
+            names_in_file
+                .entry(n.module_path.as_str())
+                .or_default()
+                .insert(n.name.as_str());
+        }
+    }
+    let mut imported = 0;
+    for f in files {
+        let Some(ex) = &f.extract.cross.elixir else {
+            continue;
+        };
+        if ex.imports.is_empty() {
+            continue;
+        }
+        let empty_names = HashSet::new();
+        let local_names = names_in_file
+            .get(f.module_path.as_str())
+            .unwrap_or(&empty_names);
+        let empty = Vec::new();
+        let spans = fn_spans.get(f.module_path.as_str()).unwrap_or(&empty);
+
+        for r in &f.extract.refs {
+            if r.kind != parse::RefKind::Call || local_names.contains(r.name.as_str()) {
+                continue; // a local definition wins; that edge already exists
+            }
+            let mut targets: Vec<SymbolId> = ex
+                .imports
+                .iter()
+                .filter_map(|fqn| fqn_to_module.get(fqn.as_str()))
+                .filter_map(|file| fn_by_loc.get(&(*file, r.name.as_str())).copied())
+                .collect();
+            targets.sort_unstable();
+            targets.dedup();
+            let Some(caller) = enclosing(spans, r.site.start_line) else {
+                continue;
+            };
+            let conf = CONF_IMPORTED_CALL / targets.len().max(1) as f32;
+            for t in targets {
+                if emit(
+                    &mut edges,
+                    caller,
+                    t,
+                    EdgeKind::Calls,
+                    conf,
+                    r.site.start_line,
+                ) {
+                    imported += 1;
+                }
+            }
+        }
+    }
+
     // Calls (resolver → context) + DbQuery (function → schema)
     let mut elixir_calls = 0;
     let mut db = 0;
@@ -231,6 +295,7 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
         graphql,
         elixir_calls,
         db,
+        imported,
     }
 }
 

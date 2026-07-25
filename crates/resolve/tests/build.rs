@@ -323,6 +323,41 @@ fn skips_dependency_and_build_directories() {
     );
 }
 
+/// Elixir `import Mod` lets a bare call cross a module boundary — the class of
+/// edge `eval --oracle lsp` showed ripple was missing entirely.
+#[test]
+fn resolves_bare_calls_through_an_elixir_import() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/elixir_import");
+    let indexed = resolve::build_incremental(
+        std::slice::from_ref(&root),
+        &std::collections::HashMap::new(),
+    )
+    .unwrap();
+    let cross = resolve::link_cross_service(&indexed.files, &indexed.result.nodes);
+
+    let run = SymbolId::of("importer.ex", "run");
+    let prefers_local = SymbolId::of("importer.ex", "prefers_local");
+    let helper_fun = SymbolId::of("helpers.ex", "helper_fun");
+    let imported_shadowed = SymbolId::of("helpers.ex", "shadowed");
+
+    let calls: Vec<(SymbolId, SymbolId)> = cross
+        .edges
+        .iter()
+        .filter(|e| e.kind == EdgeKind::Calls)
+        .map(|e| (e.src, e.dst))
+        .collect();
+
+    assert!(
+        calls.contains(&(run, helper_fun)),
+        "bare helper_fun() should reach the imported module: {calls:?}"
+    );
+    assert!(
+        !calls.contains(&(prefers_local, imported_shadowed)),
+        "a local definition of the same name must win over the import"
+    );
+    assert_eq!(cross.imported, 1, "exactly one call resolved via import");
+}
+
 #[test]
 fn deterministic_build() {
     let a = resolve::build(&fixture()).unwrap();
