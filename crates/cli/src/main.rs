@@ -1341,10 +1341,11 @@ fn mcp_call(
         "explain_edge" => {
             let from = str_arg("from").ok_or("from required")?;
             let to = str_arg("to").ok_or("to required")?;
+            let widen = |q: &str| graph.lookup(q).map(|(n, _)| n).unwrap_or_default();
             let to_ids: std::collections::HashSet<_> =
-                graph.find_by_name(&to).into_iter().map(|n| n.id).collect();
+                widen(&to).into_iter().map(|n| n.id).collect();
             let mut out = Vec::new();
-            for f in graph.find_by_name(&from) {
+            for f in widen(&from) {
                 for e in graph.out_edges(f.id).iter().chain(graph.in_edges(f.id)) {
                     let other = if e.src == f.id { e.dst } else { e.src };
                     if to_ids.contains(&other) {
