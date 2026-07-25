@@ -1,13 +1,41 @@
 //! TypeScript / TSX adapter (v0, Tier 0).
+//!
+//! Two flavours, because tree-sitter ships two grammars: JSX nodes exist only in
+//! the TSX one. Parsing `.tsx` with the plain TypeScript grammar left every JSX
+//! body as an error node, so anything a component rendered was invisible — the
+//! rendered component itself, and any call inside a JSX expression.
 
 use crate::{resolve_import, LanguageAdapter, Workspace};
 use std::path::{Path, PathBuf};
 
-pub struct Adapter;
+/// Every extension an import from TypeScript may land on, regardless of which
+/// flavour is doing the importing.
+const TS_FAMILY: &[&str] = &["*.ts", "*.tsx", "*.mts", "*.cts"];
+
+/// Which grammar (and therefore which file set) this instance serves.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Flavour {
+    Ts,
+    Tsx,
+}
+
+pub struct Adapter {
+    flavour: Flavour,
+}
 
 impl Adapter {
+    /// Plain TypeScript (`.ts`, `.mts`, `.cts`).
     pub fn new() -> Self {
-        Adapter
+        Adapter {
+            flavour: Flavour::Ts,
+        }
+    }
+
+    /// TSX (`.tsx`) — the grammar that knows JSX.
+    pub fn tsx() -> Self {
+        Adapter {
+            flavour: Flavour::Tsx,
+        }
     }
 }
 
@@ -18,16 +46,28 @@ impl Default for Adapter {
 }
 
 impl LanguageAdapter for Adapter {
+    /// Distinct ids: queries are compiled once per id, and the two flavours compile
+    /// against different grammars. Both are TypeScript to a language server, which
+    /// is why `lsp::defaults` lists the same command for each.
     fn id(&self) -> &'static str {
-        "typescript"
+        match self.flavour {
+            Flavour::Ts => "typescript",
+            Flavour::Tsx => "tsx",
+        }
     }
 
     fn grammar(&self) -> tree_sitter::Language {
-        tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()
+        match self.flavour {
+            Flavour::Ts => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            Flavour::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
+        }
     }
 
     fn file_globs(&self) -> &'static [&'static str] {
-        &["*.ts", "*.tsx", "*.mts", "*.cts"]
+        match self.flavour {
+            Flavour::Ts => &["*.ts", "*.mts", "*.cts"],
+            Flavour::Tsx => &["*.tsx"],
+        }
     }
 
     fn tags_query(&self) -> &'static str {
@@ -39,7 +79,14 @@ impl LanguageAdapter for Adapter {
     }
 
     fn refs_query(&self) -> Option<&'static str> {
-        Some(include_str!("queries/refs.scm"))
+        Some(match self.flavour {
+            Flavour::Ts => include_str!("queries/refs.scm"),
+            // JSX patterns are only valid against the TSX grammar
+            Flavour::Tsx => concat!(
+                include_str!("queries/refs.scm"),
+                include_str!("queries/refs-jsx.scm")
+            ),
+        })
     }
 
     fn bindings_query(&self) -> Option<&'static str> {
@@ -47,7 +94,10 @@ impl LanguageAdapter for Adapter {
     }
 
     fn resolve_import(&self, spec: &str, from_file: &Path, ws: &Workspace) -> Option<PathBuf> {
-        let globs = self.file_globs();
+        // Probe the whole family, not this flavour's globs: a `.tsx` module importing
+        // a `.ts` one is the common case, and probing only `*.tsx` silently resolved
+        // nothing — every aliased import in a TSX file disappeared.
+        let globs = TS_FAMILY;
         resolve_import::relative(spec, from_file, globs)
             .or_else(|| resolve_import::tsconfig_paths(spec, ws, globs))
             .or_else(|| resolve_import::workspace_package(spec, ws, globs))

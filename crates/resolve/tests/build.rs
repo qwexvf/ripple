@@ -517,3 +517,31 @@ fn a_call_in_a_variable_initialiser_belongs_to_the_function() {
         "a value binding is not something that calls"
     );
 }
+
+/// Rendering a component is a call, and an import from a `.tsx` file lands on `.ts`
+/// files too. Both had to hold before a React component had any callers (issue #26).
+#[test]
+fn a_rendered_component_is_a_caller() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/jsx");
+    let r = resolve::build(&root).unwrap();
+
+    let search = SymbolId::of("search.tsx", "SearchInput");
+    let panel = SymbolId::of("panel.tsx", "Panel");
+    let classes = SymbolId::of("util.ts", "classes");
+
+    let calls: Vec<(SymbolId, SymbolId)> = r
+        .edges
+        .iter()
+        .filter(|e| e.kind == EdgeKind::Calls)
+        .map(|e| (e.src, e.dst))
+        .collect();
+
+    assert!(
+        calls.contains(&(search, panel)),
+        "<Panel /> renders it, which is a call"
+    );
+    assert!(
+        calls.contains(&(search, classes)),
+        "a .tsx file importing a .ts file must resolve"
+    );
+}

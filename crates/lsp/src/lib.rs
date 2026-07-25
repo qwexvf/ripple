@@ -86,6 +86,15 @@ pub fn defaults() -> Vec<ServerSpec> {
             &["tsconfig.json", "package.json"],
             true,
         ),
+        // ripple splits TS and TSX because tree-sitter has two grammars; a language
+        // server does not, so both point at the same command
+        spec(
+            "tsx",
+            "typescript-language-server",
+            &["--stdio"],
+            &["tsconfig.json", "package.json"],
+            true,
+        ),
         spec("go", "gopls", &[], &["go.mod"], true),
         spec(
             "python",

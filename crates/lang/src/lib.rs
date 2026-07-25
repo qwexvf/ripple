@@ -88,6 +88,7 @@ pub fn graphql_language() -> tree_sitter::Language {
 pub fn registry() -> Vec<Box<dyn LanguageAdapter>> {
     vec![
         Box::new(typescript::Adapter::new()),
+        Box::new(typescript::Adapter::tsx()),
         Box::new(elixir::Adapter::new()),
         Box::new(graphql::Adapter::new()),
         Box::new(rust::Adapter::new()),
