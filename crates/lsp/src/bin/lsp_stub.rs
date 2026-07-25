@@ -122,7 +122,13 @@ fn incoming_calls() -> Value {
                 "range": {"start": {"line": 10, "character": 0}, "end": {"line": 14, "character": 1}},
                 "selectionRange": {"start": {"line": 10, "character": 4}, "end": {"line": 10, "character": 14}},
             },
-            "fromRanges": [],
+            // two call sites inside the caller, one repeated — callers must see the
+            // call's own position, not just the caller's definition line
+            "fromRanges": [
+                {"start": {"line": 11, "character": 4}, "end": {"line": 11, "character": 20}},
+                {"start": {"line": 11, "character": 4}, "end": {"line": 11, "character": 20}},
+                {"start": {"line": 13, "character": 4}, "end": {"line": 13, "character": 20}},
+            ],
         },
         {
             "from": {

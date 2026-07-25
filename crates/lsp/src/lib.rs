@@ -328,6 +328,15 @@ pub struct CallSite {
     pub name: String,
     /// 1-based line of the caller's own definition.
     pub line: u32,
+    /// 1-based lines of the actual call expressions inside the caller
+    /// (`fromRanges`), sorted and deduplicated.
+    ///
+    /// Separate from `line` because the two disagree, and the disagreement is the
+    /// point: dexter credits a call made inside an ExUnit `test` block to the
+    /// preceding `defp`, so `name`/`line` can name a function that does not contain
+    /// the call. Whoever compares against ripple's spans needs the call's own
+    /// position to attribute it honestly. Empty if the server sends none.
+    pub call_lines: Vec<u32>,
 }
 
 /// A function the server found in a file, with the position to ask about it.
@@ -424,10 +433,23 @@ fn collect_symbols(node: &Value, out: &mut Vec<Symbol>) {
 
 fn caller_of(call: &Value) -> Option<CallSite> {
     let from = call.get("from")?;
+    let mut call_lines: Vec<u32> = call
+        .get("fromRanges")
+        .and_then(Value::as_array)
+        .map(|rs| {
+            rs.iter()
+                .filter_map(|r| r.pointer("/start/line")?.as_u64())
+                .map(|l| l as u32 + 1)
+                .collect()
+        })
+        .unwrap_or_default();
+    call_lines.sort_unstable();
+    call_lines.dedup();
     Some(CallSite {
         path: uri_to_path(from.get("uri")?.as_str()?)?,
         name: from.get("name")?.as_str()?.to_owned(),
         line: from.pointer("/range/start/line")?.as_u64()? as u32 + 1,
+        call_lines,
     })
 }
 

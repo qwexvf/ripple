@@ -95,6 +95,13 @@ fn incoming_calls_map_to_paths_and_skip_malformed_entries() {
         ],
         "uris become paths, lines become 1-based, the entry without a uri is dropped"
     );
+    // the call's own lines, deduplicated — a caller's definition line is not where
+    // the call happens, and attribution by span needs the latter
+    assert_eq!(calls[0].call_lines, vec![12, 14]);
+    assert!(
+        calls[1].call_lines.is_empty(),
+        "a server that sends no fromRanges yields none, not a guess"
+    );
     client.stop();
 }
 
