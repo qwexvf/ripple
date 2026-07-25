@@ -80,7 +80,8 @@ Rides on the existing `confidence` field, so `store` and `query` stay unaware:
 | case | action |
 |---|---|
 | our edge, confirmed by server | confidence → 1.0, `source = LspVerified` |
-| server has an edge we lack | add at **0.7**, `source = LspVerified` |
+| server has an edge we lack, at a position inside one of our symbols | add at **0.7**, `source = LspVerified` |
+| server reports a call at a position inside no symbol we index | count it, add nothing — issue #18 |
 | we have it, server denies it, and the server covers that file | **report only** by default; `--floor-contradicted` → 0.4, `--drop-contradicted` → delete |
 | server absent, timed out, or file unindexed | keep ours untouched |
 
@@ -91,11 +92,16 @@ Rows 2 and 3 are weaker than this doc originally specified, because the first re
 run measured why (2026-07-25, dexter 0.7.1 on 5noobs — see
 [`12-dogfood-log.md`](12-dogfood-log.md)):
 
-- **Additions are single-source, so they don't get 1.0.** dexter attributes a call
-  made inside an ExUnit `test` block to the preceding `defp`, so 5 of the first 5
-  sampled additions claimed a test helper called what the test bodies called.
-  An agreement between two independent extractions is real evidence; one
-  unconfirmed extractor is not, and invariant 5 forbids stating a guess as fact.
+- **A caller is decided by position, not by the name the server gives it.**
+  `incomingCalls` carries `fromRanges` — where the call actually is — and dexter's
+  chosen caller can be a function that does not contain it (a call inside an ExUnit
+  `test` block is credited to the preceding `defp`). Attributing by position
+  removed **every** addition the first run made: 145 → 0, all of them that shape.
+  This needs `ir::Node::extra_spans`, because a symbol written as several clauses
+  shares one id and only its first definition site used to survive.
+- **Additions are single-source, so they don't get 1.0.** An agreement between two
+  independent extractions is real evidence; one unconfirmed extractor is not, and
+  invariant 5 forbids stating a guess as fact.
 - **A denial is not evidence of absence.** All 5 sampled contradictions were the
   server's misses: for a multi-clause Elixir function dexter reports callers for
   some clauses and not others, so `players.ex:player_in_discord?/1` really does
@@ -149,7 +155,7 @@ Built-in defaults cover `elixir` (dexter), `typescript`, `go`, `python`, and
    `gopls`: 128ms handshake, `callHierarchy=true`.
    Still to add here: UTF-16↔byte position conversion, once something actually
    sends positions.
-2. **`ripple eval --oracle lsp --sample N`.** ✅ **done.** Samples files evenly
+2. **`ripple eval --oracle lsp --sample N [--granularity function|file]`.** ✅ **done.** Samples files evenly
    across a root, asks the server for each function's callers via
    `documentSymbol` → `prepareCallHierarchy` → `incomingCalls`, and diffs against
    ripple's `Calls` edges. Callers in files ripple doesn't index are dropped (a
@@ -159,19 +165,30 @@ Built-in defaults cover `elixir` (dexter), `typescript`, `go`, `python`, and
    Comparability is most of the work: servers spell one function three ways
    (`changeset`, `changeset/2`, `FiveNoobs.Players.PlayerReport.changeset`), and
    "the server can't resolve this symbol" must stay distinct from "this symbol has
-   no callers". First result against dexter on 5noobs: **144/165 (87.3%) identical
-   caller sets**, 1 possible false positive, 20 possible misses. It immediately
-   found two real bugs — a renamed `alias ... as:` that made calls through it
-   unresolvable (fixed), and Elixir `import` being unhandled (open). See
-   [`12-dogfood-log.md`](12-dogfood-log.md).
+   no callers". The first result (87.3%) immediately found two real bugs — a renamed
+   `alias ... as:` that made calls through it unresolvable (fixed), and Elixir
+   `import` being unhandled (open).
+
+   Comparing by *position* rather than by name, and stating the granularity, is what
+   made the number mean one thing. On 40 files against dexter 0.7.1:
+
+   | granularity | identical caller sets | ripple-only | server-only |
+   |---|---|---|---|
+   | function | **164/165 (99.4%)** | 1 | 0 |
+   | file | 146/165 (88.5%) | 0 | **19** |
+
+   Plus **153 call sites inside no indexed symbol** (test bodies, seed scripts,
+   module bodies) — reported as their own bucket rather than as disagreements. Those
+   sites are issue #18, and the two rows are its acceptance test: fixing #18 should
+   drive the file-granularity 19 to ~0 without moving the function row.
 3. **On-demand verification.** ✅ **done.** `impact` / `review --verify lsp
    [--verify-budget 2s]` verifies the seed files plus one hop, reconciles per the
    table above, and persists the result — `ir::Edge` now carries `source`
    (`Extracted` | `LspVerified` | `CoChange`), so a later query reads a stored
    answer instead of re-deriving one from a server whose reply moves with its
-   version. First run on 5noobs (132 files, ~8s, dexter 0.7.1): **1516 confirmed,
-   145 added, 28 contradicted, 331 symbols the server couldn't resolve**. A second
-   run adds 1, so the pass is effectively idempotent. Under-budget runs name the
+   version. On 5noobs (132 files, ~8s, dexter 0.7.1): **1516 confirmed, 0 added,
+   28 contradicted, 331 symbols the server couldn't resolve** — the 145 additions
+   the first run made were all position-misattributed and are gone. Under-budget runs name the
    files they skipped (`--verify-budget 1s` → 17 checked, 120 reported unverified),
    and a root with no usable server says so and answers unchanged.
    Still to add: the content-hash cache, so a stable file is verified once per

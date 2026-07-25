@@ -18,19 +18,23 @@ Last measured 2026-07-25 on the 5noobs stack (web + api). A count that moves wit
 an explanation is the cheapest bug signal this project has, so re-measure and diff:
 
 ```
-1153 files → 10099 nodes, 14153 edges
-  (2461 co-change, 343 graphql, 820 db, 31 imported, 4576 with dependents)
-cold index ~1.7s, warm ~0.9s
+1153 files → 8929 nodes, 14153 edges
+  (2461 co-change, 343 graphql, 820 db, 31 imported, 3827 with dependents)
+  ↑ nodes/with-dependents dropped on 2026-07-25 because duplicate definition nodes
+    (one per clause) stopped being counted — the store only ever kept one of each
+cold index ~1.4s, warm ~0.7s
 eval (5noobs-web, held out — co-change mined only from commits older than the test window):
   --commits 50  (500 train, 2078 pairs): static 7.1% | co-change 3.4% | fused 10.5%
   --commits 300 (148 train, 4188 pairs): static 6.5% | co-change 1.3% | fused  7.8%
   ↑ prefer the 50 line: a 300-commit test window leaves only 148 training commits
     (15 trained pairs), so co-change is starved, not wrong
-eval --oracle lsp vs dexter 0.7.1, 40 files:
-  145/165 (87.9%) identical caller sets, 1 possible false positive, 19 possible misses
+eval --oracle lsp vs dexter 0.7.1, 40 files (compare by position, state granularity):
+  --granularity function: 164/165 (99.4%) | 1 ripple-only | 0 server-only
+  --granularity file    : 146/165 (88.5%) | 0 ripple-only | 19 server-only
+  153 call sites inside no indexed symbol (test bodies, seeds, module bodies) = issue #18;
+  the file-granularity 19 is #18's acceptance test — it should go to ~0 when #18 lands
 impact changeset --verify lsp (132 files, ~8s, dexter 0.7.1):
-  1516 confirmed | 145 added @0.7 | 28 contradicted (reported, not applied) | 331 unresolved
-  second run adds 1 → the pass is effectively idempotent
+  1516 confirmed | 0 added | 28 contradicted (reported, not applied) | 331 unresolved
 ```
 
 **Build the release binary before timing anything** or compile time lands inside the
@@ -78,6 +82,10 @@ eval [--commits N] [--root P]        # static vs co-change recall on N held-out 
 - `impact` seeds by name and ranks by confidence-weighted diffusion; `neighbors` is
   a raw traversal. Use `impact` to decide, `neighbors` to understand.
 - `risk` fuses churn / bug-density / ownership from git with structural fan-out.
+- A server's answer is attributed to a symbol by the **call's position**
+  (`fromRanges`), never by the caller name the server chose — dexter credits a call
+  inside an ExUnit `test` block to the preceding `defp`, and trusting that added 145
+  false edges before it was checked.
 - `--verify lsp` asks the language server about the seed files plus one hop, then
   **persists** what it learns (confirmed → 1.0, server-only → 0.7, both
   `LspVerified`). It never blocks the answer: past `--verify-budget` it prints the
@@ -112,8 +120,9 @@ candidates — check it before acting on it.
 
 - Self-recursion edges are dropped on purpose (X → X says nothing about blast radius).
 - Elixir multi-clause functions collapse to one symbol; arity is not distinguished.
-  So an LSP answer must be unioned across clauses before it is compared — dexter
-  reports callers per clause, and comparing clause-by-clause invents contradictions.
+  Every clause's span is kept (`Node::extra_spans`), so "which symbol contains this
+  line?" still works — but an LSP answer must be unioned across clauses before it is
+  compared, or comparing clause-by-clause invents contradictions.
 - Elixir `@spec`/`@type` bodies are ignored (they parse as calls but name types).
 - `dataloader(...)` and inline `fn` resolvers produce no edge — under-link over invent.
 - `deps/`, `_build/`, `vendor/`, `target/`, `.venv/` are never indexed.

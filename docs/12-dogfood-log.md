@@ -8,6 +8,51 @@ the roadmap beforehand. Using the tool finds different bugs than reading it.
 
 ---
 
+## 2026-07-25 — 87.9% was three different measurements added together
+
+**Asked:** build the piece issue #18 says has to come first — make
+`eval --oracle lsp` compare at a stated granularity — then re-run it.
+
+**Said:** the first attempt made agreement *worse*, 87.9% → 62.4%, with 348 call
+sites reported as "credited to a function that doesn't contain them" and callers
+named `FiveNoobs.Lfgs.LfgPosts` — a module, not a function.
+
+**Was true:** three separate faults, each hidden by the previous number.
+
+1. **Attribution has to be by position.** `incomingCalls` carries `fromRanges`, and
+   the caller the server *names* can be a function that does not contain the call.
+   Comparing names measured naming conventions; comparing positions measures edges.
+2. **A module node spans its whole file**, so "innermost containing node" absorbed
+   every call that sits outside a function and called it a module-level call. Only
+   callables may contain a call.
+3. **The graph had lost every definition site but one.** Identity is
+   (path, qualified name), so `def kind(:admin)` and `def kind(_other)` share an id —
+   and the store's id-keyed table kept whichever was written last. So a call in the
+   second clause looked like it was inside no function at all. This is not an Elixir
+   quirk: overloads and reopened classes do the same thing.
+
+**Implication (fixed).** `ir::Node::extra_spans` keeps every definition site,
+`resolve` collapses duplicates into one node instead of letting the store do it by
+accident, and cross-service linking uses all the spans. With attribution by position
+on top:
+
+| granularity | identical caller sets | ripple-only | server-only |
+|---|---|---|---|
+| function | **164/165 (99.4%)** | 1 | 0 |
+| file | 146/165 (88.5%) | 0 | **19** |
+
+and 153 call sites inside no indexed symbol, reported as their own bucket. The two
+rows are now issue #18's acceptance test. `impact --verify lsp` additions went
+**145 → 0**: every one had been dexter crediting a test-block call to the preceding
+`defp`, and yesterday's "145 added" line in this log was wrong about them being
+useful.
+
+**Lesson:** the headline 87.9% was summing agreement about *edges*, agreement about
+*naming*, and our own missing spans. Splitting them moved one number up and produced
+a second number worth fixing — which is what a measurement is for.
+
+---
+
 ## 2026-07-25 — the oracle's answers are wrong in both directions
 
 **Asked:** `impact changeset --root <web> --verify lsp` — the first run of on-demand
