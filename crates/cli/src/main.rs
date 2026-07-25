@@ -386,27 +386,47 @@ fn cmd_impact(args: &[String]) -> Result<()> {
     }
     graph = verify_upgrade(&mut store, graph, &root, args, &seeds, json)?;
 
-    let hits = query::impact(&graph, &seeds, budget);
+    let result = query::impact(&graph, &seeds, budget);
+    let hits = &result.hits;
     if json {
         let out: Vec<_> = hits
             .iter()
             .map(|h| {
+                // `from` makes the result a graph rather than a list: depth and via
+                // say how far and along what kind of edge, never from where
+                let parent = graph.get(h.from);
                 serde_json::json!({
                     "symbol": h.node.name, "module": h.node.module_path,
                     "kind": format!("{:?}", h.node.kind),
                     "score": h.score, "weight": h.weight, "depth": h.depth,
                     "via": format!("{:?}", h.via), "risk": h.node.risk.composite,
+                    "from": parent.map(|n| n.name.clone()),
+                    "from_module": parent.map(|n| n.module_path.clone()),
                 })
             })
             .collect();
-        println!("{}", serde_json::to_string_pretty(&out)?);
-    } else {
         println!(
-            "blast radius of {} — {} hits (ranked):",
-            symbols.join(", "),
-            hits.len()
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "shown": hits.len(),
+                "reached": result.reached,
+                "hits": out,
+            }))?
         );
-        for h in &hits {
+    } else {
+        let cut = result.reached.saturating_sub(hits.len());
+        let note = if cut > 0 {
+            format!(" — {cut} more cut by --budget {budget}")
+        } else {
+            String::new()
+        };
+        println!(
+            "blast radius of {} — {} of {} hits (ranked){note}:",
+            symbols.join(", "),
+            hits.len(),
+            result.reached
+        );
+        for h in hits {
             println!(
                 "  {:.2}  {:?}<{:.2}> {}",
                 h.score,
@@ -1241,20 +1261,27 @@ fn mcp_call(
                     json!({ "error": format!("no symbol '{sym}' — try `search`") }),
                 ));
             }
-            let hits = query::impact(graph, &seeds, usize_arg("budget", 20));
-            let out: Vec<_> = hits
+            let result = query::impact(graph, &seeds, usize_arg("budget", 20));
+            let out: Vec<_> = result
+                .hits
                 .iter()
                 .map(|h| {
+                    let parent = graph.get(h.from);
                     json!({
                         "symbol": h.node.name, "module": h.node.module_path,
                         "score": h.score, "weight": h.weight, "depth": h.depth,
                         "via": format!("{:?}", h.via), "risk": h.node.risk.composite,
+                        "from": parent.map(|n| n.name.clone()),
+                        "from_module": parent.map(|n| n.module_path.clone()),
                     })
                 })
                 .collect();
-            Ok(mcp_text(
-                json!({ "seeds_matched": seeds.len(), "blast_radius": out }),
-            ))
+            Ok(mcp_text(json!({
+                "seeds_matched": seeds.len(),
+                "shown": result.hits.len(),
+                "reached": result.reached,
+                "blast_radius": out,
+            })))
         }
         "review_focus" => {
             let changed = overlay::diff_lines(root, str_arg("base").as_deref());

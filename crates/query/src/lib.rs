@@ -17,6 +17,21 @@ pub struct ImpactHit {
     pub score: f32,
     pub depth: usize,
     pub via: EdgeKind,
+    /// The symbol this hit was reached *from* on its best path.
+    ///
+    /// Without it a result is a flat list: `depth` and `via` say how far and along
+    /// what kind of edge, but not from where, so no client can draw the blast radius
+    /// as a graph. Points at a seed when `depth == 1`.
+    pub from: SymbolId,
+}
+
+/// A blast radius, and what it cost to report it.
+pub struct Impact {
+    /// Ranked hits, at most `budget` of them.
+    pub hits: Vec<ImpactHit>,
+    /// How many nodes the diffusion actually reached, before the budget cut.
+    /// Reported so a truncated answer never looks like a complete one.
+    pub reached: usize,
 }
 
 /// Per-hop decay: distant dependents matter less.
@@ -40,9 +55,9 @@ fn kind_weight(kind: EdgeKind) -> f32 {
 /// highest `score` first, with a stable tie-break on SymbolId so the ranking is
 /// deterministic. (A tie node's reported `depth`/`via` provenance may vary when
 /// two equal-weight paths reach it; the score and order do not.)
-pub fn impact(graph: &InMemoryGraph, seeds: &[SymbolId], budget: usize) -> Vec<ImpactHit> {
-    // best propagated weight + (depth, via) provenance per reached node
-    let mut best: HashMap<SymbolId, (f32, usize, EdgeKind)> = HashMap::new();
+pub fn impact(graph: &InMemoryGraph, seeds: &[SymbolId], budget: usize) -> Impact {
+    // best propagated weight + (depth, via, from) provenance per reached node
+    let mut best: HashMap<SymbolId, (f32, usize, EdgeKind, SymbolId)> = HashMap::new();
     let mut heap: BinaryHeap<QItem> = BinaryHeap::new();
     for &s in seeds {
         heap.push(QItem {
@@ -61,7 +76,7 @@ pub fn impact(graph: &InMemoryGraph, seeds: &[SymbolId], budget: usize) -> Vec<I
             }
             let improved = best.get(&e.src).is_none_or(|&(bw, ..)| w > bw);
             if improved {
-                best.insert(e.src, (w, depth + 1, e.kind));
+                best.insert(e.src, (w, depth + 1, e.kind, id));
                 heap.push(QItem {
                     weight: w,
                     id: e.src,
@@ -76,7 +91,7 @@ pub fn impact(graph: &InMemoryGraph, seeds: &[SymbolId], budget: usize) -> Vec<I
     let mut hits: Vec<ImpactHit> = best
         .into_iter()
         .filter(|(id, _)| !seed_set.contains(id))
-        .filter_map(|(id, (weight, depth, via))| {
+        .filter_map(|(id, (weight, depth, via, from))| {
             let node = graph.get(id)?.clone();
             let score = weight * (1.0 + node.risk.composite);
             Some(ImpactHit {
@@ -85,6 +100,7 @@ pub fn impact(graph: &InMemoryGraph, seeds: &[SymbolId], budget: usize) -> Vec<I
                 score,
                 depth,
                 via,
+                from,
             })
         })
         .collect();
@@ -94,8 +110,9 @@ pub fn impact(graph: &InMemoryGraph, seeds: &[SymbolId], budget: usize) -> Vec<I
             .total_cmp(&a.score)
             .then(a.node.id.0.cmp(&b.node.id.0)) // stable tie-break
     });
+    let reached = hits.len();
     hits.truncate(budget);
-    hits
+    Impact { hits, reached }
 }
 
 /// True if any impacted hit lacks a test edge (used by review to flag risk).
@@ -171,7 +188,7 @@ pub fn review_focus(
     let mut focus = Vec::new();
     let mut untested = Vec::new();
     for sym in &changed_syms {
-        let downstream = impact(graph, &[sym.id], 200);
+        let downstream = impact(graph, &[sym.id], 200).hits;
         let down_weight: f32 = downstream.iter().map(|h| h.weight).sum();
         let review_priority = (1.0 + sym.risk.composite) * (1.0 + down_weight);
 
@@ -255,5 +272,86 @@ impl Ord for QItem {
 impl PartialOrd for QItem {
     fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
         Some(self.cmp(o))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ir::{NodeKind, Span};
+
+    fn span() -> Span {
+        Span {
+            start_line: 1,
+            start_col: 1,
+            end_line: 1,
+            end_col: 1,
+        }
+    }
+
+    fn node(module: &str, name: &str) -> Node {
+        Node {
+            id: SymbolId::of(module, name),
+            kind: NodeKind::Function,
+            name: name.to_owned(),
+            qualified_name: name.to_owned(),
+            module_path: module.to_owned(),
+            span: span(),
+            extra_spans: Vec::new(),
+            is_exported: true,
+            risk: ir::RiskScores::default(),
+        }
+    }
+
+    fn calls(src: &Node, dst: &Node) -> Edge {
+        Edge {
+            src: src.id,
+            dst: dst.id,
+            kind: EdgeKind::Calls,
+            confidence: 1.0,
+            site: span(),
+            source: ir::EdgeSource::Extracted,
+        }
+    }
+
+    /// A hit has to say where it was reached from, and a truncated answer has to say
+    /// how much it dropped — otherwise a budgeted result reads as a complete one.
+    #[test]
+    fn a_hit_names_its_parent_and_a_cut_answer_says_so() {
+        let target = node("a.ts", "target");
+        let mid = node("b.ts", "mid");
+        let outer = node("c.ts", "outer");
+        let other = node("d.ts", "other");
+        let graph = InMemoryGraph::from_parts(
+            vec![target.clone(), mid.clone(), outer.clone(), other.clone()],
+            vec![
+                calls(&mid, &target),
+                calls(&outer, &mid),
+                calls(&other, &target),
+            ],
+        );
+
+        let all = impact(&graph, &[target.id], 20);
+        assert_eq!(all.reached, 3);
+        assert_eq!(all.hits.len(), 3);
+
+        let parent_of = |name: &str| {
+            all.hits
+                .iter()
+                .find(|h| h.node.name == name)
+                .map(|h| h.from)
+                .expect("hit")
+        };
+        assert_eq!(parent_of("mid"), target.id, "depth 1 points at the seed");
+        assert_eq!(parent_of("other"), target.id);
+        assert_eq!(
+            parent_of("outer"),
+            mid.id,
+            "depth 2 points at the node it was reached through, not the seed"
+        );
+
+        let cut = impact(&graph, &[target.id], 1);
+        assert_eq!(cut.hits.len(), 1);
+        assert_eq!(cut.reached, 3, "the budget must not hide what was reached");
     }
 }
