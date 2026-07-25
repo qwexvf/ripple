@@ -8,6 +8,42 @@ the roadmap beforehand. Using the tool finds different bugs than reading it.
 
 ---
 
+## 2026-07-25 — the reverted fix was right; the metric that rejected it was wrong
+
+**Asked:** re-do issue #18 (calls outside any function are dropped), which had been
+tried, measured, and reverted: +1,634 edges for −6.7 points of oracle agreement.
+
+**Said (then):** 87.9% → 81.2% identical caller sets, 64 ripple-only edges, and none
+of the 19 known misses fixed. A fair reading at the time: coarser edges, no gain.
+
+**Was true:** the oracle was comparing function-granular names against file-granular
+edges, so every correct-but-coarser edge scored as a false positive, and the misses it
+"failed to fix" were file-level linkage it had no way to express. With the oracle
+attributing by position and stating its granularity, the same fix measures:
+
+| | function granularity | file granularity |
+|---|---|---|
+| before #18 | 164/165 (99.4%), 1 ripple-only, 0 server-only | 146/165, 0 ripple-only, **19 server-only** |
+| after #18 | **165/165 (100%)**, 0, 0 | 153/165, 44 ripple-only, **0 server-only** |
+
+The function row got *better* (the one remaining false positive was itself a
+file-granular edge being mis-scored), and every file-level miss closed. The 44 new
+file-granularity ripple-only edges were sampled: dexter reports one caller for
+`filter_posts` and misses the five real call sites in `lfg_posts_test.exs`, so they
+are true edges the oracle cannot see.
+
+**Implication (fixed).** Cross-service linking falls back the way same-file
+resolution always did — enclosing definition, else module body, else file — and the
+index reports the coarser edges as their own count (`1634 file-granular`) rather than
+blending them in. Held-out recall did not move (7.1% static / 10.5% fused): these
+edges link tests and module bodies, not the co-changing pairs `eval` samples.
+
+**Lesson:** a fix rejected by a measurement is only as rejected as the measurement is
+sound. This one was reverted for six months' worth of the wrong number, and the
+reverted diff was closer to right than the metric that killed it.
+
+---
+
 ## 2026-07-25 — 87.9% was three different measurements added together
 
 **Asked:** build the piece issue #18 says has to come first — make

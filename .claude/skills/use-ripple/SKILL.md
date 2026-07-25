@@ -18,8 +18,8 @@ Last measured 2026-07-25 on the 5noobs stack (web + api). A count that moves wit
 an explanation is the cheapest bug signal this project has, so re-measure and diff:
 
 ```
-1153 files → 8929 nodes, 14153 edges
-  (2461 co-change, 343 graphql, 820 db, 31 imported, 3827 with dependents)
+1153 files → 8929 nodes, 15787 edges
+  (2461 co-change, 343 graphql, 941 db, 134 imported, 1634 file-granular, 4117 with dependents)
   ↑ nodes/with-dependents dropped on 2026-07-25 because duplicate definition nodes
     (one per clause) stopped being counted — the store only ever kept one of each
 cold index ~1.4s, warm ~0.7s
@@ -29,10 +29,12 @@ eval (5noobs-web, held out — co-change mined only from commits older than the 
   ↑ prefer the 50 line: a 300-commit test window leaves only 148 training commits
     (15 trained pairs), so co-change is starved, not wrong
 eval --oracle lsp vs dexter 0.7.1, 40 files (compare by position, state granularity):
-  --granularity function: 164/165 (99.4%) | 1 ripple-only | 0 server-only
-  --granularity file    : 146/165 (88.5%) | 0 ripple-only | 19 server-only
-  153 call sites inside no indexed symbol (test bodies, seeds, module bodies) = issue #18;
-  the file-granularity 19 is #18's acceptance test — it should go to ~0 when #18 lands
+  --granularity function: 165/165 (100.0%) | 0 ripple-only | 0 server-only
+  --granularity file    : 153/165 (92.7%)  | 44 ripple-only | 0 server-only
+  the 44 are true edges dexter misses (it reports 1 caller for filter_posts and misses
+  5 real call sites in lfg_posts_test.exs) — ripple-only at file granularity is capped
+  by the oracle's own completeness, so read it with that in mind
+153 call sites still sit inside no indexed symbol; they now link at file granularity
 impact changeset --verify lsp (132 files, ~8s, dexter 0.7.1):
   1516 confirmed | 0 added | 28 contradicted (reported, not applied) | 331 unresolved
 ```
@@ -119,6 +121,10 @@ candidates — check it before acting on it.
 ## Known behaviour that looks like a bug but isn't
 
 - Self-recursion edges are dropped on purpose (X → X says nothing about blast radius).
+- A call outside every function (module body, ExUnit `test` block, `.exs` script) is
+  attributed to its module, so `impact` shows `[file] path` or a `defmodule` symbol as
+  a caller. Those are the `file-granular` count in the index summary — real edges, one
+  level coarser.
 - Elixir multi-clause functions collapse to one symbol; arity is not distinguished.
   Every clause's span is kept (`Node::extra_spans`), so "which symbol contains this
   line?" still works — but an LSP answer must be unioned across clauses before it is
