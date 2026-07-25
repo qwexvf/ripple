@@ -40,6 +40,7 @@ A **language-agnostic core** (graph model, git overlay, risk scoring, impact/rev
 | [`docs/08-roadmap.md`](docs/08-roadmap.md) | Phased delivery (v0 TypeScript → v1 git overlay → v2 impact/review MCP → v3 multi-language) |
 | [`docs/09-review-and-corrections.md`](docs/09-review-and-corrections.md) | Architecture review + primary-source fact-check audit trail; every external claim traced, corrections & design fixes logged |
 | [`docs/10-cross-service-resolution.md`](docs/10-cross-service-resolution.md) | Call-site ↔ route matching across services: `RouteKey` normalization, `FrameworkDetector` seam, matching + confidence, co-change safety net |
+| [`docs/11-lsp-integration.md`](docs/11-lsp-integration.md) | LSP as the Tier-2 accuracy tier over the tree-sitter base: layering, reconciliation, how slow servers are kept off the critical path, provenance |
 | [`docs/v0-plan.md`](docs/v0-plan.md) | **Execution plan** for the first slice (TypeScript, Tier 2): crate build order, the concrete TS reference-resolution algorithm, store spike, testing & done criteria |
 
 ## Status

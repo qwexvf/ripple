@@ -40,7 +40,8 @@ A correct, fast static graph for TypeScript: `ir`/`parse`/`lang`(+typescript)/`r
 
 ## v4 — Breadth & scale
 
-- **More languages:** Gleam, Python, Go — each a folder under `adapters/`, diff confined to `crates/lang/` (guardrail test).
+- **LSP as the accuracy tier** ([`11`](11-lsp-integration.md)): take Tier-2 call resolution from language servers where one is configured, keep tree-sitter as the always-available base. Slow servers are handled by never blocking a query on one — budgeted verification, content-hash cache, churn-ordered background warm. Makes "add a language" mostly config, and gives the call graph its first real precision measurement (`eval --oracle lsp`).
+- **More languages:** Gleam, Python, Go — each a folder under `adapters/`, diff confined to `crates/lang/` (guardrail test). With the LSP tier, a new language needs `tags.scm` plus a server entry, not hand-written call resolution.
 - **More detectors:** HTTP/REST, pub-sub, gRPC cross-service edges.
 - **Incremental daemon:** file-watch + resident in-RAM graph (LSP-style) — removes the CLI cold-load cost; warm queries for an agent session.
 - **Scale escape hatch:** for graphs too large for RAM, swap `store` to a disk-resident backend (Samyama/LadybugDB) behind the unchanged `GraphStore` trait — [`04`](04-architecture.md#store).
