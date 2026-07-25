@@ -715,6 +715,13 @@ fn compare_calls(
         let Ok(symbols) = client.functions(&abs) else {
             continue;
         };
+        // Union the server's answers per ripple symbol before judging any of them.
+        // One ripple node routinely corresponds to several server symbols — eight
+        // overload declarations of `getFragmentData`, an Elixir function's clauses —
+        // and comparing each against the same node counted the same caller set as a
+        // disagreement once per declaration (45 phantom false positives on 5noobs).
+        let mut claims: std::collections::BTreeMap<ir::SymbolId, (bool, Vec<lsp::CallSite>)> =
+            std::collections::BTreeMap::new();
         for sym in symbols {
             let name = bare_name(&sym.name).to_owned();
             if !is_callable_name(&name) {
@@ -726,10 +733,6 @@ fn compare_calls(
             if cmp.server_names.len() < 6 {
                 cmp.server_names.push(name.clone());
             }
-            let Some(sites) = found else {
-                cmp.server_unknown += 1;
-                continue;
-            };
             let Some(target) = graph
                 .nodes_in_file(module)
                 .into_iter()
@@ -738,6 +741,23 @@ fn compare_calls(
                 cmp.ripple_unknown += 1;
                 continue;
             };
+            let entry = claims.entry(target.id).or_default();
+            // a declaration the server can't resolve tells us nothing; another
+            // declaration of the same symbol may still answer
+            if let Some(sites) = found {
+                entry.0 = true;
+                entry.1.extend(sites);
+            }
+        }
+
+        for (target_id, (resolved, sites)) in claims {
+            let Some(target) = graph.get(target_id) else {
+                continue;
+            };
+            if !resolved {
+                cmp.server_unknown += 1;
+                continue;
+            }
 
             let key = |module: &str, name: &str| match grain {
                 Granularity::Function => (module.to_owned(), name.to_owned()),
