@@ -13,6 +13,105 @@ the roadmap beforehand. Using the tool finds different bugs than reading it.
 
 ---
 
+## 2026-07-26 — the differentiator emits nothing on the two repos it was built for
+
+**Asked:** index the two real polyglot repos on this machine and look at the
+cross-service edges — the thing no other tool does.
+
+**Said:** `aegis` (848 files, 21 `.graphql`) → `0 graphql, 0 db`. `poker-platform`
+(213 files, 44 `.graphql`) → `0 graphql, 0 db`.
+
+**Was true:** both have real operation documents (`query PackageGraph { packageGraph(…) }`)
+and real codegen output, and ripple finds the *consumer* side fine. The producer side
+is **Gleam**, which has no adapter, so there is nothing to join to. Counting across
+`~/projects`: **699 `.gleam` files in 9 repositories**, including `services/api` in both
+of these. The 8 graphql edges in ripple's own index all come from its Elixir fixtures.
+
+**Implication (issue #39).** Every quality number for cross-service resolution to date
+comes from one language pair on one corpus. `tree-sitter-gleam` is on crates.io, already
+ships a `tags.scm`, and `gleam lsp` exists — so Tier 0 plus `index --calls lsp` is the
+same 4-touchpoint shape phase 4 just measured on Go.
+
+**Lesson:** "works" measured on the corpus it was written against says nothing about the
+corpus you actually own. Cross-service is the headline claim and it had never been run
+outside the fixtures.
+
+---
+
+## 2026-07-26 — a language server the repo chooses, and ripple runs it
+
+**Asked:** are language servers usable in this repo? (`ripple lsp doctor`)
+
+**Said:**
+```
+  go (/bin/touch)
+    broken   server exited during initialize
+```
+
+**Was true:** `.ripple/lsp.json` is read from the repository *under analysis*, and its
+`command`/`args` are spawned. A repo that commits one gets arbitrary command execution
+with the user's privileges; `doctor` then prints the injected binary as if it were a
+diagnostic. Confirmed by pointing it at `/bin/touch` and watching the file appear. Every
+LSP path is affected — `doctor`, `--verify lsp`, `index --calls lsp`.
+
+**Implication (issue #34).** In-repo config has to become untrusted data: read the table
+from user config outside the tree, or allowlist known server binaries, or require an
+explicit per-root trust step.
+
+**Lesson:** ripple's whole purpose is reading code somebody else wrote. Anything it loads
+from the target tree is attacker input, config included — and the MCP server makes an
+agent the one who pulls the trigger.
+
+---
+
+## 2026-07-26 — every symbol is untested, because nothing can be tested
+
+**Asked:** review a one-line edit to `src/utils/url.ts` in honojs/hono.
+
+**Said:**
+```
+  6.66  getPath (src/utils/url.ts)  — high churn (0.86), 4 downstream, untested
+
+⚠ expected co-changes absent (usually changed together):
+  src/utils/url.test.ts
+```
+
+**Was true:** `src/utils/url.test.ts` imports `getPath` and has a `describe('getPath')`
+block. One line called it untested while the next named the file that tests it. The flag
+checks for an `EdgeKind::Tests` edge and **nothing in the codebase ever emits one**, so it
+is true for every symbol in every repo — 15 of 15 rows on this repo.
+
+**Implication (issue #36).** Either produce the edge (a call from a file matching the
+language's test convention into a symbol outside it — cheap at Tier 2, and a better
+"you changed this and its test didn't move" signal than co-change) or stop printing it.
+
+**Lesson:** a flag that never varies is not a weak signal, it is a decoration. Grep for
+the producer before trusting any boolean in the output.
+
+---
+
+## 2026-07-26 — one name, six symbols, three languages, no warning
+
+**Asked:** `ripple impact run` on ripple's own repo, wanting `verify::run`.
+
+**Said:** `blast radius of run — 1 of 1 hits`, the one hit being `boot` in a
+TypeScript test fixture.
+
+**Was true:** six symbols are named `run` — one Rust function and five fixtures across
+TS, Elixir and Rust — and all six were seeded. `lookup_or_bail` announces the match rule
+only when it had to *widen* past exact, so the ambiguous-exact case, which is the
+dangerous one, says nothing. The Rust function the query meant has no callers in the
+graph at all, because Rust `use` paths are unresolved.
+
+**Implication (issue #37).** Say how many symbols a name seeded, and accept `--in-file`
+on `impact` the way `neighbors` already does. Separately: test fixtures are indexed as
+production code with no default exclusion, so ripple's own graph is mostly fixtures.
+
+**Lesson:** the honest-uncertainty work went into the *edges*. The seed set has the same
+problem and none of the same reporting.
+
+---
+
 ## 2026-07-25 — the reverted fix was right; the metric that rejected it was wrong
 
 **Asked:** re-do issue #18 (calls outside any function are dropped), which had been
