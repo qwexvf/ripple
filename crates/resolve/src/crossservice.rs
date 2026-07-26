@@ -92,6 +92,26 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
         }
     }
 
+    // fragment name → its definition, so a spread can be expanded at link time
+    let mut fragments: HashMap<&str, &lang::cross::GqlFragment> = HashMap::new();
+    for f in files {
+        for fragment in &f.extract.cross.gql_fragments {
+            fragments.insert(fragment.name.as_str(), fragment);
+        }
+    }
+    // operation → the fragments it spreads. Most nested selections in a codegen app are
+    // written in fragments, so without this the type-graph walk has almost nothing to
+    // walk (363 spreads across 24 definitions on one real app).
+    let mut op_spreads: HashMap<&str, Vec<&lang::cross::GqlSpread>> = HashMap::new();
+    for f in files {
+        for spread in &f.extract.cross.gql_spreads {
+            op_spreads
+                .entry(spread.op.as_str())
+                .or_default()
+                .push(spread);
+        }
+    }
+
     // scope → scopes whose fields it includes (Absinthe `import_fields`)
     let mut includes: HashMap<&str, Vec<&str>> = HashMap::new();
     for f in files {
@@ -234,7 +254,7 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
                     }
                 }
                 // a dataloader field names a context, not a function — coarser, and
-                // priced accordingly
+                // priced accordingly (unchanged below)
                 if let Some(contexts) = resolvers_for(&context_producer, &field_type, scope, path) {
                     let conf = CONF_GRAPHQL_CONTEXT / contexts.len() as f32;
                     for &context in contexts {
@@ -243,6 +263,34 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
                         }
                     }
                 }
+            }
+            // `...LfgPostFields` — the fragment's own type condition names the scope its
+            // fields live in, so an expanded spread needs no descent
+            for spread in op_spreads.get(op.as_str()).into_iter().flatten() {
+                expand_spread(
+                    spread.fragment.as_str(),
+                    &fragments,
+                    &mut HashSet::new(),
+                    MAX_FRAGMENT_HOPS,
+                    &mut |scope: &str, path: &[String]| {
+                        let mut hits = Vec::new();
+                        if let Some(rs) = resolvers_for(&producer, &field_type, scope, path) {
+                            hits.push((rs, CONF_GRAPHQL));
+                        }
+                        if let Some(cs) = resolvers_for(&context_producer, &field_type, scope, path)
+                        {
+                            hits.push((cs, CONF_GRAPHQL_CONTEXT));
+                        }
+                        for (targets, base) in hits {
+                            let conf = base / targets.len() as f32;
+                            for &t in targets {
+                                if emit(&mut edges, src_id, t, EdgeKind::GraphqlCall, conf, 0) {
+                                    graphql += 1;
+                                }
+                            }
+                        }
+                    },
+                );
             }
         }
     }
@@ -392,6 +440,37 @@ fn roots_by_scope<'a>(includes: &HashMap<&'a str, Vec<&'a str>>) -> HashMap<&'a 
         roots.sort_unstable();
     }
     out
+}
+
+/// How deep a chain of fragments spreading fragments is followed. They nest (a page
+/// fragment composing card fragments), but not deeply, and a cycle must cost nothing.
+const MAX_FRAGMENT_HOPS: usize = 4;
+
+/// Visit every field path a fragment selects, rooted at the scope its type condition
+/// names, following fragments it spreads in turn.
+fn expand_spread(
+    name: &str,
+    fragments: &HashMap<&str, &lang::cross::GqlFragment>,
+    seen: &mut HashSet<String>,
+    hops: usize,
+    visit: &mut impl FnMut(&str, &[String]),
+) {
+    if hops == 0 || !seen.insert(name.to_owned()) {
+        return;
+    }
+    let Some(fragment) = fragments.get(name) else {
+        return; // spread of a fragment defined nowhere we indexed
+    };
+    let scope = format!(
+        "object:{}",
+        lang::cross::decamelize(&fragment.type_condition)
+    );
+    for path in &fragment.paths {
+        visit(&scope, path);
+    }
+    for (_, nested) in &fragment.spreads {
+        expand_spread(nested, fragments, seen, hops - 1, visit);
+    }
 }
 
 /// The resolvers behind one selection path, walked down the schema's type graph.

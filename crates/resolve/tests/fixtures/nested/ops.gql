@@ -1,11 +1,22 @@
+# written out in full: the walk descends currentPlayer's type
 query CurrentPlayer {
   currentPlayer {
     id
     team {
       name
     }
-    badges {
-      name
-    }
+  }
+}
+
+# the same selection through a fragment, which is how a codegen app writes it
+query CurrentPlayerViaFragment {
+  currentPlayer {
+    ...PlayerFields
+  }
+}
+
+fragment PlayerFields on Player {
+  badges {
+    name
   }
 }

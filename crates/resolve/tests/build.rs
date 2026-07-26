@@ -687,14 +687,18 @@ fn a_nested_selection_reaches_its_own_resolver() {
         "the nested field's resolver, found by descending currentPlayer's type"
     );
 
-    // `resolve: dataloader(App.Badges)` names a context, not a function: the honest
-    // target is that module, at a lower confidence than a named resolver
+    // the same selection written through a fragment: its type condition names the
+    // scope directly, so `...PlayerFields` reaches the fields inside it. Most nested
+    // selections in a codegen app are written this way (363 spreads on one real app).
+    let via_fragment = SymbolId::module("fragment_page.ts");
     let badges = SymbolId::module("badges.ex");
     let ctx = r
         .edges
         .iter()
-        .find(|e| e.src == page && e.dst == badges && e.kind == EdgeKind::GraphqlCall)
-        .expect("a dataloader field reaches its context module");
+        .find(|e| e.src == via_fragment && e.dst == badges && e.kind == EdgeKind::GraphqlCall)
+        .expect("a spread reaches the fields the fragment selects");
+    // `resolve: dataloader(App.Badges)` names a context, not a function, so the honest
+    // target is that module — worth less than a named resolver, and priced that way
     assert!(
         ctx.confidence < 0.9,
         "module-granular is worth less than a named function: {}",

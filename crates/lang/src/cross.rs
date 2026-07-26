@@ -14,11 +14,19 @@ pub struct CrossFacts {
     pub gql_ops: Vec<GqlOp>,
     /// TypeScript `<Name>Document` operation names referenced in the file.
     pub ts_docs: Vec<String>,
+    /// Fragment definitions in a `.gql` file.
+    pub gql_fragments: Vec<GqlFragment>,
+    /// Fragment spreads inside operations. Most nested selections in a codegen-based
+    /// app are written in fragments, so an unexpanded spread hides them all.
+    pub gql_spreads: Vec<GqlSpread>,
 }
 
 impl CrossFacts {
     pub fn is_empty(&self) -> bool {
-        self.elixir.is_none() && self.gql_ops.is_empty() && self.ts_docs.is_empty()
+        self.elixir.is_none()
+            && self.gql_ops.is_empty()
+            && self.ts_docs.is_empty()
+            && self.gql_fragments.is_empty()
     }
 }
 
@@ -37,6 +45,34 @@ pub struct GqlOp {
     /// "author"]` for `lfgPosts { author { … } }`. A nested selection has a resolver
     /// too, and matching only the root field missed every one of them.
     pub path: Vec<String>,
+}
+
+/// A fragment definition: a named, reusable selection on one type.
+///
+/// `fragment LfgPostFields on LfgPost { author { name } }`. The type condition names
+/// the scope its fields live in directly, so an expanded spread needs no descent —
+/// which is why fragments are cheaper to follow than nested selections were.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GqlFragment {
+    pub name: String,
+    /// The type it applies to, as written (`LfgPost`).
+    pub type_condition: String,
+    /// Field paths selected inside it, relative to the type condition.
+    pub paths: Vec<Vec<String>>,
+    /// Fragments it spreads in turn, with the path each occurs at.
+    pub spreads: Vec<(Vec<String>, String)>,
+}
+
+/// A `...FragmentName` in an operation, and where in the selection it appears.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GqlSpread {
+    /// Operation name the spread belongs to.
+    pub op: String,
+    /// Root scope of that operation: `query` | `mutation` | `subscription`.
+    pub scope: String,
+    /// Selection path the spread sits at, root first. Empty = spread at the top level.
+    pub at: Vec<String>,
+    pub fragment: String,
 }
 
 /// A field served by a *context module* rather than a named function —
@@ -132,11 +168,51 @@ pub fn typescript(root: TsNode, src: &[u8]) -> CrossFacts {
 
 // ── GraphQL: operation → root fields ──
 pub fn graphql(root: TsNode, src: &[u8]) -> CrossFacts {
-    let mut gql_ops = Vec::new();
-    collect_gql(root, src, &mut gql_ops);
-    CrossFacts {
-        gql_ops,
-        ..Default::default()
+    let mut facts = CrossFacts::default();
+    collect_gql(root, src, &mut facts);
+    facts
+}
+
+/// Where a selection walk puts what it finds. Operations and fragment bodies are the
+/// same shape of walk with different destinations, so they share one walker.
+enum Sink<'a> {
+    Operation {
+        op: &'a str,
+        scope: &'a str,
+        ops: &'a mut Vec<GqlOp>,
+        spreads: &'a mut Vec<GqlSpread>,
+    },
+    Fragment {
+        paths: &'a mut Vec<Vec<String>>,
+        spreads: &'a mut Vec<(Vec<String>, String)>,
+    },
+}
+
+impl Sink<'_> {
+    fn field(&mut self, path: &[String], name: &str) {
+        match self {
+            Sink::Operation { op, scope, ops, .. } => ops.push(GqlOp {
+                name: (*op).to_owned(),
+                scope: (*scope).to_owned(),
+                field: name.to_owned(),
+                path: path.to_vec(),
+            }),
+            Sink::Fragment { paths, .. } => paths.push(path.to_vec()),
+        }
+    }
+
+    fn spread(&mut self, path: &[String], fragment: &str) {
+        match self {
+            Sink::Operation {
+                op, scope, spreads, ..
+            } => spreads.push(GqlSpread {
+                op: (*op).to_owned(),
+                scope: (*scope).to_owned(),
+                at: path.to_vec(),
+                fragment: fragment.to_owned(),
+            }),
+            Sink::Fragment { spreads, .. } => spreads.push((path.to_vec(), fragment.to_owned())),
+        }
     }
 }
 
@@ -144,46 +220,83 @@ pub fn graphql(root: TsNode, src: &[u8]) -> CrossFacts {
 ///
 /// Recursive because a nested selection is a field on another type, with its own
 /// resolver — flattening to the root field is what made those resolvers unreachable.
-fn collect_selections(
-    set: TsNode,
-    src: &[u8],
-    op: &str,
-    scope: &str,
-    path: &mut Vec<String>,
-    out: &mut Vec<GqlOp>,
-) {
+fn collect_selections(set: TsNode, src: &[u8], path: &mut Vec<String>, sink: &mut Sink) {
     let mut sc = set.walk();
     for sel in set.named_children(&mut sc) {
         if sel.kind() != "selection" {
             continue;
         }
-        let Some(field) = sel.named_child(0).filter(|f| f.kind() == "field") else {
-            continue; // a fragment spread names no field of its own
-        };
-        let mut fc = field.walk();
-        let children: Vec<TsNode> = field.named_children(&mut fc).collect();
-        let Some(name) = children
-            .iter()
-            .find(|n| n.kind() == "name")
-            .map(|n| text(*n, src).to_owned())
-        else {
+        let Some(inner) = sel.named_child(0) else {
             continue;
         };
-        path.push(name.clone());
-        out.push(GqlOp {
-            name: op.to_owned(),
-            scope: scope.to_owned(),
-            field: name,
-            path: path.clone(),
-        });
-        for nested in children.iter().filter(|n| n.kind() == "selection_set") {
-            collect_selections(*nested, src, op, scope, path, out);
+        match inner.kind() {
+            // `...Name` — the fields are in the fragment, resolved at link time
+            "fragment_spread" => {
+                if let Some(name) = named_child_text(inner, "fragment_name", src) {
+                    sink.spread(path, &name);
+                }
+            }
+            "field" => {
+                let mut fc = inner.walk();
+                let children: Vec<TsNode> = inner.named_children(&mut fc).collect();
+                let Some(name) = children
+                    .iter()
+                    .find(|n| n.kind() == "name")
+                    .map(|n| text(*n, src).to_owned())
+                else {
+                    continue;
+                };
+                path.push(name.clone());
+                sink.field(path, &name);
+                for nested in children.iter().filter(|n| n.kind() == "selection_set") {
+                    collect_selections(*nested, src, path, sink);
+                }
+                path.pop();
+            }
+            // an inline fragment (`... on Type { … }`) selects on a different type;
+            // not followed yet, and skipped rather than mis-attributed to this one
+            _ => {}
         }
-        path.pop();
     }
 }
 
-fn collect_gql(node: TsNode, src: &[u8], out: &mut Vec<GqlOp>) {
+/// Text of the first named child of `kind`, one level down (`fragment_name (name)`).
+fn named_child_text(node: TsNode, kind: &str, src: &[u8]) -> Option<String> {
+    let mut c = node.walk();
+    let child = node.named_children(&mut c).find(|n| n.kind() == kind)?;
+    let mut cc = child.walk();
+    let name = child
+        .named_children(&mut cc)
+        .find(|n| n.kind() == "name")
+        .unwrap_or(child);
+    Some(text(name, src).to_owned())
+}
+
+fn collect_gql(node: TsNode, src: &[u8], out: &mut CrossFacts) {
+    if node.kind() == "fragment_definition" {
+        let name = named_child_text(node, "fragment_name", src);
+        let mut c = node.walk();
+        let children: Vec<TsNode> = node.named_children(&mut c).collect();
+        let type_condition = children
+            .iter()
+            .find(|n| n.kind() == "type_condition")
+            .and_then(|n| named_child_text(*n, "named_type", src));
+        let set = children.iter().find(|n| n.kind() == "selection_set");
+        if let (Some(name), Some(type_condition), Some(set)) = (name, type_condition, set) {
+            let mut fragment = GqlFragment {
+                name,
+                type_condition,
+                paths: Vec::new(),
+                spreads: Vec::new(),
+            };
+            let mut sink = Sink::Fragment {
+                paths: &mut fragment.paths,
+                spreads: &mut fragment.spreads,
+            };
+            collect_selections(*set, src, &mut Vec::new(), &mut sink);
+            out.gql_fragments.push(fragment);
+        }
+    }
     if node.kind() == "operation_definition" {
         let mut op_name = None;
         let mut sel_set = None;
@@ -199,7 +312,13 @@ fn collect_gql(node: TsNode, src: &[u8], out: &mut Vec<GqlOp>) {
             }
         }
         if let (Some(op), Some(set)) = (op_name, sel_set) {
-            collect_selections(set, src, &op, scope, &mut Vec::new(), out);
+            let mut sink = Sink::Operation {
+                op: &op,
+                scope,
+                ops: &mut out.gql_ops,
+                spreads: &mut out.gql_spreads,
+            };
+            collect_selections(set, src, &mut Vec::new(), &mut sink);
         }
     }
     let mut c = node.walk();
@@ -217,6 +336,25 @@ pub fn elixir(root: TsNode, src: &[u8]) -> CrossFacts {
 }
 
 /// snake_case atom → camelCase (Absinthe LanguageConventions default).
+/// The inverse of `camelize`: a GraphQL type name to the atom Absinthe declares it
+/// under (`LfgPost` → `lfg_post`). A fragment's type condition is written the first
+/// way and the schema's object scope the second, so a spread cannot be followed
+/// without it.
+pub fn decamelize(name: &str) -> String {
+    let mut out = String::with_capacity(name.len() + 4);
+    for (i, ch) in name.chars().enumerate() {
+        if ch.is_ascii_uppercase() {
+            if i > 0 {
+                out.push('_');
+            }
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 pub fn camelize(snake: &str) -> String {
     let mut out = String::with_capacity(snake.len());
     let mut upper = false;
