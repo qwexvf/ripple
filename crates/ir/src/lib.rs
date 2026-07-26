@@ -165,6 +165,82 @@ pub enum EdgeKind {
     DbQuery,
 }
 
+// ── cross-service vocabulary ────────────────────────────────────────────────
+//
+// A call in service A that reaches a handler in service B has no static call edge
+// crossing the process boundary. Both sides are therefore normalized into one key
+// space and matched by lookup — the fixed vocabulary every framework detector maps
+// onto, the way every language maps onto NodeKind/EdgeKind above. See docs/10.
+
+/// What kind of boundary a cross-service key crosses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Transport {
+    Http,
+    Graphql,
+    Grpc,
+    /// method-name-keyed RPC (JSON-RPC and kin)
+    Rpc,
+    PubSub,
+    Db,
+}
+
+/// One normalized piece of a route/topic/selection path.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Segment {
+    Literal(String),
+    /// a route parameter (`:id`, `{id}`) or a consumer interpolation (`${x}`) —
+    /// both sides normalize to this, so a template matches a parameterized route
+    Param,
+    /// catch-all (`*`, `/**`): matches the rest of the path, including nothing
+    Wildcard,
+}
+
+/// The normalized key both sides of a boundary reduce to, so matching is a lookup
+/// rather than fuzzy guessing. Producers (routes, schema fields, topics) and
+/// consumers (fetch calls, documents, publishes) emit the identical structure.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RouteKey {
+    pub transport: Transport,
+    /// `GET`/`POST` for HTTP; gRPC/RPC method name; `None` where the transport has
+    /// no method axis (pub/sub topics, DB entities, GraphQL — its root scope is the
+    /// first path segment instead).
+    pub method: Option<String>,
+    /// URL segments, GraphQL selection path, topic split on `.`, or a DB entity
+    /// name. Wire-format spelling: each detector normalizes its own framework's
+    /// conventions before emitting, so the matcher never learns a framework name.
+    pub path: Vec<Segment>,
+}
+
+impl RouteKey {
+    /// Does a consumer's key reach this producer key?
+    ///
+    /// `Literal` must equal `Literal`, `Param` matches exactly one segment from
+    /// either side, `Wildcard` matches the whole rest. Transports and methods must
+    /// agree exactly — a `player` mutation must never match a `player` query.
+    pub fn matches(&self, consumer: &RouteKey) -> bool {
+        self.transport == consumer.transport
+            && self.method == consumer.method
+            && segments_match(&self.path, &consumer.path)
+    }
+}
+
+fn segments_match(producer: &[Segment], consumer: &[Segment]) -> bool {
+    match (producer.first(), consumer.first()) {
+        (None, None) => true,
+        (Some(Segment::Wildcard), _) | (_, Some(Segment::Wildcard)) => true,
+        (Some(a), Some(b)) => {
+            let head_ok = match (a, b) {
+                (Segment::Literal(x), Segment::Literal(y)) => x == y,
+                // Param on either side matches exactly one segment
+                (Segment::Param, _) | (_, Segment::Param) => true,
+                _ => unreachable!("wildcard handled above"),
+            };
+            head_ok && segments_match(&producer[1..], &consumer[1..])
+        }
+        _ => false,
+    }
+}
+
 /// Where an edge's claim came from.
 ///
 /// Provenance is separate from `confidence` on purpose: confidence says how sure
@@ -195,4 +271,76 @@ pub struct Edge {
     /// provenance existed load unchanged.
     #[serde(default)]
     pub source: EdgeSource,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lit(s: &str) -> Segment {
+        Segment::Literal(s.to_owned())
+    }
+
+    fn key(transport: Transport, method: Option<&str>, path: Vec<Segment>) -> RouteKey {
+        RouteKey {
+            transport,
+            method: method.map(str::to_owned),
+            path,
+        }
+    }
+
+    /// The whole point of the normalized key: a parameterized route and an
+    /// interpolated consumer template meet in one key space.
+    #[test]
+    fn a_param_matches_one_segment_from_either_side() {
+        let route = key(
+            Transport::Http,
+            Some("GET"),
+            vec![lit("users"), Segment::Param],
+        );
+        let call = key(
+            Transport::Http,
+            Some("GET"),
+            vec![lit("users"), Segment::Param],
+        );
+        assert!(route.matches(&call));
+        // literal on the consumer side still matches the route's param
+        let literal_call = key(Transport::Http, Some("GET"), vec![lit("users"), lit("42")]);
+        assert!(route.matches(&literal_call));
+        // but a param never swallows two segments
+        let deeper = key(
+            Transport::Http,
+            Some("GET"),
+            vec![lit("users"), lit("42"), lit("posts")],
+        );
+        assert!(!route.matches(&deeper));
+    }
+
+    #[test]
+    fn method_and_transport_are_exact() {
+        let get = key(Transport::Http, Some("GET"), vec![lit("health")]);
+        let post = key(Transport::Http, Some("POST"), vec![lit("health")]);
+        assert!(
+            !get.matches(&post),
+            "a player mutation must not match a player query"
+        );
+        let topic = key(Transport::PubSub, None, vec![lit("health")]);
+        assert!(!get.matches(&topic));
+    }
+
+    #[test]
+    fn a_wildcard_matches_the_rest_including_nothing() {
+        let route = key(
+            Transport::Http,
+            Some("GET"),
+            vec![lit("assets"), Segment::Wildcard],
+        );
+        assert!(route.matches(&key(
+            Transport::Http,
+            Some("GET"),
+            vec![lit("assets"), lit("a"), lit("b")]
+        )));
+        assert!(route.matches(&key(Transport::Http, Some("GET"), vec![lit("assets")])));
+        assert!(!route.matches(&key(Transport::Http, Some("GET"), vec![lit("other")])));
+    }
 }
