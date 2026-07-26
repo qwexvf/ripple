@@ -623,10 +623,20 @@ fn verify_upgrade(
     if roots.is_empty() {
         roots.push((String::new(), root.canonicalize().unwrap_or(root.into())));
     }
+    // the extract cache already hashes every file for incremental indexing; the
+    // verdict cache reuses those hashes as its keys
+    let hashes: std::collections::HashMap<String, String> = store
+        .read_extracts()?
+        .into_iter()
+        .map(|(module, f)| (module, f.hash))
+        .collect();
+    let cached = store.read_verified()?;
     let plan = verify::Plan {
         focus: verify::focus_files(&graph, seeds),
         roots: &roots,
         budget,
+        hashes: &hashes,
+        cached: &cached,
         on_denial: if args.iter().any(|a| a == "--drop-contradicted") {
             verify::OnDenial::Drop
         } else if args.iter().any(|a| a == "--floor-contradicted") {
@@ -642,6 +652,11 @@ fn verify_upgrade(
         eprintln!("{}", outcome.summary());
     } else {
         println!("{}", outcome.summary());
+    }
+    if !outcome.learned.is_empty() {
+        store
+            .write_verified(&outcome.learned)
+            .context("persisting verified verdicts")?;
     }
     if !outcome.changed() {
         return Ok(graph);

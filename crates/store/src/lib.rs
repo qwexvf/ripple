@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use ir::{Edge, EdgeKind, Node, SymbolId};
 use parse::CachedFile;
 use redb::{Database, ReadableTable, TableDefinition};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -13,6 +14,8 @@ const NODES: TableDefinition<u64, &[u8]> = TableDefinition::new("nodes");
 const EDGES: TableDefinition<u64, &[u8]> = TableDefinition::new("edges");
 const EXTRACTS: TableDefinition<&str, &[u8]> = TableDefinition::new("extracts");
 const ROOTS: TableDefinition<u64, &[u8]> = TableDefinition::new("roots");
+/// Verified call verdicts, keyed by the *content hash* of the file they came from.
+const VERIFIED: TableDefinition<&str, &[u8]> = TableDefinition::new("verified");
 
 /// Durable graph store. One writer, many readers; query happens after `load`.
 /// Also persists the per-file extract cache for incremental re-indexing.
@@ -41,6 +44,10 @@ pub trait GraphStore {
     fn write_roots(&mut self, roots: &[(String, PathBuf)]) -> Result<()>;
     /// The roots of the last index; empty if none were recorded.
     fn read_roots(&self) -> Result<Vec<(String, PathBuf)>>;
+    /// Merge verified verdicts into the cache, keyed by file content hash.
+    fn write_verified(&mut self, by_hash: &HashMap<String, Vec<VerifiedCall>>) -> Result<()>;
+    /// Every cached verdict set, keyed by file content hash.
+    fn read_verified(&self) -> Result<HashMap<String, Vec<VerifiedCall>>>;
 }
 
 pub struct RedbStore {
@@ -163,6 +170,40 @@ impl GraphStore for RedbStore {
         Ok(())
     }
 
+    /// Merges rather than replaces: verifying one query's neighbourhood must not
+    /// discard what earlier queries learned about other files.
+    fn write_verified(&mut self, by_hash: &HashMap<String, Vec<VerifiedCall>>) -> Result<()> {
+        let db = self.db()?;
+        let wtx = db.begin_write()?;
+        {
+            let mut t = wtx.open_table(VERIFIED)?;
+            for (hash, calls) in by_hash {
+                let bytes = serde_json::to_vec(calls)?;
+                t.insert(hash.as_str(), bytes.as_slice())?;
+            }
+        }
+        wtx.commit()?;
+        Ok(())
+    }
+
+    fn read_verified(&self) -> Result<HashMap<String, Vec<VerifiedCall>>> {
+        let Ok(db) = Database::open(&self.path) else {
+            return Ok(HashMap::new());
+        };
+        let rtx = db.begin_read()?;
+        let mut out = HashMap::new();
+        if let Ok(t) = rtx.open_table(VERIFIED) {
+            for row in t.iter()? {
+                let (k, v) = row?;
+                // a row from an older verdict schema is a cache miss, not a failure
+                if let Ok(calls) = serde_json::from_slice::<Vec<VerifiedCall>>(v.value()) {
+                    out.insert(k.value().to_owned(), calls);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     fn read_roots(&self) -> Result<Vec<(String, PathBuf)>> {
         let Ok(db) = Database::open(&self.path) else {
             return Ok(Vec::new()); // no prior index
@@ -203,6 +244,31 @@ impl GraphStore for RedbStore {
         }
         Ok(InMemoryGraph::from_parts(nodes, edges))
     }
+}
+
+/// What a language server said about one call, recorded so the same question is not
+/// asked twice about a file that has not changed.
+///
+/// Keyed by file content hash rather than path: a file that changes gets a new key and
+/// its stale verdicts are simply never read again, and a file that is renamed but not
+/// edited keeps its answers. Symbol ids are stored raw — replaying a verdict against a
+/// graph that no longer holds the symbol is a miss, not a lie.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Verdict {
+    /// Both ripple and the server found this call.
+    Confirmed,
+    /// Only the server found it.
+    Added,
+    /// Ripple has it; the server, which covers that file, does not report it.
+    Contradicted,
+}
+
+/// One recorded verdict: the call `src → dst`, and what the server said about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerifiedCall {
+    pub src: SymbolId,
+    pub dst: SymbolId,
+    pub verdict: Verdict,
 }
 
 /// How a name query found what it found. A looser match still answers, but the

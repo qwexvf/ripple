@@ -8,6 +8,7 @@ license.workspace = true
 ir = { workspace = true }
 parse = { workspace = true }
 anyhow = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 redb = "2"
 

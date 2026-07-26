@@ -62,6 +62,11 @@ pub struct Plan<'a> {
     pub budget: Duration,
     /// What a server's silence about one of our edges is allowed to do.
     pub on_denial: OnDenial,
+    /// module path → file content hash, from the index's extract cache. A file whose
+    /// hash is already in the verdict cache is replayed instead of re-asked.
+    pub hashes: &'a HashMap<String, String>,
+    /// Verdicts recorded by earlier runs, keyed by file content hash.
+    pub cached: &'a HashMap<String, Vec<store::VerifiedCall>>,
 }
 
 /// What verification changed, and what it could not reach. Never silently partial:
@@ -89,6 +94,10 @@ pub struct Outcome {
     pub added_examples: Vec<String>,
     /// `language: server` for each server that answered.
     pub servers: Vec<String>,
+    /// Files answered from the verdict cache — no server request at all.
+    pub files_cached: usize,
+    /// Verdicts learned this run, keyed by file content hash, to persist.
+    pub learned: HashMap<String, Vec<store::VerifiedCall>>,
     /// The full edge list after reconciliation, ready to persist.
     pub edges: Vec<Edge>,
     /// Positions in `edges` that `--drop-contradicted` marked for removal. Applied
@@ -98,6 +107,36 @@ pub struct Outcome {
 }
 
 impl Outcome {
+    /// Remember a verdict against the file the *target* lives in, so the next query
+    /// about an unchanged file replays instead of asking.
+    fn record(&mut self, pass: &Pass, target: SymbolId, src: SymbolId, verdict: store::Verdict) {
+        let Some(module) = pass.graph.get(target).map(|n| n.module_path.clone()) else {
+            return;
+        };
+        let Some(hash) = pass.plan.hashes.get(&module) else {
+            return; // no hash means no key that can be invalidated — don't cache it
+        };
+        self.learned
+            .entry(hash.clone())
+            .or_default()
+            .push(store::VerifiedCall {
+                src,
+                dst: target,
+                verdict,
+            });
+    }
+
+    /// Note that a file was verified even if the server had nothing to say about it.
+    ///
+    /// Without this, a file that produces no verdicts has no cache key, so every later
+    /// query asks the server about it again — 43 of 163 files on the first real run.
+    /// "Verified, nothing to report" is an answer worth keeping.
+    fn mark_checked(&mut self, pass: &Pass, module: &str) {
+        if let Some(hash) = pass.plan.hashes.get(module) {
+            self.learned.entry(hash.clone()).or_default();
+        }
+    }
+
     /// Drop the edges `--drop-contradicted` marked, then put the list in a total
     /// order. Must run before `edges` is used: it is collected from a `HashMap`, so
     /// without the sort what gets persisted would vary run to run.
@@ -129,6 +168,12 @@ impl Outcome {
             "verify lsp: {} files checked, {} confirmed, {} added, {} contradicted",
             self.files_checked, self.confirmed, self.added, self.contradicted
         );
+        if self.files_cached > 0 {
+            s.push_str(&format!(
+                ", {} files replayed from cache",
+                self.files_cached
+            ));
+        }
         if !self.servers.is_empty() {
             s.push_str(&format!(" (via {})", self.servers.join(", ")));
         }
@@ -269,6 +314,13 @@ pub fn run(graph: &InMemoryGraph, plan: &Plan) -> Outcome {
             };
             for module in mine {
                 work.remove(&module);
+                // a file whose content hash already has verdicts costs nothing: the
+                // budget and the server are for files that actually changed
+                if let Some(calls) = pass.cached_for(&module) {
+                    replay(&pass, calls, &mut out);
+                    out.files_cached += 1;
+                    continue;
+                }
                 if Instant::now() >= deadline {
                     out.out_of_budget.push(module);
                     continue;
@@ -294,6 +346,28 @@ struct Pass<'a> {
     /// is about without rescanning the list per symbol.
     index: &'a HashMap<(SymbolId, SymbolId), usize>,
     plan: &'a Plan<'a>,
+}
+
+impl Pass<'_> {
+    /// Verdicts already recorded for this file's current content, if any.
+    fn cached_for(&self, module: &str) -> Option<&[store::VerifiedCall]> {
+        let hash = self.plan.hashes.get(module)?;
+        self.plan.cached.get(hash).map(Vec::as_slice)
+    }
+}
+
+/// Apply verdicts from the cache. Same effect as reconciling the server's live answer
+/// for that file, without the round trip.
+fn replay(pass: &Pass, calls: &[store::VerifiedCall], out: &mut Outcome) {
+    for c in calls {
+        match c.verdict {
+            store::Verdict::Confirmed => confirm(pass, c.dst, c.src, out),
+            store::Verdict::Added => add(pass, c.dst, c.src, out),
+            store::Verdict::Contradicted => {
+                contradict(pass, c.dst, c.src, out);
+            }
+        }
+    }
 }
 
 /// What the answering server's workspace actually covers. Silence from a server
@@ -355,6 +429,7 @@ fn verify_file(pass: &Pass, client: &mut lsp::Client, module: &str, out: &mut Ou
         return;
     };
     out.files_checked += 1;
+    out.mark_checked(pass, module);
 
     // name → (any clause resolved, unioned callers). BTreeMap so verdicts are
     // applied in a fixed order.
@@ -493,61 +568,91 @@ fn reconcile(pass: &Pass, target: SymbolId, theirs: &HashSet<SymbolId>, out: &mu
         .collect();
 
     for &src in theirs.intersection(&ours) {
-        if let Some(&i) = pass.index.get(&(target, src)) {
-            out.edges[i].confidence = CONF_VERIFIED;
-            out.edges[i].source = EdgeSource::LspVerified;
-            out.confirmed += 1;
-        }
+        confirm(pass, target, src, out);
+        out.record(pass, target, src, store::Verdict::Confirmed);
     }
     for &src in theirs.difference(&ours) {
-        let site = pass.graph.get(src).map_or(
-            ir::Span {
-                start_line: 0,
-                start_col: 0,
-                end_line: 0,
-                end_col: 0,
-            },
-            |n| n.span,
-        );
-        out.edges.push(Edge {
-            src,
-            dst: target,
-            kind: EdgeKind::Calls,
-            confidence: CONF_SERVER_ONLY,
-            site,
-            source: EdgeSource::LspVerified,
-        });
-        out.added += 1;
-        if out.added_examples.len() < 5 {
-            out.added_examples.push(describe(pass, target, src));
-        }
+        add(pass, target, src, out);
+        out.record(pass, target, src, store::Verdict::Added);
     }
     for &src in ours.difference(theirs) {
-        let Some(&i) = pass.index.get(&(target, src)) else {
-            continue;
-        };
-        if !pass
-            .graph
-            .get(src)
-            .is_some_and(|n| pass.cov.covers(&n.module_path))
-        {
-            continue;
-        }
-        out.contradicted += 1;
-        if out.contradicted_examples.len() < 5 {
-            out.contradicted_examples.push(describe(pass, target, src));
-        }
-        match pass.plan.on_denial {
-            OnDenial::Report => {}
-            OnDenial::Floor => {
-                out.edges[i].confidence = out.edges[i].confidence.min(CONF_CONTRADICTED);
-                out.floored += 1;
-            }
-            OnDenial::Drop => {
-                out.to_drop.insert(i);
-            }
+        if contradict(pass, target, src, out) {
+            out.record(pass, target, src, store::Verdict::Contradicted);
         }
     }
+}
+
+/// Both sides found this call: it is as certain as anything here gets.
+fn confirm(pass: &Pass, target: SymbolId, src: SymbolId, out: &mut Outcome) {
+    if let Some(&i) = pass.index.get(&(target, src)) {
+        out.edges[i].confidence = CONF_VERIFIED;
+        out.edges[i].source = EdgeSource::LspVerified;
+        out.confirmed += 1;
+    }
+}
+
+/// Only the server found it. Added below the extracted band — see `CONF_SERVER_ONLY`.
+fn add(pass: &Pass, target: SymbolId, src: SymbolId, out: &mut Outcome) {
+    if pass.index.contains_key(&(target, src)) {
+        return; // already ours (a replayed verdict from before it was added)
+    }
+    let site = pass.graph.get(src).map_or(
+        ir::Span {
+            start_line: 0,
+            start_col: 0,
+            end_line: 0,
+            end_col: 0,
+        },
+        |n| n.span,
+    );
+    out.edges.push(Edge {
+        src,
+        dst: target,
+        kind: EdgeKind::Calls,
+        confidence: CONF_SERVER_ONLY,
+        site,
+        source: EdgeSource::LspVerified,
+    });
+    out.added += 1;
+    if out.added_examples.len() < 5 {
+        out.added_examples.push(describe(pass, target, src));
+    }
+}
+
+/// Ripple has it and the server, which covers that file, does not. Returns whether it
+/// counted as a contradiction at all — an edge outside the server's coverage is not
+/// one, and must not be cached as one either.
+fn contradict(pass: &Pass, target: SymbolId, src: SymbolId, out: &mut Outcome) -> bool {
+    let Some(&i) = pass.index.get(&(target, src)) else {
+        return false;
+    };
+    let Some(caller) = pass.graph.get(src) else {
+        return false;
+    };
+    if !pass.cov.covers(&caller.module_path) {
+        return false;
+    }
+    // a file-granular caller (a module body, a `test` block — issue #18) is not
+    // something a server can name, so its silence about one is not a denial. Counting
+    // those turned 28 contradictions into 658 the moment those edges existed.
+    if !matches!(caller.kind, ir::NodeKind::Function | ir::NodeKind::Method) {
+        return false;
+    }
+    out.contradicted += 1;
+    if out.contradicted_examples.len() < 5 {
+        out.contradicted_examples.push(describe(pass, target, src));
+    }
+    match pass.plan.on_denial {
+        OnDenial::Report => {}
+        OnDenial::Floor => {
+            out.edges[i].confidence = out.edges[i].confidence.min(CONF_CONTRADICTED);
+            out.floored += 1;
+        }
+        OnDenial::Drop => {
+            out.to_drop.insert(i);
+        }
+    }
+    true
 }
 
 #[cfg(test)]
@@ -620,11 +725,18 @@ mod tests {
     }
 
     fn plan(on_denial: OnDenial) -> Plan<'static> {
+        // leaked so the fixtures can hand out a 'static Plan; the process is a test
+        static EMPTY_HASHES: std::sync::OnceLock<HashMap<String, String>> =
+            std::sync::OnceLock::new();
+        static EMPTY_CACHE: std::sync::OnceLock<HashMap<String, Vec<store::VerifiedCall>>> =
+            std::sync::OnceLock::new();
         Plan {
             focus: BTreeSet::new(),
             roots: &[],
             budget: Duration::from_secs(1),
             on_denial,
+            hashes: EMPTY_HASHES.get_or_init(HashMap::new),
+            cached: EMPTY_CACHE.get_or_init(HashMap::new),
         }
     }
 
@@ -871,6 +983,76 @@ mod tests {
             ))]
         );
         assert!(attribute(&g, "api/caller.ex", &site("nope", &[])).is_empty());
+    }
+
+    /// A verdict recorded for a file's content hash replays without a server, and a
+    /// changed file's hash simply misses — invalidation is the key, not a timestamp.
+    #[test]
+    fn a_cached_verdict_replays_and_a_changed_file_misses() {
+        let mut f = fixture();
+        let target = SymbolId::of("api/target.ex", "run");
+        let caller = SymbolId::of("api/caller.ex", "call_it");
+        let hashes: HashMap<String, String> = [("api/target.ex".to_owned(), "hash-v1".to_owned())]
+            .into_iter()
+            .collect();
+        let cached: HashMap<String, Vec<store::VerifiedCall>> = [(
+            "hash-v1".to_owned(),
+            vec![store::VerifiedCall {
+                src: caller,
+                dst: target,
+                verdict: store::Verdict::Confirmed,
+            }],
+        )]
+        .into_iter()
+        .collect();
+
+        let registry = lang::registry();
+        let plan = Plan {
+            focus: BTreeSet::new(),
+            roots: &[],
+            budget: Duration::from_secs(1),
+            on_denial: OnDenial::Report,
+            hashes: &hashes,
+            cached: &cached,
+        };
+        let pass = Pass {
+            graph: &f.graph,
+            root: Path::new("/repo"),
+            cov: elixir_coverage(&registry),
+            index: &f.index,
+            plan: &plan,
+        };
+
+        let hit = pass.cached_for("api/target.ex").expect("cache hit");
+        replay(&pass, hit, &mut f.out);
+        assert_eq!(f.out.confirmed, 1);
+        let e = &f.out.edges[0];
+        assert_eq!(e.confidence, CONF_VERIFIED);
+        assert_eq!(e.source, EdgeSource::LspVerified);
+
+        // the file changed: its new hash is not a key anyone recorded
+        let moved: HashMap<String, String> = [("api/target.ex".to_owned(), "hash-v2".to_owned())]
+            .into_iter()
+            .collect();
+        let plan2 = Plan {
+            focus: BTreeSet::new(),
+            roots: &[],
+            budget: Duration::from_secs(1),
+            on_denial: OnDenial::Report,
+            hashes: &moved,
+            cached: &cached,
+        };
+        let pass2 = Pass {
+            graph: &f.graph,
+            root: Path::new("/repo"),
+            cov: elixir_coverage(&registry),
+            index: &f.index,
+            plan: &plan2,
+        };
+        assert!(
+            pass2.cached_for("api/target.ex").is_none(),
+            "an edited file must be re-asked, not replayed"
+        );
     }
 
     #[test]
