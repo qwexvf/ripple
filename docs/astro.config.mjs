@@ -10,6 +10,12 @@ import rehypeAutolinkHeadings from 'rehype-autolink-headings';
 import { remarkAlert } from 'remark-github-blockquote-alert';
 import { remarkMdLinks, remarkHeadingIds } from './src/plugins/remark-md-links.mjs';
 
+// Astro 7 renders markdown with Sätteri by default. We stay on the remark/rehype
+// pipeline because remarkAlert is third-party and our two plugins are remark —
+// porting all three to MDAST/HAST buys nothing here. Deprecated in Astro 8's terms
+// only if we keep the old top-level plugin keys; `unified()` is the supported form.
+import { unified } from '@astrojs/markdown-remark';
+
 // https://astro.build/config
 export default defineConfig({
   site: 'https://qwexvf.github.io/ripple',
@@ -25,17 +31,19 @@ export default defineConfig({
       defaultColor: false,
       wrap: true,
     },
-    remarkPlugins: [remarkAlert, remarkMdLinks, remarkHeadingIds],
-    rehypePlugins: [
-      rehypeSlug,
-      [
-        rehypeAutolinkHeadings,
-        {
-          behavior: 'append',
-          properties: { className: ['heading-anchor'], 'aria-label': 'Link to this section' },
-          content: { type: 'text', value: '#' },
-        },
+    processor: unified({
+      remarkPlugins: [remarkAlert, remarkMdLinks, remarkHeadingIds],
+      rehypePlugins: [
+        rehypeSlug,
+        [
+          rehypeAutolinkHeadings,
+          {
+            behavior: 'append',
+            properties: { className: ['heading-anchor'], 'aria-label': 'Link to this section' },
+            content: { type: 'text', value: '#' },
+          },
+        ],
       ],
-    ],
+    }),
   },
 });
