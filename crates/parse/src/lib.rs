@@ -79,6 +79,9 @@ pub struct RefRec {
 pub struct BindRec {
     pub name: String,
     pub type_name: String,
+    /// Where the binding is declared. Two functions routinely bind the same name to
+    /// different types, and a file-wide map answered whichever came last.
+    pub site: Span,
 }
 
 /// A symbol this file passes through from another one: `export { a } from "./x"`,
@@ -463,16 +466,24 @@ fn extract_bindings(tree: &Tree, query: &Query, src: &[u8]) -> Result<Vec<BindRe
         }
         let mut name = None;
         let mut ty = None;
+        let mut site = None;
         for cap in m.captures {
             let text = cap.node.utf8_text(src).unwrap_or("").to_owned();
             match names[cap.index as usize] {
-                "bind.name" => name = Some(text),
+                "bind.name" => {
+                    site = Some(span_of(cap.node));
+                    name = Some(text);
+                }
                 "bind.ctor" | "bind.type" => ty = Some(text),
                 _ => {}
             }
         }
-        if let (Some(name), Some(type_name)) = (name, ty) {
-            out.push(BindRec { name, type_name });
+        if let (Some(name), Some(type_name), Some(site)) = (name, ty, site) {
+            out.push(BindRec {
+                name,
+                type_name,
+                site,
+            });
         }
     }
     Ok(out)

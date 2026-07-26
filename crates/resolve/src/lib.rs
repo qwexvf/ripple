@@ -527,13 +527,7 @@ fn resolve_calls(
     modules: &HashMap<String, PathBuf>,
     edges: &mut Vec<Edge>,
 ) {
-    // local identifier → class-name map (M2 approximation: file-wide, last wins)
-    let type_map: HashMap<&str, &str> = f
-        .extract
-        .bindings
-        .iter()
-        .map(|b| (b.name.as_str(), b.type_name.as_str()))
-        .collect();
+    let types = Bindings::new(&f.extract.bindings);
 
     let empty = HashMap::new();
     let local = idx.file_defs.get(&f.canonical).unwrap_or(&empty);
@@ -588,7 +582,13 @@ fn resolve_calls(
                         None => (Vec::new(), CONF_KNOWN_RECEIVER),
                     }
                 } else {
-                    resolve_member(&r.name, r.receiver.as_ref(), enclosing, &type_map, idx)
+                    resolve_member(
+                        &r.name,
+                        r.receiver.as_ref(),
+                        enclosing,
+                        &types.at(r.site, enclosing, &defs_by_start),
+                        idx,
+                    )
                 }
             }
         };
@@ -715,6 +715,58 @@ fn resolve_member(
             None => (candidates(), CONF_CANDIDATE),
         },
         _ => (candidates(), CONF_CANDIDATE),
+    }
+}
+
+/// A file's identifier → type bindings, answered by position rather than file-wide.
+///
+/// `type_map` used to be one flat map per file, last declaration wins. Two functions
+/// binding the same name to different types is ordinary code (`const client = new
+/// AdminClient()` in one, `new UserClient()` in the next), and the flat map sent every
+/// `client.foo()` in the file to whichever came last.
+struct Bindings<'a> {
+    /// sorted by declaration position, so the nearest preceding one is findable
+    by_site: Vec<&'a parse::BindRec>,
+}
+
+impl<'a> Bindings<'a> {
+    fn new(records: &'a [parse::BindRec]) -> Bindings<'a> {
+        let mut by_site: Vec<&parse::BindRec> = records.iter().collect();
+        by_site.sort_by_key(|b| (b.site.start_line, b.site.start_col));
+        Bindings { by_site }
+    }
+
+    /// The bindings visible at `site`: those declared inside the enclosing definition
+    /// before it, plus file-level ones outside every definition.
+    ///
+    /// Nearest-preceding wins, which is the closest thing to scope that spans alone can
+    /// express — no language knowledge, and shadowing inside a block resolves the same
+    /// way a reader would resolve it.
+    /// `defs` is the file's definitions, so a binding inside *another* function can be
+    /// told apart from one at module level — otherwise one function's local leaks into
+    /// another's calls, which is the bug this replaces.
+    fn at(
+        &self,
+        site: Span,
+        enclosing: Option<&Node>,
+        defs: &[&Node],
+    ) -> HashMap<&'a str, &'a str> {
+        let mut out: HashMap<&str, &str> = HashMap::new();
+        for b in &self.by_site {
+            if (b.site.start_line, b.site.start_col) > (site.start_line, site.start_col) {
+                break; // sorted: nothing further can precede the reference
+            }
+            let line = b.site.start_line;
+            let visible = match enclosing {
+                // inside the same definition, or at module level (inside none)
+                Some(d) => d.contains_line(line) || !defs.iter().any(|x| x.contains_line(line)),
+                None => !defs.iter().any(|x| x.contains_line(line)),
+            };
+            if visible {
+                out.insert(b.name.as_str(), b.type_name.as_str());
+            }
+        }
+        out
     }
 }
 

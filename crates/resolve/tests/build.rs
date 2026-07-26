@@ -604,3 +604,56 @@ fn an_aliased_and_a_namespace_import_both_resolve() {
         ns.confidence
     );
 }
+
+/// Two functions binding the same name to different types is ordinary code, and a
+/// file-wide type map sent every `client.send()` to whichever binding came last
+/// (issue #2). Visibility is decided by position: the binding inside the calling
+/// definition wins, module-level bindings stay visible, another function's local does
+/// not leak.
+#[test]
+fn a_binding_is_scoped_to_the_function_that_declares_it() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/scope");
+    let r = resolve::build(&root).unwrap();
+
+    let as_admin = SymbolId::of("callers.ts", "asAdmin");
+    let as_user = SymbolId::of("callers.ts", "asUser");
+    let admin_send = SymbolId::of("clients.ts", "AdminClient.send");
+    let user_send = SymbolId::of("clients.ts", "UserClient.send");
+
+    let targets = |src: SymbolId| -> Vec<SymbolId> {
+        r.edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Calls && e.src == src)
+            .map(|e| e.dst)
+            .collect()
+    };
+    assert_eq!(
+        targets(as_admin),
+        vec![admin_send],
+        "asAdmin's client is an AdminClient"
+    );
+    assert_eq!(
+        targets(as_user),
+        vec![user_send],
+        "asUser's client is a UserClient — not whichever binding was declared last"
+    );
+
+    // `unbound` declares no `client`, and another function's local must not leak in:
+    // with no type to go on this falls back to by-name candidates, split 1/N
+    let unbound = SymbolId::of("callers.ts", "unbound");
+    let mut got = targets(unbound);
+    got.sort_by_key(|id| id.0);
+    let mut both = vec![admin_send, user_send];
+    both.sort_by_key(|id| id.0);
+    assert_eq!(got, both, "an unbound receiver is ambiguous, not confident");
+    let conf = r
+        .edges
+        .iter()
+        .find(|e| e.kind == EdgeKind::Calls && e.src == unbound)
+        .map(|e| e.confidence)
+        .expect("edge");
+    assert!(
+        conf < 0.5,
+        "two equally plausible targets must split confidence, got {conf}"
+    );
+}
