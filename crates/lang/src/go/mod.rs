@@ -72,9 +72,6 @@ fn name_of<'a>(def: Node, src: &'a [u8]) -> Option<&'a str> {
 
 /// `type`/`const`/`var` declarations hold their name one level down, on the spec.
 fn first_spec_name(def: Node) -> Option<Node> {
-    if let Some(name) = def.child_by_field_name("name") {
-        return Some(name);
-    }
     let mut c = def.walk();
     let found = def
         .children(&mut c)

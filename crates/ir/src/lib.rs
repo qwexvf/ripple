@@ -231,9 +231,9 @@ fn segments_match(producer: &[Segment], consumer: &[Segment]) -> bool {
         (Some(a), Some(b)) => {
             let head_ok = match (a, b) {
                 (Segment::Literal(x), Segment::Literal(y)) => x == y,
-                // Param on either side matches exactly one segment
-                (Segment::Param, _) | (_, Segment::Param) => true,
-                _ => unreachable!("wildcard handled above"),
+                // whatever is left pairs a `Param` with one segment, which matches;
+                // `Wildcard` never reaches here, the arm above consumed it
+                _ => true,
             };
             head_ok && segments_match(&producer[1..], &consumer[1..])
         }
