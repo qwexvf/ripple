@@ -7,8 +7,14 @@
 //! missing or slow server changes freshness, never latency.
 //!
 //! Reconciliation follows the table in docs/11 with one measured deviation:
-//! confirmed → 1.0, server-only → added at 1.0, unreachable → untouched, and a
-//! contradiction is *reported* rather than acted on unless asked (see `OnDenial`).
+//! confirmed → 1.0, server-only → added at `CONF_SERVER_ONLY`, unreachable →
+//! untouched, and a contradiction is *reported* rather than acted on unless asked
+//! (see `OnDenial`).
+//!
+//! `index --calls lsp` reuses the same pass as a *producer* for languages that have
+//! no refs query, where a server is the only possible source of a call edge — same
+//! reconciliation, whole-root focus, run once at index time. See
+//! `server_sourced_files`.
 
 use ir::{Edge, EdgeKind, EdgeSource, SymbolId};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -86,6 +92,9 @@ pub struct Outcome {
     /// Symbols the server could not resolve a call-hierarchy item for — neither
     /// confirmation nor denial, so nothing is changed for them.
     pub unresolved: usize,
+    /// Server symbols that matched several of ours by bare name with nothing to
+    /// choose between them (two methods of the same name in one file). Dropped.
+    pub ambiguous: usize,
     /// A few `target ← caller` pairs the server denied, so a floored edge can be
     /// checked by hand instead of taken on faith.
     pub contradicted_examples: Vec<String>,
@@ -213,6 +222,12 @@ impl Outcome {
                 self.unresolved
             ));
         }
+        if self.ambiguous > 0 {
+            s.push_str(&format!(
+                "\n  {} server symbols matched several of ours by name — dropped, not guessed",
+                self.ambiguous
+            ));
+        }
         s
     }
 }
@@ -224,6 +239,49 @@ fn sample(files: &[String]) -> String {
     } else {
         head.join(", ")
     }
+}
+
+/// Which of our symbols a server's `documentSymbol` entry is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Target {
+    One(SymbolId),
+    /// No node of that name in that file — the server indexes something we don't.
+    Unknown,
+    /// Several nodes share the bare name and nothing distinguishes them. Dropped
+    /// rather than guessed.
+    Ambiguous,
+}
+
+/// Match a server's symbol to one of ours, by qualified name where both sides
+/// spell one, and by bare name only where that is unambiguous.
+///
+/// Bare name alone is wrong whenever a file defines the same name twice on
+/// different receivers or classes: fzf has 7 such Go files (9 `String` methods
+/// across the repo), and picking the first match hands every caller of one to the
+/// other. Two candidates and no way to choose is exactly the case invariant 5
+/// covers — emit nothing rather than a fabricated single edge.
+pub fn target_for(graph: &InMemoryGraph, module: &str, server_name: &str) -> Target {
+    let nodes = graph.nodes_in_file(module);
+    let qualified = qualified_spelling(server_name);
+    if let Some(n) = nodes.iter().find(|n| n.qualified_name == qualified) {
+        return Target::One(n.id);
+    }
+    let bare = bare_name(server_name);
+    let mut hits = nodes.iter().filter(|n| n.name == bare);
+    let Some(first) = hits.next() else {
+        return Target::Unknown;
+    };
+    if hits.next().is_some() {
+        return Target::Ambiguous;
+    }
+    Target::One(first.id)
+}
+
+/// A server's own qualification, in the spelling ripple stores: gopls says
+/// `(*Terminal).Loop` for what the Go adapter calls `Terminal.Loop`.
+fn qualified_spelling(server_name: &str) -> String {
+    let no_arity = server_name.split('/').next().unwrap_or(server_name).trim();
+    no_arity.replace(['(', ')', '*', '&'], "")
 }
 
 /// Reduce a server's symbol name to the bare function name ripple stores.
@@ -243,6 +301,30 @@ pub fn bare_name(name: &str) -> &str {
 /// and asking for their callers is meaningless.
 pub fn is_callable_name(name: &str) -> bool {
     !name.is_empty() && !name.contains(char::is_whitespace)
+}
+
+/// Every indexed file whose language has no refs query, so tree-sitter cannot
+/// produce a call edge for it and a server is the only possible source.
+///
+/// This is the other end of `focus_files`. A query verifies a neighborhood because
+/// there is already a graph to walk; a Tier-0 language has none, so one hop off
+/// zero edges reaches nothing and the pass has to be whole-root and run at index
+/// time instead. Selection is by adapter capability, never by language name — a
+/// language that later grows a `refs.scm` drops out of here on its own.
+pub fn server_sourced_files(graph: &InMemoryGraph) -> BTreeSet<String> {
+    let registry = lang::registry();
+    let mut out = BTreeSet::new();
+    for node in graph.nodes() {
+        if out.contains(&node.module_path) {
+            continue;
+        }
+        let tier_zero = lang::adapter_for(&registry, Path::new(&node.module_path))
+            .is_some_and(|a| a.refs_query().is_none());
+        if tier_zero {
+            out.insert(node.module_path.clone());
+        }
+    }
+    out
 }
 
 /// The files worth verifying for a query: the seeds' own files plus the files of
@@ -436,19 +518,17 @@ fn verify_file(pass: &Pass, client: &mut lsp::Client, module: &str, out: &mut Ou
     let mut claims: std::collections::BTreeMap<SymbolId, (bool, HashSet<SymbolId>)> =
         std::collections::BTreeMap::new();
     for sym in symbols {
-        let name = bare_name(&sym.name).to_owned();
-        if !is_callable_name(&name) {
+        if !is_callable_name(bare_name(&sym.name)) {
             continue;
         }
-        let Some(target) = pass
-            .graph
-            .nodes_in_file(module)
-            .into_iter()
-            .find(|n| n.name == name)
-        else {
-            continue; // the server sees a symbol ripple has no node for
+        let target_id = match target_for(pass.graph, module, &sym.name) {
+            Target::One(id) => id,
+            Target::Unknown => continue, // the server sees a symbol ripple has no node for
+            Target::Ambiguous => {
+                out.ambiguous += 1;
+                continue;
+            }
         };
-        let target_id = target.id;
         let entry = claims.entry(target_id).or_default();
         let Ok(Some(sites)) = client.incoming_calls(&abs, sym.line, sym.character) else {
             continue; // this clause is unresolvable; another may not be
@@ -680,6 +760,18 @@ mod tests {
             extra_spans: Vec::new(),
             is_exported: true,
             risk: ir::RiskScores::default(),
+        }
+    }
+
+    /// A node whose bare and qualified names differ, the way a Go method's do.
+    fn method(module: &str, receiver: &str, name: &str) -> Node {
+        let qualified = format!("{receiver}.{name}");
+        Node {
+            id: SymbolId::of(module, &qualified),
+            kind: NodeKind::Method,
+            name: name.to_owned(),
+            qualified_name: qualified,
+            ..node(module, name)
         }
     }
 
@@ -1075,5 +1167,57 @@ mod tests {
         );
         assert!(!is_callable_name("schema players"));
         assert!(is_callable_name("changeset"));
+    }
+
+    /// gopls spells a method `(*Terminal).Loop`; the Go adapter stores
+    /// `Terminal.Loop`. Same symbol, and the receiver is what tells two
+    /// same-named methods apart.
+    #[test]
+    fn a_qualified_server_name_picks_the_right_receiver() {
+        let loop_a = method("src/tui.go", "Terminal", "Loop");
+        let loop_b = method("src/tui.go", "Reader", "Loop");
+        let graph = InMemoryGraph::from_parts(vec![loop_a.clone(), loop_b.clone()], vec![]);
+        assert_eq!(
+            target_for(&graph, "src/tui.go", "(*Terminal).Loop"),
+            Target::One(loop_a.id)
+        );
+        assert_eq!(
+            target_for(&graph, "src/tui.go", "Reader.Loop"),
+            Target::One(loop_b.id)
+        );
+    }
+
+    /// Without a receiver there is nothing to choose with, and picking the first
+    /// match hands every caller of one method to the other.
+    #[test]
+    fn a_bare_name_matching_two_symbols_is_dropped_not_guessed() {
+        let graph = InMemoryGraph::from_parts(
+            vec![
+                method("src/tui.go", "Terminal", "String"),
+                method("src/tui.go", "Reader", "String"),
+            ],
+            vec![],
+        );
+        assert_eq!(
+            target_for(&graph, "src/tui.go", "String"),
+            Target::Ambiguous
+        );
+    }
+
+    /// The Elixir path must keep working: dexter's fully-qualified
+    /// `Mod.Sub.get_player/1` matches no stored qualified name, so it falls back to
+    /// the bare name — which is unique, because clauses collapse into one node.
+    #[test]
+    fn an_unambiguous_bare_name_still_matches() {
+        let target = node("api/players.ex", "get_player");
+        let graph = InMemoryGraph::from_parts(vec![target.clone()], vec![]);
+        assert_eq!(
+            target_for(&graph, "api/players.ex", "FiveNoobs.Players.get_player/1"),
+            Target::One(target.id)
+        );
+        assert_eq!(
+            target_for(&graph, "api/players.ex", "missing"),
+            Target::Unknown
+        );
     }
 }

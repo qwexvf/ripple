@@ -33,7 +33,7 @@ fn main() -> Result<()> {
     }
 }
 
-const USAGE: &str = "usage:\n  ripple parse <file> [--json]\n  ripple index <path>...\n  ripple neighbors <symbol> [--in|--out] [--depth N] [--in-file <substr>] [--root <path>] [--json]\n  ripple impact <symbol>... [--budget N] [--root <path>] [--json] [--verify lsp]\n  ripple review [<base>] [--budget N] [--root <path>] [--json] [--verify lsp]\n    --verify lsp [--verify-budget 2s] [--floor-contradicted|--drop-contradicted]  (upgrade call edges from a language server)\n  ripple path <from> <to> [--depth 6] [--limit 3] [--root <path>] [--json]   (how does A reach B?)\n  ripple risk <symbol|file> [--root <path>] [--json]\n  ripple mcp [--root <path>]   (MCP server over stdio for AI agents)\n  ripple lsp doctor [--root <path>] [--budget 10s] [--json]   (are language servers usable here?)";
+const USAGE: &str = "usage:\n  ripple parse <file> [--json]\n  ripple index <path>... [--calls lsp [--calls-budget 120s]]   (--calls lsp: call edges from a language server, for languages with no refs query)\n  ripple neighbors <symbol> [--in|--out] [--depth N] [--in-file <substr>] [--root <path>] [--json]\n  ripple impact <symbol>... [--budget N] [--root <path>] [--json] [--verify lsp]\n  ripple review [<base>] [--budget N] [--root <path>] [--json] [--verify lsp]\n    --verify lsp [--verify-budget 2s] [--floor-contradicted|--drop-contradicted]  (upgrade call edges from a language server)\n  ripple path <from> <to> [--depth 6] [--limit 3] [--root <path>] [--json]   (how does A reach B?)\n  ripple risk <symbol|file> [--root <path>] [--json]\n  ripple mcp [--root <path>]   (MCP server over stdio for AI agents)\n  ripple lsp doctor [--root <path>] [--budget 10s] [--json]   (are language servers usable here?)";
 
 fn db_path(root: &Path) -> PathBuf {
     root.join(".ripple").join("graph.redb")
@@ -60,6 +60,8 @@ const VALUE_FLAGS: &[&str] = &[
     "--granularity",
     "--verify",
     "--verify-budget",
+    "--calls",
+    "--calls-budget",
     "--weights",
     "--in-file",
     "--skip",
@@ -130,13 +132,21 @@ fn cmd_index(args: &[String]) -> Result<()> {
             r
         }
     };
-    println!("{}", index_project(&roots)?);
+    let calls = match flag_value(args, "--calls") {
+        None => None,
+        Some("lsp") => Some(
+            parse_duration(flag_value(args, "--calls-budget"))
+                .unwrap_or_else(|| std::time::Duration::from_secs(120)),
+        ),
+        Some(other) => bail!("--calls takes lsp, not {other}"),
+    };
+    println!("{}", index_project(&roots, calls)?);
     Ok(())
 }
 
 /// Build the graph for `roots` (parse + git overlay + cross-service) and persist
 /// it. Returns a one-line summary. Shared by `index` and the MCP `reindex` tool.
-fn index_project(roots: &[PathBuf]) -> Result<String> {
+fn index_project(roots: &[PathBuf], lsp_calls: Option<std::time::Duration>) -> Result<String> {
     let mut store = RedbStore::open(db_path(&roots[0])); // db + cache live under root[0]
 
     let cached = store.read_extracts()?;
@@ -181,14 +191,81 @@ fn index_project(roots: &[PathBuf]) -> Result<String> {
     // extract cache and the roots describing different indexes
     store.write_index(&nodes, &edges, &indexed.files, &indexed.roots)?;
 
+    let edge_count = edges.len();
+    let calls_report = match lsp_calls {
+        Some(budget) => Some(lsp_calls_pass(&mut store, &nodes, edges, budget)?),
+        None => None,
+    };
+
     let s = indexed.stats;
-    Ok(format!(
+    let mut summary = format!(
         "indexed {} files across {} root(s) ({} added, {} changed, {} unchanged, {} removed) → {} nodes, {} edges ({} co-change, {} graphql, {} db, {} imported, {} file-granular, {} repeated, {} with dependents) ({})",
         indexed.result.files_indexed, indexed.roots.len(),
         s.added, s.changed, s.unchanged, s.removed,
-        nodes.len(), edges.len(), cochange_applied, graphql, db, imported, file_granular, repeated, with_dependents,
+        nodes.len(), edge_count, cochange_applied, graphql, db, imported, file_granular, repeated, with_dependents,
         db_path(&roots[0]).display()
-    ))
+    );
+    if let Some(report) = calls_report {
+        summary.push('\n');
+        summary.push_str(&report);
+    }
+    Ok(summary)
+}
+
+/// `index --calls lsp`: ask each root's language server for the call edges of
+/// files whose language has no refs query, and persist what comes back.
+///
+/// This is the producer half of docs/11 — everywhere else a server only *grades*
+/// edges tree-sitter already found. A Tier-0 language has none to grade, so the
+/// pass runs over the whole root at index time rather than over a query's
+/// neighborhood, and its answers are stored with `EdgeSource::LspVerified` at the
+/// server-only confidence. Storing them is what keeps queries deterministic: the
+/// graph a later query reads is a fact on disk, not a re-derivation from a server
+/// whose answer moves with its version.
+fn lsp_calls_pass(
+    store: &mut RedbStore,
+    nodes: &[ir::Node],
+    edges: Vec<ir::Edge>,
+    budget: std::time::Duration,
+) -> Result<String> {
+    let graph = InMemoryGraph::from_parts(nodes.to_vec(), edges);
+    let focus = verify::server_sourced_files(&graph);
+    if focus.is_empty() {
+        return Ok(
+            "calls lsp: no tier-0 files in this index — nothing a server is the only source for"
+                .to_owned(),
+        );
+    }
+    let roots = store.read_roots()?;
+    let hashes: std::collections::HashMap<String, String> = store
+        .read_extracts()?
+        .into_iter()
+        .map(|(module, f)| (module, f.hash))
+        .collect();
+    let cached = store.read_verified()?;
+    let plan = verify::Plan {
+        focus,
+        roots: &roots,
+        budget,
+        hashes: &hashes,
+        cached: &cached,
+        // nothing to contradict: a Tier-0 file has no extracted edge for the server
+        // to disagree with, so silence can only mean "no callers"
+        on_denial: verify::OnDenial::Report,
+    };
+    let outcome = verify::run(&graph, &plan);
+    let report = outcome.summary();
+    if !outcome.learned.is_empty() {
+        store
+            .write_verified(&outcome.learned)
+            .context("persisting verified verdicts")?;
+    }
+    if outcome.changed() {
+        store
+            .write(nodes, &outcome.edges)
+            .context("persisting server-sourced call edges")?;
+    }
+    Ok(report)
 }
 
 /// The tag `index` used for `root`, so a filesystem path can be turned into the
@@ -1412,7 +1489,7 @@ fn cmd_mcp(args: &[String]) -> Result<()> {
     let root: PathBuf = flag_value(args, "--root").map_or_else(|| ".".into(), PathBuf::from);
     // index-if-missing so an agent can point at a repo that was never indexed
     if !db_path(&root).exists() {
-        index_project(std::slice::from_ref(&root))?;
+        index_project(std::slice::from_ref(&root), None)?;
     }
     let mut graph = RedbStore::open(db_path(&root)).load()?;
 
@@ -1542,7 +1619,7 @@ fn mcp_call(
 
     match name {
         "reindex" => {
-            let summary = index_project(std::slice::from_ref(&root.to_path_buf()))
+            let summary = index_project(std::slice::from_ref(&root.to_path_buf()), None)
                 .map_err(|e| e.to_string())?;
             *graph = RedbStore::open(db_path(root))
                 .load()
