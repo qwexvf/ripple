@@ -206,8 +206,43 @@ Built-in defaults cover `elixir` (dexter), `typescript`, `go`, `python`, and
    and a root with no usable server says so and answers unchanged.
    Still to add: the content-hash cache, so a stable file is verified once per
    version rather than once per query.
-4. **Breadth proof.** Add Go or Python with `tags.scm` only and all call edges
-   from the server; measure the cost of "adding a language".
+4. **Breadth proof.** ✅ **done.** Go, added with `tags.scm` and nothing else, all
+   call edges from `gopls` via `ripple index --calls lsp [--calls-budget 120s]`.
+
+   The pass is the phase-3 one, reused as a *producer*: a language with no refs
+   query has no edges to grade, and one hop off zero edges reaches nothing, so the
+   focus set is whole-root and it runs at index time instead of per query. Files
+   are selected by adapter capability (`refs_query().is_none()`), never by language
+   name — a language that later grows a `refs.scm` drops out on its own.
+
+   On fzf (81 Go files, gopls, cold index):
+
+   | | |
+   |---|---|
+   | call edges | **2008**, all `LspVerified` @ 0.7 |
+   | cold / warm | 12s / **0.33s** (verdict cache, no server contacted) |
+   | unresolved | 640 — 637 of them package-level `var`/`const`, which have no call hierarchy. Every one of the 920 funcs/methods resolved. |
+   | hand-checked | 5/5 real, including `terminal.go:Name → actiontype_string.go:String`, a cross-file call through a receiver type that a `refs.scm` could not resolve without type inference |
+
+   **Cost of adding the language: 4 touchpoints** — `crates/lang/src/go/` (a module
+   + `tags.scm`), one `registry()` line, and a `Cargo.toml` dependency. Nothing
+   above `ir` changed. The invariant-2 claim of "a module + `.scm` + a registry
+   line" is accurate modulo the grammar dependency.
+
+   **What the run cost us in correctness, which is the more useful number.** It
+   exposed a bug in the shared pass, not in Go: a server's symbol was matched to
+   ours by *bare* name, so a file defining two same-named methods on different
+   receivers handed every caller of one to the other. fzf has 7 such files and 9
+   `String` methods. gopls spells them `(*Terminal).String`, so matching the
+   qualified name first fixes it (2003 → 2008 edges, and the ones that moved
+   matter more than the five that appeared); where two candidates remain
+   indistinguishable the symbol is dropped and counted rather than guessed, per
+   invariant 5. TypeScript classes have the same shape, so this was never a
+   Go-only defect — it just took a Go corpus to see it.
+
+   Determinism note: queries stay deterministic because the edges are persisted
+   with a `source`, but the *index* now varies with the server's version when
+   `--calls lsp` is passed. Phase 3 confined that risk to query time.
 
 ## What this does not fix
 

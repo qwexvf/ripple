@@ -8,7 +8,7 @@ sidebar:
 
 ```
 ripple parse <file> [--json]
-ripple index <path>...
+ripple index <path>... [--calls lsp [--calls-budget 120s]]
 ripple neighbors <symbol> [--in|--out] [--depth N] [--root <path>] [--json]
 ripple impact <symbol>... [--budget N] [--root <path>] [--json] [--verify lsp]
 ripple review [<base>] [--budget N] [--root <path>] [--json] [--verify lsp]
@@ -42,6 +42,19 @@ line reports added / changed / unchanged / removed alongside the node and edge c
 
 There is no watcher and no staleness check. After you edit code, re-index — otherwise
 every other command answers from the old graph without warning.
+
+### `--calls lsp`
+
+Ask each root's language server for the call edges of files whose language has **no
+`refs.scm`** — where a server is the only possible source. Everywhere else LSP only grades
+edges ripple already extracted (`impact --verify lsp`); here it produces them, at
+confidence 0.7 with `source: LspVerified`.
+
+Go is the language this exists for today. Without the flag a Go index has symbols and
+co-change but no call graph; with it, `impact` answers. `--calls-budget` caps the whole
+pass (default 120s) and any file it could not reach is named in the report. Verdicts are
+cached by file content hash, so a re-index of unchanged files contacts no server —
+measured 12s cold, 0.33s warm on 81 files.
 
 ## `ripple impact <symbol>...`
 
