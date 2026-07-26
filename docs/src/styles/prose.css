@@ -1,0 +1,353 @@
+/* Styles for rendered markdown bodies (`.prose-docs` in DocsLayout).
+   Tailwind's preflight strips every default, so everything a doc can contain
+   has to be declared here. Colours come from the tokens in globals.css, so
+   light/dark follow the theme automatically — except Shiki, which needs an
+   explicit dark selector (see the end of this file). */
+
+.prose-docs {
+  color: var(--color-fg);
+  font-size: 15px;
+  line-height: 1.7;
+}
+
+/* ── Rhythm ─────────────────────────────────────────────────────── */
+
+.prose-docs > * + * {
+  margin-top: 1.15em;
+}
+
+.prose-docs > * + :is(h2, h3, h4, h5, h6) {
+  margin-top: 2.4em;
+}
+
+.prose-docs > :first-child {
+  margin-top: 0;
+}
+
+/* ── Headings ───────────────────────────────────────────────────── */
+
+.prose-docs :is(h2, h3, h4, h5, h6) {
+  font-family: var(--font-display);
+  font-weight: 600;
+  line-height: 1.25;
+  letter-spacing: -0.01em;
+  color: var(--color-fg-strong);
+  scroll-margin-top: 5rem;
+}
+
+.prose-docs h2 {
+  font-size: 1.5rem;
+  padding-bottom: 0.35em;
+  border-bottom: 1px solid var(--color-rule);
+}
+
+.prose-docs h3 {
+  font-size: 1.2rem;
+}
+
+.prose-docs h4 {
+  font-size: 1.02rem;
+}
+
+.prose-docs :is(h5, h6) {
+  font-size: 0.95rem;
+  color: var(--color-fg);
+}
+
+/* The `#` appended by rehype-autolink-headings. Present for deep links,
+   but it shouldn't compete with the heading text. */
+/* The `#` is drawn here rather than injected as a text node, so it stays out
+   of the heading text Astro collects for the table of contents. */
+.prose-docs .heading-anchor {
+  margin-left: 0.4em;
+  font-weight: 400;
+  color: var(--color-fg-faint);
+  text-decoration: none;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+
+.prose-docs .heading-anchor::after {
+  content: "#";
+}
+
+.prose-docs :is(h2, h3, h4, h5, h6):hover .heading-anchor,
+.prose-docs .heading-anchor:focus-visible {
+  opacity: 1;
+}
+
+/* ── Inline ─────────────────────────────────────────────────────── */
+
+.prose-docs a {
+  color: var(--color-signal);
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.2em;
+  text-decoration-color: color-mix(in oklab, var(--color-signal) 35%, transparent);
+}
+
+.prose-docs a:hover {
+  text-decoration-color: var(--color-signal);
+}
+
+.prose-docs strong {
+  font-weight: 600;
+  color: var(--color-fg-strong);
+}
+
+.prose-docs em {
+  font-style: italic;
+}
+
+.prose-docs del {
+  color: var(--color-fg-mute);
+}
+
+.prose-docs :not(pre) > code {
+  font-family: var(--font-mono);
+  font-size: 0.86em;
+  padding: 0.15em 0.36em;
+  border-radius: 3px;
+  background: var(--color-bg-inline);
+  color: var(--color-fg-strong);
+  overflow-wrap: break-word;
+}
+
+.prose-docs a > code {
+  color: inherit;
+}
+
+.prose-docs kbd {
+  font-family: var(--font-mono);
+  font-size: 0.8em;
+  padding: 0.1em 0.4em;
+  border: 1px solid var(--color-rule-strong);
+  border-bottom-width: 2px;
+  border-radius: 3px;
+  background: var(--color-bg-elev);
+}
+
+/* ── Lists ──────────────────────────────────────────────────────── */
+
+.prose-docs :is(ul, ol) {
+  padding-left: 1.5em;
+}
+
+.prose-docs ul {
+  list-style: disc;
+}
+
+.prose-docs ul ul {
+  list-style: circle;
+}
+
+.prose-docs ol {
+  list-style: decimal;
+}
+
+.prose-docs li::marker {
+  color: var(--color-fg-faint);
+}
+
+.prose-docs li + li {
+  margin-top: 0.35em;
+}
+
+.prose-docs li > :is(ul, ol) {
+  margin-top: 0.35em;
+}
+
+.prose-docs li > p + p {
+  margin-top: 0.6em;
+}
+
+/* Task lists from GFM. */
+.prose-docs li:has(> input[type="checkbox"]) {
+  list-style: none;
+  margin-left: -1.3em;
+}
+
+.prose-docs input[type="checkbox"] {
+  margin-right: 0.5em;
+  accent-color: var(--color-signal);
+}
+
+/* ── Code blocks ────────────────────────────────────────────────── */
+
+.prose-docs pre {
+  position: relative;
+  padding: 0.9rem 1rem;
+  border: 1px solid var(--color-rule);
+  border-radius: 4px;
+  font-size: 0.84rem;
+  line-height: 1.6;
+  overflow-x: auto;
+}
+
+/* Injected per code block by the script in BaseLayout.astro. Without these
+   rules the button sits inline and its "copy" label runs into the code. */
+.prose-docs .code-copy-btn {
+  position: absolute;
+  top: 0.45rem;
+  right: 0.45rem;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35em;
+  padding: 0.2em 0.5em;
+  border: 1px solid var(--color-rule);
+  border-radius: 3px;
+  background: var(--color-bg-elev);
+  font-family: var(--font-mono);
+  font-size: 0.66rem;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--color-fg-faint);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+}
+
+.prose-docs pre:hover .code-copy-btn,
+.prose-docs .code-copy-btn:focus-visible,
+.prose-docs .code-copy-btn[data-copied="true"] {
+  opacity: 1;
+}
+
+.prose-docs .code-copy-btn:hover,
+.prose-docs .code-copy-btn[data-copied="true"] {
+  color: var(--color-signal);
+  border-color: var(--color-signal);
+}
+
+.prose-docs pre code {
+  font-family: var(--font-mono);
+  background: none;
+  padding: 0;
+  font-size: inherit;
+}
+
+/* ── Tables ─────────────────────────────────────────────────────── */
+
+/* Several docs carry very wide comparison tables, so the table scrolls
+   inside itself rather than pushing the page sideways. */
+.prose-docs table {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+  border-collapse: collapse;
+  font-size: 0.88rem;
+  line-height: 1.5;
+}
+
+.prose-docs :is(th, td) {
+  padding: 0.5em 0.85em;
+  border: 1px solid var(--color-rule);
+  text-align: left;
+  vertical-align: top;
+}
+
+.prose-docs th {
+  background: var(--color-bg-elev);
+  font-weight: 600;
+  color: var(--color-fg-strong);
+  white-space: nowrap;
+}
+
+.prose-docs tbody tr:nth-child(even) {
+  background: color-mix(in oklab, var(--color-bg-elev) 45%, transparent);
+}
+
+/* ── Blocks ─────────────────────────────────────────────────────── */
+
+.prose-docs blockquote {
+  padding: 0.15em 0 0.15em 1.1em;
+  border-left: 2px solid var(--color-rule-strong);
+  color: var(--color-fg-mute);
+}
+
+.prose-docs blockquote > * + * {
+  margin-top: 0.8em;
+}
+
+.prose-docs hr {
+  height: 0;
+  border: 0;
+  border-top: 1px solid var(--color-rule);
+  margin-block: 2.5em;
+}
+
+.prose-docs img {
+  max-width: 100%;
+  height: auto;
+  border-radius: 4px;
+}
+
+.prose-docs :is(sup, sub) {
+  font-size: 0.75em;
+}
+
+/* ── GitHub alerts (remark-github-blockquote-alert) ─────────────── */
+
+.prose-docs .markdown-alert {
+  padding: 0.8rem 1rem;
+  border-left: 3px solid var(--alert-accent, var(--color-rule-strong));
+  border-radius: 0 4px 4px 0;
+  background: color-mix(in oklab, var(--alert-accent, var(--color-fg-mute)) 7%, transparent);
+}
+
+.prose-docs .markdown-alert > * + * {
+  margin-top: 0.6em;
+}
+
+.prose-docs .markdown-alert-title {
+  display: flex;
+  align-items: center;
+  gap: 0.45em;
+  font-family: var(--font-display);
+  font-size: 0.78rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--alert-accent, var(--color-fg-mute));
+}
+
+.prose-docs .markdown-alert .octicon {
+  width: 1em;
+  height: 1em;
+  fill: currentColor;
+}
+
+.prose-docs .markdown-alert-note      { --alert-accent: var(--color-signal); }
+.prose-docs .markdown-alert-tip       { --alert-accent: var(--color-signal); }
+.prose-docs .markdown-alert-important { --alert-accent: var(--color-fg-mute); }
+.prose-docs .markdown-alert-warning   { --alert-accent: var(--color-danger); }
+.prose-docs .markdown-alert-caution   { --alert-accent: var(--color-danger); }
+
+/* ── Shiki dual theme ───────────────────────────────────────────── */
+
+/* astro.config sets `defaultColor: false`, so Shiki only emits --shiki-light
+   and --shiki-dark custom properties. Without these rules a code block has
+   no colours at all. */
+/* Colour only — the background stays the theme's, set once on the block
+   below. Painting `--shiki-*-bg` onto every span would tile Shiki's own
+   backdrop over each token. */
+.astro-code,
+.astro-code span {
+  color: var(--shiki-light);
+  font-style: var(--shiki-light-font-style);
+  font-weight: var(--shiki-light-font-weight);
+  text-decoration: var(--shiki-light-text-decoration);
+}
+
+:is(.dark, [data-theme="dark"]) .astro-code,
+:is(.dark, [data-theme="dark"]) .astro-code span {
+  color: var(--shiki-dark);
+  font-style: var(--shiki-dark-font-style);
+  font-weight: var(--shiki-dark-font-weight);
+  text-decoration: var(--shiki-dark-text-decoration);
+}
+
+/* Shiki writes its own theme background as an inline style on the block. */
+.prose-docs .astro-code {
+  background-color: var(--color-bg-code) !important;
+}

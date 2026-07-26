@@ -40,7 +40,9 @@ export default defineConfig({
           {
             behavior: 'append',
             properties: { className: ['heading-anchor'], 'aria-label': 'Link to this section' },
-            content: { type: 'text', value: '#' },
+            // The visible `#` is a CSS ::after in prose.css — as a text node it
+            // ends up in the heading text Astro collects for the ToC.
+            content: [],
           },
         ],
       ],
