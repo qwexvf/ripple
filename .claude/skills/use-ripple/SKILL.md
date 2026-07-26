@@ -18,8 +18,8 @@ Last measured 2026-07-25 on the 5noobs stack (web + api). A count that moves wit
 an explanation is the cheapest bug signal this project has, so re-measure and diff:
 
 ```
-1153 files → 9179 nodes, 20100 edges
-  (2461 co-change, 825 graphql, 941 db, 134 imported, 1634 file-granular, 4452 with dependents)
+1153 files → 9179 nodes, 20316 edges
+  (2569 co-change, 825 graphql, 941 db, 134 imported, 1634 file-granular, 4471 with dependents)
   ↑ +4313 edges on 2026-07-25/26. TS side: .tsx uses the TSX grammar, JSX rendering is
     a call, `export { X }` lists count as exports, barrels (`export * from`) are followed,
     aliased/namespace imports resolve. GraphQL side: nested selections descend the type
@@ -27,10 +27,9 @@ an explanation is the cheapest bug signal this project has, so re-measure and di
     expand (343 → 825 graphql edges)
 cold index ~1.6s, warm ~0.8s
 eval (5noobs-web, held out — co-change mined only from commits older than the test window):
-  --commits 50  (500 train, 2078 pairs): static 7.1% | co-change 3.4% | fused 10.5%
-  --commits 300 (148 train, 4188 pairs): static 6.5% | co-change 1.3% | fused  7.8%
-  ↑ prefer the 50 line: a 300-commit test window leaves only 148 training commits
-    (15 trained pairs), so co-change is starved, not wrong
+  --commits 50 (503 train, 2078 pairs): static 11.8% | co-change 3.7% | fused 15.1%
+  ↑ was static 7.1% / fused 10.5% before 2026-07-26's extraction work; a 300-commit
+    test window starves co-change (15 trained pairs), so quote the 50 line
 eval --oracle lsp vs dexter 0.7.1, 40 files (compare by position, state granularity):
   elixir  --granularity function: 165/165 (100.0%) | 0 ripple-only | 0 server-only
   elixir  --granularity file    : 153/165 (92.7%)  | 44 ripple-only | 0 server-only
@@ -119,8 +118,10 @@ eval [--commits N] [--root P]        # static vs co-change recall on N held-out 
 - `impact` seeds by name and ranks by confidence-weighted diffusion; `neighbors` is
   a raw traversal. Use `impact` to decide, `neighbors` to understand.
 - `risk` fuses churn / bug-density / ownership from git with structural fan-out.
-  `eval --risk` measures whether it ranks the files a held-out fix later touched
-  (lift 1.50× over base rate; `bug_density` alone is 0.83× — at or below random).
+  `eval --risk` measures whether it ranks the files a held-out fix later touched. Latest:
+  ownership 2.09× / fanout 1.95× / churn 1.22× / bug_density 0.79× / **composite 0.94×**.
+  The blend is worse than three of its four inputs — its heaviest weights sit on its
+  weakest terms (#19). Read `risk`'s composite ordering as unreliable for now.
 - `path` enumerates routes A→B along dependency direction, shortest first, and reports
   the product of the edge confidences. Co-change edges are excluded — a companion is
   not a route. This is the front-to-DB chain in one command.
