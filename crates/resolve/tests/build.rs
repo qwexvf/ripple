@@ -705,3 +705,26 @@ fn a_nested_selection_reaches_its_own_resolver() {
         ctx.confidence
     );
 }
+
+/// A document may name its operation `currentPlayer` while codegen emits
+/// `CurrentPlayerDocument` — the name the TypeScript side references. Keying the join on
+/// the raw name lost every edge from such an operation (11 of 242 on one real frontend).
+#[test]
+fn an_operation_named_lowercase_still_joins() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/opcase");
+    let indexed = resolve::build_incremental(
+        std::slice::from_ref(&root),
+        &std::collections::HashMap::new(),
+    )
+    .unwrap();
+    let r = resolve::link_cross_service(&indexed.files, &indexed.result.nodes);
+
+    let page = SymbolId::module("page.ts");
+    let me = SymbolId::of("resolver.ex", "me");
+    assert!(
+        r.edges
+            .iter()
+            .any(|e| e.src == page && e.dst == me && e.kind == EdgeKind::GraphqlCall),
+        "the page reaches the resolver despite the casing difference"
+    );
+}

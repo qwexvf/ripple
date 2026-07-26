@@ -1,0 +1,6 @@
+# written lowercase-first; codegen emits `CurrentPlayerDocument`
+query currentPlayer {
+  currentPlayer {
+    id
+  }
+}

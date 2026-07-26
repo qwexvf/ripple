@@ -82,11 +82,11 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
 
     // GraphQL operation name → the (scope, root field) pairs it selects,
     // aggregated across all .gql files
-    let mut op_fields: HashMap<&str, Vec<(&str, &[String])>> = HashMap::new();
+    let mut op_fields: HashMap<String, Vec<(&str, &[String])>> = HashMap::new();
     for f in files {
         for op in &f.extract.cross.gql_ops {
             op_fields
-                .entry(op.name.as_str())
+                .entry(document_key(&op.name))
                 .or_default()
                 .push((op.scope.as_str(), op.path.as_slice()));
         }
@@ -102,11 +102,11 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
     // operation → the fragments it spreads. Most nested selections in a codegen app are
     // written in fragments, so without this the type-graph walk has almost nothing to
     // walk (363 spreads across 24 definitions on one real app).
-    let mut op_spreads: HashMap<&str, Vec<&lang::cross::GqlSpread>> = HashMap::new();
+    let mut op_spreads: HashMap<String, Vec<&lang::cross::GqlSpread>> = HashMap::new();
     for f in files {
         for spread in &f.extract.cross.gql_spreads {
             op_spreads
-                .entry(spread.op.as_str())
+                .entry(document_key(&spread.op))
                 .or_default()
                 .push(spread);
         }
@@ -240,7 +240,7 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
         }
         let src_id = SymbolId::module(&f.module_path);
         for op in &f.extract.cross.ts_docs {
-            let Some(fields) = op_fields.get(op.as_str()) else {
+            let Some(fields) = op_fields.get(&document_key(op)) else {
                 continue;
             };
             for (scope, path) in fields {
@@ -266,7 +266,7 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
             }
             // `...LfgPostFields` — the fragment's own type condition names the scope its
             // fields live in, so an expanded spread needs no descent
-            for spread in op_spreads.get(op.as_str()).into_iter().flatten() {
+            for spread in op_spreads.get(&document_key(op)).into_iter().flatten() {
                 expand_spread(
                     spread.fragment.as_str(),
                     &fragments,
@@ -440,6 +440,20 @@ fn roots_by_scope<'a>(includes: &HashMap<&'a str, Vec<&'a str>>) -> HashMap<&'a 
         roots.sort_unstable();
     }
     out
+}
+
+/// Join key for a GraphQL operation, from either side of the codegen boundary.
+///
+/// A document may name its operation `updateLfgRequest`; codegen emits
+/// `UpdateLfgRequestDocument`, which is what the TypeScript side references. Keying on
+/// the raw name silently lost every edge from such an operation — 11 of 242 operations
+/// on one real frontend are written lowercase-first.
+fn document_key(name: &str) -> String {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
 }
 
 /// How deep a chain of fragments spreading fragments is followed. They nest (a page
