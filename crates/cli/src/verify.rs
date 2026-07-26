@@ -364,7 +364,7 @@ pub fn run(graph: &InMemoryGraph, plan: &Plan) -> Outcome {
 
     let mut work = plan.focus.clone();
     for (tag, root) in plan.roots {
-        let specs = lsp::load(root).unwrap_or_else(|_| lsp::defaults());
+        let specs = lsp::load(root).map_or_else(|_| lsp::defaults(), |c| c.specs);
         for spec in &specs {
             let mine: Vec<String> = work
                 .iter()

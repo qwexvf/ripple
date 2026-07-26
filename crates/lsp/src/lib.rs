@@ -107,25 +107,175 @@ pub fn defaults() -> Vec<ServerSpec> {
     ]
 }
 
-/// Load the server table for `root`: built-in defaults, with any entry in
-/// `.ripple/lsp.json` replacing the default for that language (and adding
-/// languages the defaults don't cover). Omitted fields take their default.
-pub fn load(root: &Path) -> Result<Vec<ServerSpec>> {
-    let path = root.join(".ripple").join("lsp.json");
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return Ok(defaults());
-    };
-    let overrides: Vec<ServerSpec> = serde_json::from_str(&text)
-        .with_context(|| format!("invalid server config at {}", path.display()))?;
+/// The server table for one root, plus anything ripple refused to take from it.
+pub struct Config {
+    pub specs: Vec<ServerSpec>,
+    /// An in-repo config that was read but **not applied**, because the root is
+    /// not trusted. Present so `doctor` can say so instead of staying quiet.
+    pub untrusted: Option<Untrusted>,
+}
 
-    let mut out = defaults();
-    for o in overrides {
-        match out.iter_mut().find(|d| d.language == o.language) {
-            Some(d) => *d = o,
-            None => out.push(o),
+/// An in-repo `.ripple/lsp.json` ripple declined to obey.
+pub struct Untrusted {
+    pub path: PathBuf,
+    /// `language → command` it wanted spawned, so the user can see what they are
+    /// being asked to trust before trusting it.
+    pub declares: Vec<(String, String)>,
+}
+
+/// Load the server table for `root`.
+///
+/// Sources, in increasing precedence: built-in defaults, then the **user's own**
+/// config (`$RIPPLE_LSP_CONFIG`, else `$XDG_CONFIG_HOME/ripple/lsp.json`, else
+/// `~/.config/ripple/lsp.json`), then the repository's `.ripple/lsp.json` — that
+/// last one **only if the root is trusted**. Each entry replaces the default for
+/// its language; omitted fields take their default.
+///
+/// The trust step exists because a config file names a `command` that gets
+/// executed, and `root` is a repository somebody else wrote. Honoring it by
+/// default made cloning a repo and running `ripple lsp doctor` enough to run
+/// arbitrary code as the user, which is issue #34. A repo-supplied table is
+/// therefore data to be reported, not instructions to be followed, until the user
+/// says otherwise with `ripple lsp trust`.
+pub fn load(root: &Path) -> Result<Config> {
+    load_from(root, user_config_path().as_deref(), is_trusted(root))
+}
+
+/// `load` with its two environment lookups passed in, so the policy can be tested
+/// without setting process-global environment variables from several threads.
+fn load_from(root: &Path, user_config: Option<&Path>, trusted: bool) -> Result<Config> {
+    let mut specs = defaults();
+    if let Some(path) = user_config {
+        if let Some(user) = read_specs(path)? {
+            apply(&mut specs, user);
         }
     }
-    Ok(out)
+
+    let repo_path = root.join(".ripple").join("lsp.json");
+    let Some(repo) = read_specs(&repo_path)? else {
+        return Ok(Config {
+            specs,
+            untrusted: None,
+        });
+    };
+    if !trusted {
+        let declares = repo
+            .iter()
+            .map(|s| (s.language.clone(), s.command.clone()))
+            .collect();
+        return Ok(Config {
+            specs,
+            untrusted: Some(Untrusted {
+                path: repo_path,
+                declares,
+            }),
+        });
+    }
+    apply(&mut specs, repo);
+    Ok(Config {
+        specs,
+        untrusted: None,
+    })
+}
+
+/// `Ok(None)` when the file simply isn't there; an unreadable or malformed one is
+/// an error, because silently falling back would hide a config the user wrote.
+fn read_specs(path: &Path) -> Result<Option<Vec<ServerSpec>>> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Ok(None);
+    };
+    let specs: Vec<ServerSpec> = serde_json::from_str(&text)
+        .with_context(|| format!("invalid server config at {}", path.display()))?;
+    Ok(Some(specs))
+}
+
+fn apply(table: &mut Vec<ServerSpec>, overrides: Vec<ServerSpec>) {
+    for o in overrides {
+        match table.iter_mut().find(|d| d.language == o.language) {
+            Some(d) => *d = o,
+            None => table.push(o),
+        }
+    }
+}
+
+/// The user's own config file — outside any repository, so a repository cannot
+/// write it. `$RIPPLE_LSP_CONFIG` wins, for CI and for tests.
+pub fn user_config_path() -> Option<PathBuf> {
+    if let Some(explicit) = std::env::var_os("RIPPLE_LSP_CONFIG") {
+        return Some(PathBuf::from(explicit));
+    }
+    Some(config_dir()?.join("lsp.json"))
+}
+
+fn config_dir() -> Option<PathBuf> {
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+        let xdg = PathBuf::from(xdg);
+        if xdg.is_absolute() {
+            return Some(xdg.join("ripple"));
+        }
+    }
+    Some(
+        PathBuf::from(std::env::var_os("HOME")?)
+            .join(".config")
+            .join("ripple"),
+    )
+}
+
+/// Where trusted root paths are recorded — one absolute path per line, in the
+/// user's config directory rather than in any repository.
+pub fn trust_file() -> Option<PathBuf> {
+    Some(config_dir()?.join("trusted-roots"))
+}
+
+/// May ripple obey `<root>/.ripple/lsp.json`?
+///
+/// `RIPPLE_TRUST_REPO_LSP=1` covers CI, where writing a user config is awkward and
+/// the checkout is already trusted by whoever configured the job.
+pub fn is_trusted(root: &Path) -> bool {
+    if std::env::var("RIPPLE_TRUST_REPO_LSP").is_ok_and(|v| v == "1") {
+        return true;
+    }
+    let Some(file) = trust_file() else {
+        return false;
+    };
+    let Ok(text) = std::fs::read_to_string(file) else {
+        return false;
+    };
+    listed_as_trusted(&text, root)
+}
+
+/// Is `root` one of the paths in a trust file's text? Exact path match on a
+/// canonical path — no prefix rule, so trusting one repo never trusts a sibling
+/// or anything nested inside it.
+fn listed_as_trusted(text: &str, root: &Path) -> bool {
+    let want = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .any(|l| Path::new(l) == want)
+}
+
+/// Record `root` as trusted, so its own `.ripple/lsp.json` is honored from now on.
+/// Returns the trust file written, and whether it was already there.
+pub fn trust(root: &Path) -> Result<(PathBuf, bool)> {
+    let file = trust_file().context("no config directory (set HOME or XDG_CONFIG_HOME)")?;
+    if is_trusted(root) {
+        return Ok((file, true));
+    }
+    let canonical = root
+        .canonicalize()
+        .with_context(|| format!("cannot access {}", root.display()))?;
+    if let Some(dir) = file.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    let mut text = std::fs::read_to_string(&file).unwrap_or_default();
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(&canonical.to_string_lossy());
+    text.push('\n');
+    std::fs::write(&file, text).with_context(|| format!("writing {}", file.display()))?;
+    Ok((file, false))
 }
 
 /// The protocol features ripple can actually use, as reported by the server.
@@ -781,20 +931,27 @@ fn read_message(reader: &mut impl BufRead) -> Option<Value> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn config_overrides_one_language_and_adds_others() {
-        let dir = std::env::temp_dir().join(format!("ripple-lsp-cfg-{}", std::process::id()));
+    /// A repo whose `.ripple/lsp.json` names servers, for the trust tests.
+    fn repo_with_config(tag: &str, body: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ripple-lsp-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(".ripple")).unwrap();
-        std::fs::write(
-            dir.join(".ripple/lsp.json"),
-            r#"[
-                 {"language": "elixir", "command": "lexical", "inline": false},
-                 {"language": "gleam", "command": "gleam", "args": ["lsp"]}
-               ]"#,
-        )
-        .unwrap();
+        std::fs::write(dir.join(".ripple/lsp.json"), body).unwrap();
+        dir
+    }
 
-        let specs = load(&dir).unwrap();
+    const REPO_CONFIG: &str = r#"[
+             {"language": "elixir", "command": "lexical", "inline": false},
+             {"language": "gleam", "command": "gleam", "args": ["lsp"]}
+           ]"#;
+
+    #[test]
+    fn a_trusted_repo_config_overrides_one_language_and_adds_others() {
+        let dir = repo_with_config("trusted", REPO_CONFIG);
+
+        let cfg = load_from(&dir, None, true).unwrap();
+        let specs = &cfg.specs;
+        assert!(cfg.untrusted.is_none());
         let elixir = specs.iter().find(|s| s.language == "elixir").unwrap();
         assert_eq!(elixir.command, "lexical", "override replaces the default");
         assert!(!elixir.inline);
@@ -812,10 +969,80 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The #34 case: a repository that names a command must not get it run just
+    /// because someone pointed ripple at the repository.
+    #[test]
+    fn an_untrusted_repo_config_is_reported_and_not_applied() {
+        let dir = repo_with_config(
+            "untrusted",
+            r#"[{"language": "go", "command": "/bin/touch", "args": ["/tmp/pwned"], "root_markers": ["go.mod"]}]"#,
+        );
+
+        let cfg = load_from(&dir, None, false).unwrap();
+        assert!(
+            cfg.specs
+                .iter()
+                .any(|s| s.language == "go" && s.command == "gopls"),
+            "go must still be the built-in gopls, not the repo's command"
+        );
+        assert!(!cfg.specs.iter().any(|s| s.command == "/bin/touch"));
+        let untrusted = cfg.untrusted.expect("the ignored config is reported");
+        assert_eq!(
+            untrusted.declares,
+            [("go".to_owned(), "/bin/touch".to_owned())],
+            "doctor needs to show what it refused to run"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// User config lives outside any repository, so it is trusted; and an
+    /// untrusted repo cannot override it.
+    #[test]
+    fn user_config_applies_and_outranks_an_untrusted_repo() {
+        let dir = repo_with_config("usercfg", REPO_CONFIG);
+        let user = dir.join("user-lsp.json");
+        std::fs::write(
+            &user,
+            r#"[{"language": "elixir", "command": "expert", "inline": true}]"#,
+        )
+        .unwrap();
+
+        let cfg = load_from(&dir, Some(&user), false).unwrap();
+        let elixir = cfg.specs.iter().find(|s| s.language == "elixir").unwrap();
+        assert_eq!(elixir.command, "expert");
+        assert!(
+            !cfg.specs.iter().any(|s| s.language == "gleam"),
+            "the untrusted repo's extra language is not added either"
+        );
+        assert!(cfg.untrusted.is_some());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn missing_config_yields_defaults() {
-        let specs = load(Path::new("/nonexistent-ripple-root")).unwrap();
-        assert_eq!(specs.len(), defaults().len());
+        let cfg = load_from(Path::new("/nonexistent-ripple-root"), None, false).unwrap();
+        assert_eq!(cfg.specs.len(), defaults().len());
+        assert!(cfg.untrusted.is_none());
+    }
+
+    #[test]
+    fn trust_is_an_exact_path_match() {
+        let dir = std::env::temp_dir().join(format!("ripple-trust-{}", std::process::id()));
+        let nested = dir.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        let listed = dir.canonicalize().unwrap();
+        let text = format!("# roots I wrote myself\n\n{}\n", listed.display());
+
+        assert!(listed_as_trusted(&text, &dir));
+        assert!(
+            !listed_as_trusted(&text, &nested),
+            "trusting a repo must not trust anything inside it"
+        );
+        assert!(!listed_as_trusted("", &dir));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

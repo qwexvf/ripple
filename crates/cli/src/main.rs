@@ -33,7 +33,7 @@ fn main() -> Result<()> {
     }
 }
 
-const USAGE: &str = "usage:\n  ripple parse <file> [--json]\n  ripple index <path>... [--calls lsp [--calls-budget 120s]]   (--calls lsp: call edges from a language server, for languages with no refs query)\n  ripple neighbors <symbol> [--in|--out] [--depth N] [--in-file <substr>] [--root <path>] [--json]\n  ripple impact <symbol>... [--budget N] [--root <path>] [--json] [--verify lsp]\n  ripple review [<base>] [--budget N] [--root <path>] [--json] [--verify lsp]\n    --verify lsp [--verify-budget 2s] [--floor-contradicted|--drop-contradicted]  (upgrade call edges from a language server)\n  ripple path <from> <to> [--depth 6] [--limit 3] [--root <path>] [--json]   (how does A reach B?)\n  ripple risk <symbol|file> [--root <path>] [--json]\n  ripple mcp [--root <path>]   (MCP server over stdio for AI agents)\n  ripple lsp doctor [--root <path>] [--budget 10s] [--json]   (are language servers usable here?)";
+const USAGE: &str = "usage:\n  ripple parse <file> [--json]\n  ripple index <path>... [--calls lsp [--calls-budget 120s]]   (--calls lsp: call edges from a language server, for languages with no refs query)\n  ripple neighbors <symbol> [--in|--out] [--depth N] [--in-file <substr>] [--root <path>] [--json]\n  ripple impact <symbol>... [--budget N] [--root <path>] [--json] [--verify lsp]\n  ripple review [<base>] [--budget N] [--root <path>] [--json] [--verify lsp]\n    --verify lsp [--verify-budget 2s] [--floor-contradicted|--drop-contradicted]  (upgrade call edges from a language server)\n  ripple path <from> <to> [--depth 6] [--limit 3] [--root <path>] [--json]   (how does A reach B?)\n  ripple risk <symbol|file> [--root <path>] [--json]\n  ripple mcp [--root <path>]   (MCP server over stdio for AI agents)\n  ripple lsp doctor [--root <path>] [--budget 10s] [--json]   (are language servers usable here?)\n  ripple lsp trust [--root <path>]   (allow this repo's own .ripple/lsp.json to launch servers)";
 
 fn db_path(root: &Path) -> PathBuf {
     root.join(".ripple").join("graph.redb")
@@ -295,9 +295,42 @@ fn root_tag(store: &RedbStore, root: &Path) -> Result<String> {
 /// `ripple lsp <subcommand>`. Only `doctor` for now: report whether this project
 /// has usable language servers, so the Tier-2 accuracy layer is never a mystery.
 /// See docs/11-lsp-integration.md.
+/// Where the user's own server table lives, for messages. Falls back to the
+/// documented path when no config directory can be determined.
+fn user_config_hint() -> String {
+    lsp::user_config_path().map_or_else(
+        || "~/.config/ripple/lsp.json".to_owned(),
+        |p| p.display().to_string(),
+    )
+}
+
+/// `ripple lsp trust [--root <path>]`: record a root as one whose own
+/// `.ripple/lsp.json` may be obeyed.
+///
+/// Trust is stored in the user's config directory, never in the repository — a
+/// repository that could mark itself trusted would be no protection at all.
+fn cmd_lsp_trust(args: &[String]) -> Result<()> {
+    let root: PathBuf = flag_value(args, "--root").map_or_else(|| ".".into(), PathBuf::from);
+    let (file, already) = lsp::trust(&root)?;
+    let canonical = root.canonicalize().unwrap_or(root);
+    if already {
+        println!(
+            "{} is already trusted ({})",
+            canonical.display(),
+            file.display()
+        );
+        return Ok(());
+    }
+    println!("trusted {}", canonical.display());
+    println!("  recorded in {}", file.display());
+    println!("  its .ripple/lsp.json will now be used, including any command it names");
+    Ok(())
+}
+
 fn cmd_lsp(args: &[String]) -> Result<()> {
     match positional(args).map(String::as_str) {
         Some("doctor") => cmd_lsp_doctor(&args[1..]),
+        Some("trust") => cmd_lsp_trust(&args[1..]),
         Some(other) => bail!("unknown lsp subcommand: {other}\n{USAGE}"),
         None => bail!("{USAGE}"),
     }
@@ -320,7 +353,8 @@ fn cmd_lsp_doctor(args: &[String]) -> Result<()> {
         roots.push((String::new(), root.clone()));
     }
     let adapters: Vec<String> = lang::registry().iter().map(|a| a.id().to_owned()).collect();
-    let specs = lsp::load(&root)?;
+    let config = lsp::load(&root)?;
+    let specs = config.specs;
 
     // one budget for the whole command, split across roots: a hung server must not
     // be able to hold the output back, and every probe is clamped so no handshake
@@ -352,9 +386,31 @@ fn cmd_lsp_doctor(args: &[String]) -> Result<()> {
             serde_json::to_string_pretty(&json!({
                 "ripple_adapters": adapters,
                 "roots": out,
+                "untrusted_config": config.untrusted.as_ref().map(|u| json!({
+                    "path": u.path.display().to_string(),
+                    "declares": u.declares.iter()
+                        .map(|(l, c)| json!({"language": l, "command": c}))
+                        .collect::<Vec<_>>(),
+                })),
             }))?
         );
         return Ok(());
+    }
+
+    if let Some(u) = &config.untrusted {
+        println!(
+            "⚠ ignored {} — a config inside the repository names commands to run,",
+            u.path.display()
+        );
+        println!("  and this root is not trusted. Nothing from it was used:");
+        for (language, command) in &u.declares {
+            println!("    {language}: {command}");
+        }
+        println!(
+            "  Move it to {} to apply it everywhere,",
+            user_config_hint()
+        );
+        println!("  or run `ripple lsp trust` if you wrote this repository's copy yourself.\n");
     }
 
     for (path, indexed, reports) in &checked {
@@ -906,7 +962,7 @@ fn cmd_eval_oracle(args: &[String]) -> Result<()> {
     if roots.is_empty() {
         roots.push((String::new(), root.clone()));
     }
-    let specs = lsp::load(&root)?;
+    let specs = lsp::load(&root)?.specs;
     let registry = lang::registry();
 
     let mut any = false;
