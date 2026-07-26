@@ -18,12 +18,14 @@ Last measured 2026-07-25 on the 5noobs stack (web + api). A count that moves wit
 an explanation is the cheapest bug signal this project has, so re-measure and diff:
 
 ```
-1153 files → 9179 nodes, 19538 edges
-  (2461 co-change, 343 graphql, 941 db, 134 imported, 1634 file-granular, 4441 with dependents)
-  ↑ +3751 edges on 2026-07-25 from four TS fixes: .tsx now uses the TSX grammar,
-    JSX rendering is a call, `export { X }` lists count as exports, and an import
-    through a barrel (`export * from`) follows the chain
-cold index ~1.5s, warm ~0.8s
+1153 files → 9179 nodes, 20100 edges
+  (2461 co-change, 825 graphql, 941 db, 134 imported, 1634 file-granular, 4452 with dependents)
+  ↑ +4313 edges on 2026-07-25/26. TS side: .tsx uses the TSX grammar, JSX rendering is
+    a call, `export { X }` lists count as exports, barrels (`export * from`) are followed,
+    aliased/namespace imports resolve. GraphQL side: nested selections descend the type
+    graph, `dataloader(Mod)` links to its context module at 0.5, and fragment spreads
+    expand (343 → 825 graphql edges)
+cold index ~1.6s, warm ~0.8s
 eval (5noobs-web, held out — co-change mined only from commits older than the test window):
   --commits 50  (500 train, 2078 pairs): static 7.1% | co-change 3.4% | fused 10.5%
   --commits 300 (148 train, 4188 pairs): static 6.5% | co-change 1.3% | fused  7.8%
@@ -173,8 +175,11 @@ candidates — check it before acting on it.
 - Elixir `@spec`/`@type` bodies are ignored (they parse as calls but name types).
 - `dataloader(...)` and inline `fn` resolvers produce no edge — under-link over invent.
 - `deps/`, `_build/`, `vendor/`, `target/`, `.venv/` are never indexed.
-- Type-level Absinthe fields aren't joined to consumers: only *root* fields are, so a
-  nested selection (`player { team { … } }`) does not reach `team`'s resolver yet.
+- A nested Absinthe field is reached by descending the type graph, and a fragment spread
+  is expanded against its type condition. Two gaps remain: an **inline** fragment
+  (`... on Type { … }`) is skipped, and `batch(...)` resolvers are not linked at all.
+- `dataloader(Mod)` names a context module and no function, so its edge targets that
+  file's module node at **0.5** — `impact` shows it as `[file] …`, not as a symbol.
 
 ## After every phase: the short loop (cheap)
 
