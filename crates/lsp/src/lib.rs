@@ -96,6 +96,7 @@ pub fn defaults() -> Vec<ServerSpec> {
             true,
         ),
         spec("go", "gopls", &[], &["go.mod"], true),
+        spec("gleam", "gleam", &["lsp"], &["gleam.toml"], true),
         spec(
             "python",
             "pyright-langserver",

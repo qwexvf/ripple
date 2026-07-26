@@ -4,6 +4,7 @@
 
 pub mod cross;
 pub mod elixir;
+pub mod gleam;
 pub mod go;
 pub mod graphql;
 pub mod resolve_import;
@@ -94,6 +95,7 @@ pub fn registry() -> Vec<Box<dyn LanguageAdapter>> {
         Box::new(graphql::Adapter::new()),
         Box::new(rust::Adapter::new()),
         Box::new(go::Adapter::new()),
+        Box::new(gleam::Adapter::new()),
     ]
 }
 
