@@ -1,0 +1,141 @@
+---
+title: "CLI reference"
+description: "Every ripple command and flag, with what each one is actually for"
+sidebar:
+  label: "CLI"
+  order: 1
+---
+
+```
+ripple parse <file> [--json]
+ripple index <path>...
+ripple neighbors <symbol> [--in|--out] [--depth N] [--root <path>] [--json]
+ripple impact <symbol>... [--budget N] [--root <path>] [--json] [--verify lsp]
+ripple review [<base>] [--budget N] [--root <path>] [--json] [--verify lsp]
+ripple path <from> <to> [--depth 6] [--limit 3] [--root <path>] [--json]
+ripple risk <symbol|file> [--root <path>] [--json]
+ripple mcp [--root <path>]
+ripple eval [--commits N] [--skip N] [--root <path>]
+ripple lsp doctor [--root <path>] [--budget 10s] [--json]
+```
+
+Flags shared by nearly every command:
+
+| Flag | Meaning |
+|---|---|
+| `--root <path>` | Which repository to answer about. Defaults to `.`; the graph is read from `<root>/.ripple/graph.redb` |
+| `--json` | Machine-readable output. Use this for anything scripted — the human format is not a stable interface |
+| `--budget N` | Cap the number of hits. The output always reports `{shown, total}` so a cut is visible |
+
+## `ripple index <path>...`
+
+Builds the graph and writes it to `<root>/.ripple/graph.redb`. Defaults to `.` when no
+path is given.
+
+Pass **several paths** to index separate repositories as one graph — this is how
+cross-repo tracing works, and it is the only way to get it, since git co-change cannot
+bridge two histories. Module paths are namespaced per root so identical relative paths in
+two repos do not collide.
+
+Re-running is incremental: unchanged files are reused from the content cache. The summary
+line reports added / changed / unchanged / removed alongside the node and edge counts.
+
+There is no watcher and no staleness check. After you edit code, re-index — otherwise
+every other command answers from the old graph without warning.
+
+## `ripple impact <symbol>...`
+
+The risk-ranked blast radius: what depends on this symbol, ordered by how much of the
+change reaches it scaled by how risky it is. Accepts more than one symbol to model a
+multi-symbol change.
+
+Each line carries its edge kind, that edge's confidence, and the depth it was found at.
+`--budget` defaults to 20.
+
+## `ripple review [<base>]`
+
+Ranks the symbols changed in a diff by review priority — risk × downstream reach — with a
+reason on each line. With no `<base>` it diffs the working tree against `HEAD`; give it a
+rev (`HEAD~3`, a branch, a merge base) to review a range.
+
+## `ripple neighbors <symbol>`
+
+One hop, unranked. `--in` for callers and importers, `--out` for callees and imports;
+`--depth N` to go further. Use this when you want the raw graph rather than a judgement
+about it — `impact` is the ranked version.
+
+Edge kinds surfaced: `Calls`, `Imports`, `ChangesWith`, `GraphqlCall`, `DbQuery`.
+
+## `ripple path <from> <to>`
+
+How does A reach B? Routes along the dependency direction, shortest first, each annotated
+with the product of the edge confidences along it. `from` and `to` match exactly or
+partially against symbol and file names. `--depth` defaults to 6 hops, `--limit` to 3
+routes.
+
+## `ripple risk <symbol|file>`
+
+The git-derived score for one target, broken into its terms:
+
+```
+crates/resolve/src/lib.rs (crates/resolve/src/lib.rs)
+  composite 0.92 | churn 0.96 bug 0.81 ownership 0.00 fanout 0.99
+```
+
+All terms are percentiles within this corpus, so they are relative to the repository, not
+absolute. A term with no variance across the corpus is dropped from the composite rather
+than counted — which is why `ownership` reads `0.00` in a single-author repository.
+
+`bug` is the share of commits touching the file that matched a fix or revert pattern. It
+is a heuristic about commit messages, not a defect count.
+
+## `ripple parse <file>`
+
+Dumps the symbols one file's adapter extracts. This is a debugging tool for adapter work —
+if a symbol is missing from `impact`, check whether it was ever extracted.
+
+## `ripple mcp`
+
+Speaks MCP over stdio for AI agents. Indexes first if the graph is missing. See the
+[MCP reference](mcp.md).
+
+## `ripple eval`
+
+Measures ripple against a held-out slice of git history: the newest `--commits N` commits
+become the test set and the pair counts come only from older history, so co-change cannot
+score itself on data it trained on. `--skip N` moves the window back.
+
+Two other modes:
+
+- `--oracle lsp` compares ripple's call edges against a language server's answers.
+  `--sample N` (default 25) picks how many symbols to check, `--granularity function|file`
+  how strictly to compare.
+- `--risk` asks whether risk ranks the files that actually get fixed.
+
+This is how the numbers in the [dogfood log](../design/12-dogfood-log.md) were produced,
+including the ones that turned out to be wrong. When there is nothing to evaluate it says
+so rather than reporting `0.0%`.
+
+## `ripple lsp doctor`
+
+Reports which languages are indexed here and whether a language server is installed to
+sharpen them:
+
+```
+language servers for /home/qwexvf/projects/ripple
+  indexed languages: elixir, graphql, rust, tsx, typescript
+
+  typescript (typescript-language-server)
+    missing  not installed — this language is indexed, so its edges stay tree-sitter only
+```
+
+`--budget` (default `10s`) bounds how long a server is given to answer before it is
+dropped, so a slow server cannot stall the run.
+
+### Verification with `--verify lsp`
+
+`impact` and `review` accept `--verify lsp`, which upgrades call edges using a language
+server before ranking. `--verify-budget` (default `2s`) bounds the wait. When a server
+contradicts an edge, `--floor-contradicted` keeps it at minimum confidence and
+`--drop-contradicted` removes it. Design notes in
+[11-lsp-integration.md](../design/11-lsp-integration.md).

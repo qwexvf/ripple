@@ -1,5 +1,10 @@
-# 08 — Roadmap
-
+---
+title: "08 — Roadmap"
+description: "Phased delivery: v0 TypeScript, v1 git overlay, v2 impact/review MCP, v3 multi-language"
+sidebar:
+  label: "08 — Roadmap"
+  order: 8
+---
 Each phase ships something that works on its own. Ordering is driven by the primary real-world target: tracing a **frontend page → GraphQL operation → backend resolver → DB** across a **cross-repo, cross-language** stack (TS frontend + Elixir/Absinthe backend, separate git repos — e.g. 5noobs). That target reshapes the plan: git-history signals (co-change) **cannot bridge separate repos**, so cross-service *static* resolution is promoted ahead of the git overlay.
 
 ## v0 — TypeScript substrate (Tier 2) ✅ complete

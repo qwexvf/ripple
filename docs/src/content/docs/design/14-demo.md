@@ -1,5 +1,10 @@
-# 14 — Demo: one question, across two repos and two languages
-
+---
+title: "14 — Demo: one question, across two repos and two languages"
+description: "A walkthrough on a real full-stack app — TS/React plus Elixir, two repos, one graph"
+sidebar:
+  label: "14 — Demo"
+  order: 14
+---
 A walkthrough of ripple on a real full-stack app: a TypeScript/React frontend and an
 Elixir umbrella backend, in **separate git repositories**, indexed as one graph.
 

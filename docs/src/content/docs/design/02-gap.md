@@ -1,5 +1,10 @@
-# 02 — The gap: what's possible and what's still missing
-
+---
+title: "02 — The gap: what's possible and what's still missing"
+description: "The unfilled combination; what's possible and what's still not done"
+sidebar:
+  label: "02 — The gap"
+  order: 2
+---
 ## The unfilled combination
 
 Every ingredient below is proven and shipping *somewhere*. Nobody has fused them:

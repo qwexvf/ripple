@@ -1,5 +1,10 @@
-# 04 — Architecture
-
+---
+title: "04 — Architecture"
+description: "Layered architecture, the normalized IR, the LanguageAdapter trait, and the crate layout"
+sidebar:
+  label: "04 — Architecture"
+  order: 4
+---
 Clean, layered, language-agnostic core over a thin per-language seam. The whole design exists to make one invariant true:
 
 > **Everything above the `ir` layer is blind to which programming language it's looking at.** Adding a language touches only `lang/` (plus data files). Nothing else recompiles its logic.

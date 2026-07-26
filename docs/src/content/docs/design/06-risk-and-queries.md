@@ -1,5 +1,10 @@
-# 06 — Risk scoring & query API
-
+---
+title: "06 — Risk scoring & query API"
+description: "The risk-scoring formula, impact() and review_focus(), budget-aware ranking, MCP tool schemas"
+sidebar:
+  label: "06 — Risk & queries"
+  order: 6
+---
 The differentiator is the **join + ranking function**, exposed as two diff-scoped queries. Everything here operates on the IR + git overlay — **language-agnostic**, written once, works for every language and tier.
 
 ## Risk score

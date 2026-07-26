@@ -1,5 +1,10 @@
-# 07 — AI integration: optimizing decisions, not tokens
-
+---
+title: "07 — AI integration: optimizing decisions, not tokens"
+description: "Optimizing decisions rather than tokens, and how LLM agents consume the output"
+sidebar:
+  label: "07 — AI integration"
+  order: 7
+---
 The 2025–2026 code-graph MCP servers converged on one metric: **fewer tokens**. That was the right first fight (indexed retrieval beat grep). But token compression is table stakes now. The next axis is **decision quality** — does the thing you hand the model actually change what it does?
 
 ## The shift: what gets ranked

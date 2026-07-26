@@ -1,5 +1,10 @@
-# 09 — Architecture review & fact-check audit
-
+---
+title: "09 — Architecture review & fact-check audit"
+description: "Architecture review plus the primary-source fact-check audit trail, with corrections logged"
+sidebar:
+  label: "09 — Review & corrections"
+  order: 9
+---
 An architect/systems-engineer review of the spec, plus a primary-source fact-check of every load-bearing external claim. Purpose: nothing in this spec should be assumed or guessed — each factual claim is traced to a real artifact (a repo, a binary on disk, a live MCP schema, a paper, a license file). This doc is the audit trail; corrections have been applied to the other files.
 
 Method: three independent verification passes against primary sources — (1) embedded DBs, (2) the two headline tools re-checked against the actual clone + installed binary, (3) competitors + Rust crates + cited numbers. Verdicts below are VERIFIED / corrected / ruled-out with evidence.

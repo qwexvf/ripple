@@ -1,0 +1,55 @@
+---
+import { ThemeToggle } from "./ThemeToggle";
+import { MobileSidebar } from "./MobileSidebar";
+import { Search } from "./Search";
+import type { NavGroup } from "@/lib/nav";
+
+interface Props {
+  groups: NavGroup[];
+  currentSlug: string;
+}
+
+const { groups, currentSlug } = Astro.props;
+const base = import.meta.env.BASE_URL.replace(/\/$/, "") + "/";
+---
+
+<header
+  class="sticky top-0 z-40 h-14 border-b border-[var(--color-rule)] bg-[var(--color-bg)]/95 backdrop-blur"
+>
+  <div class="mx-auto flex h-full max-w-[80rem] items-center gap-4 px-6">
+    <a
+      href={base}
+      class="flex items-center gap-2 font-display text-base font-bold tracking-tight text-[var(--color-fg-strong)]"
+    >
+      <svg
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="1.5"
+        class="h-5 w-5 text-[var(--color-signal)]"
+      >
+        <circle cx="12" cy="12" r="8"></circle>
+        <path d="M8 12 L11 15 L16 9" stroke-linecap="round" stroke-linejoin="round"></path>
+      </svg>
+      <span>Docs</span>
+    </a>
+
+    <nav
+      class="ml-6 hidden items-center gap-5 font-mono text-xs uppercase tracking-[0.1em] text-[var(--color-fg-mute)] md:flex"
+    >
+      <a href={base + "getting-started/"} class="hover:text-[var(--color-fg-strong)]">Docs</a>
+      <a href="https://github.com/your-org/your-repo" class="hover:text-[var(--color-fg-strong)]">GitHub</a>
+    </nav>
+
+    <div class="ml-auto flex items-center gap-2">
+      <Search client:load baseHref={base} />
+      <ThemeToggle client:load />
+      <MobileSidebar
+        client:load
+        groups={groups}
+        currentSlug={currentSlug}
+        baseHref={base}
+      />
+    </div>
+  </div>
+</header>

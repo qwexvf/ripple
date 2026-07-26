@@ -1,5 +1,10 @@
-# 10 — Cross-service resolution (call-site ↔ route matching)
-
+---
+title: "10 — Cross-service resolution (call-site ↔ route matching)"
+description: "Call-site to route matching across services: RouteKey normalization, confidence, the co-change safety net"
+sidebar:
+  label: "10 — Cross-service"
+  order: 10
+---
 This is the piece review flagged as hand-waved (finding #5). It's the hardest static-analysis problem in the spec *and* the highest-value one: a call in service A that reaches a handler in service B has **no static call edge** crossing the process boundary, yet that boundary is exactly where a change's blast radius escapes a single service. codebase-memory-mcp proves it's tractable — it ships `HTTP_CALLS`/`GRAPHQL_CALLS`/`ASYNC_CALLS`/`EMITS` edges with `url_path`, `confidence`, `strategy`, `via`, plus `Route`/`Channel` nodes carrying `method`/`key_path`/`broker`. This doc specifies how ripple does it.
 
 ## Shape of the problem

@@ -1,5 +1,10 @@
-# 12 — Dogfood log
-
+---
+title: "12 — Dogfood log"
+description: "What ripple got wrong when used for real, and what each mistake turned into"
+sidebar:
+  label: "12 — Dogfood log"
+  order: 12
+---
 Gaps found by *using* ripple rather than reasoning about it. Each entry: what was
 asked, what ripple said, what was true, what it implies. Newest first.
 

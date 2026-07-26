@@ -1,0 +1,44 @@
+---
+import type { NavGroup } from "@/lib/nav";
+
+interface Props {
+  groups: NavGroup[];
+  currentSlug: string;
+}
+
+const { groups, currentSlug } = Astro.props;
+const base = import.meta.env.BASE_URL.replace(/\/$/, "") + "/";
+---
+
+<aside class="sidebar hidden md:block sticky top-14 h-[calc(100vh-3.5rem)] w-60 shrink-0 overflow-y-auto border-r border-[var(--color-rule)] py-6 pr-4">
+  <nav>
+    {
+      groups.map((group) => (
+        <div class="mb-6">
+          <div class="mb-1.5 px-3 font-mono text-[0.7rem] font-semibold uppercase tracking-[0.14em] text-[var(--color-fg-faint)]">
+            {group.label}
+          </div>
+          <ul class="space-y-px">
+            {group.items.map((item) => {
+              const isCurrent = item.slug === currentSlug;
+              const classes = [
+                "block border-l px-3 py-1.5 text-sm transition-colors",
+                isCurrent
+                  ? "border-[var(--color-signal)] bg-[var(--color-signal-bg)] font-semibold text-[var(--color-signal)]"
+                  : "border-transparent text-[var(--color-fg-mute)] hover:border-[var(--color-rule-strong)] hover:text-[var(--color-fg-strong)]",
+              ].join(" ");
+              const href = base + item.href.replace(/^\//, "");
+              return (
+                <li>
+                  <a href={href} class={classes}>
+                    {item.label}
+                  </a>
+                </li>
+              );
+            })}
+          </ul>
+        </div>
+      ))
+    }
+  </nav>
+</aside>

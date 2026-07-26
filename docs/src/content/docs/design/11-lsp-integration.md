@@ -1,5 +1,10 @@
-# 11 — LSP as the accuracy tier
-
+---
+title: "11 — LSP as the accuracy tier"
+description: "LSP as the accuracy tier over the tree-sitter base: layering, reconciliation, provenance"
+sidebar:
+  label: "11 — LSP integration"
+  order: 11
+---
 **Decision.** Take what language servers already compute (per-language, per-file
 truth about symbols and calls) and layer ripple's own value on top. Tree-sitter
 stays the base tier so ripple always answers; LSP *upgrades* what it can reach.

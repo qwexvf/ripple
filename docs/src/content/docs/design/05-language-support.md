@@ -1,5 +1,10 @@
-# 05 — Language support: adding a language later is cheap
-
+---
+title: "05 — Language support: adding a language later is cheap"
+description: "The Tier system, .scm conventions, monorepo handling, and the extensibility guarantee"
+sidebar:
+  label: "05 — Language support"
+  order: 5
+---
 The core promise: **a new language is a self-contained folder under `crates/lang/adapters/` plus one line in the registry.** No layer above `ir` changes. This doc explains how that holds, and how each language becomes useful *incrementally* instead of all-or-nothing.
 
 > **As-built honesty (see [`09`](09-review-and-corrections.md) round 2).** The promise is *fully* true for **Tier 0–1** (symbols + git overlay + imports): a new language is a folder + `.scm` + a registry line and gets same-day value. Per-language behaviors that used to leak into `parse` — `is_exported`, method name-qualification — are now `LanguageAdapter` methods, so the seam holds. **Tier 2** (call resolution) and **Tier 3** (cross-service) need a small per-language implementation, not free `.scm` data. But the framework part is now data too: for macro-based languages the *shape* is generic (`lang::elixir::macros` reads `name :atom, opts do ... end` blocks with no framework knowledge) and only the *mapping* is per-framework — a table in `lang::elixir::dsl` naming which macro opens a type block, declares a member, or names a resolver. Adding Ash, a Phoenix router, or LiveView is a table entry; see [`09` round 3](09-review-and-corrections.md).

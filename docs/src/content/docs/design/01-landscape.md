@@ -1,5 +1,10 @@
-# 01 — Landscape: what existing tools actually do
-
+---
+title: "01 — Landscape: what existing tools actually do"
+description: "What existing tools actually do — verified against real code, binaries, and MCP schemas"
+sidebar:
+  label: "01 — Landscape"
+  order: 1
+---
 Verified against real sources: fresh git clones, the installed binary on disk, live MCP schemas, and vendor docs. Where a claim comes from evidence it is marked; where it's an inference it says so.
 
 ---

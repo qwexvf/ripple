@@ -1,5 +1,10 @@
-# v0 — execution plan (TypeScript, Tier 2)
-
+---
+title: "v0 — execution plan (TypeScript, Tier 2)"
+description: "The build plan for the first slice: crate order, TS reference resolution, testing and done criteria"
+sidebar:
+  label: "v0 — Execution plan"
+  order: 15
+---
 Concrete build plan for the first shippable slice: a correct, fast static graph for TypeScript, queryable via `ripple index` and `ripple neighbors`. Planning v0 forces the design of the one piece the spec left thin — **Tier-2 reference resolution** (review gap #1) — so that algorithm is specified here for TS.
 
 ## Scope

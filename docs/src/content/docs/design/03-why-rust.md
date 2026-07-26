@@ -1,5 +1,10 @@
-# 03 — Why Rust
-
+---
+title: "03 — Why Rust"
+description: "Performance, maintainability vs C, readability, ecosystem, and the honest trade-offs"
+sidebar:
+  label: "03 — Why Rust"
+  order: 3
+---
 The nearest substrate (codebase-memory-mcp) is **C**. graphify is **Python**. Neither language choice is wrong for what it is — but for a *greenfield* impact/review engine, Rust is the right pick. Here is the honest case, including where the advantage is thin.
 
 ## Performance
