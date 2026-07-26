@@ -52,6 +52,7 @@ same files, served under `/design/`.
 | [`11-lsp-integration.md`](docs/src/content/docs/design/11-lsp-integration.md) | LSP as the Tier-2 accuracy tier over the tree-sitter base: layering, reconciliation, how slow servers are kept off the critical path, provenance |
 | [`12-dogfood-log.md`](docs/src/content/docs/design/12-dogfood-log.md) | What ripple got wrong when used for real, and what each mistake turned into — the log that has produced more fixes than the roadmap |
 | [`13-engineering-review.md`](docs/src/content/docs/design/13-engineering-review.md) | 用語監査とロール別の評価（日本語）— which metric names overclaim, what the numbers survive re-measurement, and where the product gaps are |
+| [`15-two-tools-two-jobs.md`](docs/src/content/docs/design/15-two-tools-two-jobs.md) | Why tree-sitter **produces** the graph and LSP **grades** it — the measurement that killed the "accuracy tier" framing, and where the headroom actually is |
 | [`14-demo.md`](docs/src/content/docs/design/14-demo.md) | **Walkthrough on a real full-stack app** (TS/React + Elixir, two repos, one graph), with actual output and an honest list of what it still gets wrong |
 | [`v0-plan.md`](docs/src/content/docs/design/v0-plan.md) | **Execution plan** for the first slice (TypeScript, Tier 2): crate build order, the concrete TS reference-resolution algorithm, store spike, testing & done criteria |
 

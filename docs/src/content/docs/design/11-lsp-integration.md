@@ -1,14 +1,22 @@
 ---
-title: "11 — LSP as the accuracy tier"
-description: "LSP as the accuracy tier over the tree-sitter base: layering, reconciliation, provenance"
+title: "11 — LSP integration"
+description: "The LSP client, budget, cache and reconciliation. Framing superseded by doc 15."
 sidebar:
   label: "11 — LSP integration"
   order: 11
 ---
+> **Superseded in part by [`15-two-tools-two-jobs.md`](15-two-tools-two-jobs.md).**
+> This doc was written assuming LSP is a more accurate *version* of what tree-sitter
+> does. Measured on 2026-07-26, two servers added **zero** edges ripple lacked while
+> producing systematic errors of their own — so the roles are not
+> base-tier/accuracy-tier: tree-sitter **produces** the graph, LSP **grades** it. The
+> mechanics below (client, budget, cache, reconciliation) are current; read doc 15 for
+> the framing.
+
 **Decision.** Take what language servers already compute (per-language, per-file
-truth about symbols and calls) and layer ripple's own value on top. Tree-sitter
-stays the base tier so ripple always answers; LSP *upgrades* what it can reach.
-No query ever blocks on a server.
+truth about symbols and calls) and use it to check ripple's own extraction.
+Tree-sitter stays the base tier so ripple always answers; LSP *grades* what it can
+reach and raises confidence where both agree. No query ever blocks on a server.
 
 ## Why lean on LSP at all
 
