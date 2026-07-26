@@ -1,7 +1,13 @@
 /target
 **/*.rs.bk
-Cargo.lock
 .DS_Store
 
 # ripple indexes itself now (see .claude/skills/use-ripple)
 /.ripple/
+
+# docs site build artifacts
+/docs/node_modules/
+/docs/dist/
+/docs/.astro/
+
+/.hallmark/

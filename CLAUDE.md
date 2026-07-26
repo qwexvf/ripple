@@ -4,7 +4,7 @@ Guidance for Claude Code (and humans) contributing to ripple. Read this before w
 
 ## What ripple is
 
-An AI-native code impact & review-targeting engine: given a change, return a risk-ranked blast radius; given a PR, return the hunks to review first. Language-agnostic core over a thin per-language adapter seam, in Rust. Design lives in [`docs/`](docs/) — start with [`README.md`](README.md), then [`docs/04-architecture.md`](docs/04-architecture.md) and [`docs/v0-plan.md`](docs/v0-plan.md).
+An AI-native code impact & review-targeting engine: given a change, return a risk-ranked blast radius; given a PR, return the hunks to review first. Language-agnostic core over a thin per-language adapter seam, in Rust. Design lives in [`docs/src/content/docs/design/`](docs/src/content/docs/design/) — start with [`README.md`](README.md), then [`04-architecture.md`](docs/src/content/docs/design/04-architecture.md) and [`v0-plan.md`](docs/src/content/docs/design/v0-plan.md).
 
 ## Repo layout
 
@@ -16,6 +16,9 @@ crates/
   resolve/  cross-file linking: discover → index_defs → link (imports + calls).
   store/    GraphStore trait + RedbStore + in-memory graph (neighbors). query runs in RAM, never in SQL.
   cli/      `ripple` binary: parse / index / neighbors.
+docs/     the Astro docs site. Prose lives in `docs/src/content/docs/`:
+            design/     the design docs (unchanged filenames, now with frontmatter)
+            reference/  CLI and MCP reference
 ```
 
 ## Commands
@@ -25,7 +28,16 @@ cargo fmt --all                     # format (rustfmt defaults — non-negotiabl
 cargo clippy --all-targets          # must be clean; CI denies warnings
 cargo test                          # unit + golden-fixture + contract tests
 cargo run -p ripple-cli -- <cmd>    # parse <file> | index <path> | neighbors <symbol>
+
+cd docs && bun install && bun dev   # docs site at localhost:4321
+cd docs && bun run build            # what CI checks
 ```
+
+Writing docs: a new page is a markdown file under `docs/src/content/docs/` with
+`title` + `sidebar.order` frontmatter — the sidebar picks it up by directory. Don't add
+an `# H1`; the layout renders `title` as the heading. Cross-references stay plain
+relative `.md` paths so they work on GitHub too — a remark plugin
+(`docs/src/plugins/remark-md-links.mjs`) rewrites them for the built site.
 
 ## Picking the next task
 
@@ -52,9 +64,9 @@ set Status, close it, and move `next-up` to whatever is now top. When something 
 found, open an issue instead of keeping a local list — `PROGRESS.txt` was deleted on
 purpose and must not come back.
 
-`docs/12-dogfood-log.md` is the running record of what ripple got wrong when used for
-real; it has produced more committed fixes than the roadmap has, and its open entries are
-usually the best candidates for new issues.
+[`12-dogfood-log.md`](docs/src/content/docs/design/12-dogfood-log.md) is the running
+record of what ripple got wrong when used for real; it has produced more committed fixes
+than the roadmap has, and its open entries are usually the best candidates for new issues.
 
 ## Architecture invariants (do not break)
 
@@ -62,7 +74,7 @@ These are the load-bearing rules the design depends on. A change that violates o
 
 1. **The IR boundary.** Everything above `ir` (resolve, store, overlay, query, mcp) is blind to which language produced a node. Only `parse`/`resolve` touch a `LanguageAdapter`. Never leak a language-specific concept (a tree-sitter node kind, a TS-ism) above `ir`.
 2. **The adapter seam.** Adding a language touches only `crates/lang/` (a module + `.scm` files + one `registry()` line). If a new language forces a change elsewhere, that's an abstraction leak — fix the abstraction.
-3. **Store isolation.** Store-specific query dialect (Cypher/Datalog for Samyama) lives *inside* the concrete `*Store` impl. The rest of ripple speaks only the `GraphStore` trait, so a backend swap is one crate. See [`docs/04-architecture.md#store`](docs/04-architecture.md).
+3. **Store isolation.** Store-specific query dialect (Cypher/Datalog for Samyama) lives *inside* the concrete `*Store` impl. The rest of ripple speaks only the `GraphStore` trait, so a backend swap is one crate. See [`04-architecture.md#store`](docs/src/content/docs/design/04-architecture.md#store).
 4. **Query in RAM, not in the DB.** Traversal runs over the in-memory graph. The store is a durable snapshot; never push blast-radius BFS into SQL/Cypher on the hot path.
 5. **Confidence is first-class.** Every inferred edge carries a `confidence` (1.0 = extracted, `1/N` over N ambiguous candidates). Never emit a fabricated single edge where resolution is uncertain — emit candidates or drop.
 

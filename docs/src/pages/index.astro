@@ -1,0 +1,125 @@
+---
+import BaseLayout from "@/layouts/BaseLayout.astro";
+
+const base = import.meta.env.BASE_URL.replace(/\/$/, "") + "/";
+
+const capabilities = [
+  {
+    num: "01",
+    title: "Blast radius, ranked",
+    body: "Ask what depends on a symbol and get an ordered list, not a set. Each hit carries the edge kind it arrived on, its depth, and a confidence — so you can tell an extracted call from a statistical co-change.",
+  },
+  {
+    num: "02",
+    title: "Review targeting",
+    body: "Point it at a diff and it ranks the changed symbols by risk × downstream reach, with a reason on every line. On this repo the top entry scores 14.95 and the last 2.36 — that spread is the product.",
+  },
+  {
+    num: "03",
+    title: "Across services and repos",
+    body: "A GraphQL operation in a TypeScript frontend resolves to the Absinthe resolver that serves it, in a different repository, in one traversal. Static tools stop at the repo boundary.",
+  },
+  {
+    num: "04",
+    title: "Built for agents",
+    body: "An MCP server over stdio with eight tools, a token budget on every query, and an explicit {shown, total} so nothing is truncated silently. It indexes on first use if the graph is missing.",
+  },
+];
+
+const next = [
+  { href: "getting-started/", label: "Getting started", desc: "build it, index a repo, read your first ranking" },
+  { href: "reference/cli/", label: "CLI reference", desc: "every command and flag" },
+  { href: "reference/mcp/", label: "MCP reference", desc: "wire it into Claude Code, Cursor, or any MCP client" },
+  { href: "design/01-landscape/", label: "Design docs", desc: "the landscape, the gap, and what we measured wrong" },
+];
+---
+
+<BaseLayout
+  title="ripple — code impact & review targeting"
+  description="Given a change, a risk-ranked blast radius. Given a PR, the hunks to review first. Language-agnostic core in Rust, served over MCP."
+>
+  <div class="mx-auto max-w-[80rem] px-6 pb-24">
+    <section class="pt-16 md:pt-24">
+      <div class="mb-8 max-w-full overflow-hidden font-mono text-xs tracking-wider text-[var(--color-fg-faint)]">
+        ┌─ RIPPLE ────────────────────────────────────────────────────
+      </div>
+
+      <h1 class="font-display text-5xl font-bold leading-[0.95] tracking-tight text-[var(--color-fg-strong)] md:text-7xl">
+        What breaks if<br />I change this?
+      </h1>
+
+      <div class="mt-6 h-0.5 w-16 bg-[var(--color-signal)]"></div>
+
+      <p class="mt-6 max-w-[58ch] font-mono text-base text-[var(--color-fg)]">
+        <span class="font-semibold text-[var(--color-signal)]">{">"}</span>{" "}
+        A code impact and review-targeting engine. It doesn't try to find your bugs —
+        it decides what you should read first.
+      </p>
+
+      <div class="mt-8 flex flex-wrap gap-3">
+        <a
+          href={base + "getting-started/"}
+          class="inline-flex items-center rounded-sm border border-[var(--color-fg-strong)] bg-[var(--color-fg-strong)] px-5 py-2.5 font-mono text-sm font-medium text-[var(--color-bg)] transition-colors hover:border-[var(--color-signal)] hover:bg-[var(--color-signal)]"
+        >
+          Get started
+        </a>
+        <a
+          href="https://github.com/qwexvf/ripple"
+          class="inline-flex items-center rounded-sm border border-[var(--color-rule-strong)] bg-transparent px-5 py-2.5 font-mono text-sm font-medium text-[var(--color-fg)] transition-colors hover:border-[var(--color-signal)] hover:text-[var(--color-signal)]"
+        >
+          Source →
+        </a>
+      </div>
+    </section>
+
+    <section class="mt-24 max-w-4xl">
+      <div class="mb-5 font-mono text-[0.72rem] font-semibold uppercase tracking-[0.16em] text-[var(--color-fg-faint)]">
+        The two questions
+      </div>
+      <dl class="border-t border-[var(--color-rule)]">
+        {capabilities.map((c) => (
+          <div class="grid gap-x-8 gap-y-2 border-b border-[var(--color-rule)] py-6 md:grid-cols-[22rem_1fr]">
+            <dt class="flex items-baseline gap-4">
+              <span class="font-mono text-sm font-semibold text-[var(--color-signal)]">{c.num}</span>
+              <span class="font-display text-base font-semibold leading-tight text-[var(--color-fg-strong)]">{c.title}</span>
+            </dt>
+            <dd class="text-sm leading-relaxed text-[var(--color-fg)]">{c.body}</dd>
+          </div>
+        ))}
+      </dl>
+    </section>
+
+    <section class="mt-20 max-w-4xl">
+      <div class="mb-5 font-mono text-[0.72rem] font-semibold uppercase tracking-[0.16em] text-[var(--color-fg-faint)]">
+        Where it stands
+      </div>
+      <p class="max-w-[62ch] text-sm leading-relaxed text-[var(--color-fg)]">
+        Pre-1.0, no binary releases yet. Five adapters — TypeScript, TSX, Elixir, GraphQL, Rust —
+        of which TypeScript and Elixir have call resolution at a usable level. Indexing
+        <span class="font-mono">honojs/hono</span> (378 files) takes 0.47 s cold and 0.33 s warm on a release build.
+        The measurements that did <em>not</em> hold up, and why, are written down in the
+        <a class="text-[var(--color-signal)] underline-offset-4 hover:underline" href={base + "design/12-dogfood-log/"}>dogfood log</a>.
+      </p>
+    </section>
+
+    <section class="mt-20 max-w-4xl">
+      <div class="mb-5 font-mono text-[0.72rem] font-semibold uppercase tracking-[0.16em] text-[var(--color-fg-faint)]">
+        Next
+      </div>
+      <ul class="border-t border-[var(--color-rule)]">
+        {next.map((n) => (
+          <li class="grid grid-cols-1 gap-x-8 gap-y-1 border-b border-[var(--color-rule)] py-3 md:grid-cols-[16rem_1fr]">
+            <a
+              href={base + n.href}
+              class="group inline-flex items-baseline font-display text-base font-semibold text-[var(--color-fg-strong)] transition-colors hover:text-[var(--color-signal)]"
+            >
+              <span class="mr-2 font-mono font-normal text-[var(--color-signal)]">→</span>
+              {n.label}
+            </a>
+            <span class="self-center text-sm text-[var(--color-fg-mute)]">{n.desc}</span>
+          </li>
+        ))}
+      </ul>
+    </section>
+  </div>
+</BaseLayout>

@@ -1,0 +1,99 @@
+---
+import "@/styles/globals.css";
+import "@/styles/prose.css";
+import Header from "@/components/Header.astro";
+import { buildNav } from "@/lib/nav";
+
+interface Props {
+  title: string;
+  description?: string;
+  currentSlug?: string;
+}
+
+const { title, description, currentSlug = "" } = Astro.props;
+const groups = await buildNav();
+
+const themeInit = `
+(function () {
+  try {
+    var stored = localStorage.getItem('docs-theme');
+    var theme = stored === 'light' || stored === 'dark' ? stored : 'dark';
+    document.documentElement.dataset.theme = theme;
+  } catch (e) {
+    document.documentElement.dataset.theme = 'dark';
+  }
+})();
+`;
+---
+
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content={description ?? title} />
+    <link rel="icon" type="image/svg+xml" href={import.meta.env.BASE_URL + "favicon.svg"} />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Sans+Condensed:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500;600;700&display=swap"
+    />
+    <title>{title}</title>
+    <script is:inline set:html={themeInit} />
+  </head>
+  <body>
+    <Header groups={groups} currentSlug={currentSlug} />
+    <slot />
+    <script>
+      // Copy-to-clipboard on every <pre>. Runs once per page load.
+      // Astro is MPA so each navigation re-runs this script.
+      (() => {
+        const blocks = document.querySelectorAll<HTMLPreElement>(".prose-docs pre");
+        blocks.forEach((pre) => {
+          if (pre.querySelector(".code-copy-btn")) return;
+          const code = pre.querySelector("code");
+          if (!code) return;
+          const btn = document.createElement("button");
+          btn.type = "button";
+          btn.className = "code-copy-btn";
+          btn.setAttribute("aria-label", "Copy code to clipboard");
+          btn.innerHTML =
+            '<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="1.5"/><path d="M5 15V5.5A1.5 1.5 0 0 1 6.5 4H15"/></svg><span>copy</span>';
+          btn.addEventListener("click", async () => {
+            try {
+              await navigator.clipboard.writeText(code.innerText);
+              btn.dataset.copied = "true";
+              const label = btn.querySelector("span");
+              if (label) label.textContent = "copied";
+              setTimeout(() => {
+                btn.dataset.copied = "false";
+                if (label) label.textContent = "copy";
+              }, 1500);
+            } catch (err) {
+              console.warn("clipboard copy failed", err);
+            }
+          });
+          pre.appendChild(btn);
+        });
+      })();
+
+      // Heading anchor: clicking the # appends to the URL AND copies it.
+      (() => {
+        document.querySelectorAll<HTMLAnchorElement>("a.heading-anchor").forEach((a) => {
+          a.addEventListener("click", async (e) => {
+            e.preventDefault();
+            const hash = a.getAttribute("href") ?? "";
+            const url = window.location.origin + window.location.pathname + hash;
+            history.replaceState(null, "", hash);
+            try {
+              await navigator.clipboard.writeText(url);
+              a.classList.add("copied");
+              setTimeout(() => a.classList.remove("copied"), 1200);
+            } catch {}
+          });
+        });
+      })();
+    </script>
+  </body>
+</html>
