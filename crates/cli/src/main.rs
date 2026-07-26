@@ -166,6 +166,16 @@ fn index_project(roots: &[PathBuf]) -> Result<String> {
 
     // structural risk needs every edge, including the cross-service ones
     let with_dependents = overlay::score_structure(&mut nodes, &edges);
+    // several call sites between the same pair are several edges. Counted rather than
+    // merged: a site is real information (`path` prints its line), and the count is the
+    // number that decides whether merging would be worth the loss (#28)
+    let repeated = {
+        let mut seen: HashSet<(u64, u64, u8)> = HashSet::new();
+        edges
+            .iter()
+            .filter(|e| !seen.insert((e.src.0, e.dst.0, e.kind as u8)))
+            .count()
+    };
 
     // one transaction: a crash between these three would leave the graph, the
     // extract cache and the roots describing different indexes
@@ -173,10 +183,10 @@ fn index_project(roots: &[PathBuf]) -> Result<String> {
 
     let s = indexed.stats;
     Ok(format!(
-        "indexed {} files across {} root(s) ({} added, {} changed, {} unchanged, {} removed) → {} nodes, {} edges ({} co-change, {} graphql, {} db, {} imported, {} file-granular, {} with dependents) ({})",
+        "indexed {} files across {} root(s) ({} added, {} changed, {} unchanged, {} removed) → {} nodes, {} edges ({} co-change, {} graphql, {} db, {} imported, {} file-granular, {} repeated, {} with dependents) ({})",
         indexed.result.files_indexed, indexed.roots.len(),
         s.added, s.changed, s.unchanged, s.removed,
-        nodes.len(), edges.len(), cochange_applied, graphql, db, imported, file_granular, with_dependents,
+        nodes.len(), edges.len(), cochange_applied, graphql, db, imported, file_granular, repeated, with_dependents,
         db_path(&roots[0]).display()
     ))
 }
@@ -601,41 +611,77 @@ fn parent_of(hop: &store::Hop, dir: Dir) -> Option<ir::SymbolId> {
 /// `neighbors --depth 3` printed hops sorted by depth, so every second-level hop sat
 /// at the same indentation regardless of which first-level hop it came from — the walk
 /// was unreadable as a chain, which is what a walk is for.
-fn tree_order(root: ir::SymbolId, hops: &[store::Hop], dir: Dir) -> Vec<store::Hop> {
+fn tree_order(root: ir::SymbolId, hops: &[store::Hop], dir: Dir) -> Vec<Row> {
     let mut children: HashMap<ir::SymbolId, Vec<&store::Hop>> = HashMap::new();
     for h in hops {
         if let Some(p) = parent_of(h, dir) {
             children.entry(p).or_default().push(h);
         }
     }
-    let mut out = Vec::with_capacity(hops.len());
-    let mut seen = HashSet::new();
-    walk_tree(root, &children, &mut seen, &mut out);
+    // how many sites back each (neighbour, edge kind): three `<Input />` in one
+    // component are three edges, and collapsing them without saying so hides that (#28)
+    let mut sites: HashMap<(ir::SymbolId, u8), usize> = HashMap::new();
+    for h in hops {
+        *sites.entry((h.node.id, h.edge.kind as u8)).or_default() += 1;
+    }
+
+    let mut walk = Walk {
+        children: &children,
+        sites: &sites,
+        // one row per (neighbour, kind): keying on the node alone dropped the fact that
+        // a caller can both import *and* call the same target
+        emitted: HashSet::new(),
+        // recursion is per node — expanding one twice would duplicate a whole subtree
+        expanded: HashSet::new(),
+        out: Vec::with_capacity(hops.len()),
+    };
+    walk.descend(root);
     // a hop whose parent was never itself reached (a cycle entered mid-way) still has
     // to be printed — dropping it would silently shrink the answer
     for h in hops {
-        if seen.insert(h.node.id) {
-            out.push(clone_hop(h));
-        }
+        walk.push(h);
     }
-    out
+    walk.out
 }
 
-fn walk_tree(
-    at: ir::SymbolId,
-    children: &HashMap<ir::SymbolId, Vec<&store::Hop>>,
-    seen: &mut HashSet<ir::SymbolId>,
-    out: &mut Vec<store::Hop>,
-) {
-    let Some(kids) = children.get(&at) else {
-        return;
-    };
-    for h in kids {
-        if !seen.insert(h.node.id) {
-            continue;
+/// One line of a traversal: a neighbour, and how many sites back it.
+struct Row {
+    hop: store::Hop,
+    sites: usize,
+}
+
+struct Walk<'a> {
+    children: &'a HashMap<ir::SymbolId, Vec<&'a store::Hop>>,
+    sites: &'a HashMap<(ir::SymbolId, u8), usize>,
+    emitted: HashSet<(ir::SymbolId, u8)>,
+    expanded: HashSet<ir::SymbolId>,
+    out: Vec<Row>,
+}
+
+impl Walk<'_> {
+    /// Emit a row unless this (neighbour, kind) already has one. Returns whether it did.
+    fn push(&mut self, h: &store::Hop) -> bool {
+        let key = (h.node.id, h.edge.kind as u8);
+        if !self.emitted.insert(key) {
+            return false;
         }
-        out.push(clone_hop(h));
-        walk_tree(h.node.id, children, seen, out);
+        self.out.push(Row {
+            hop: clone_hop(h),
+            sites: self.sites.get(&key).copied().unwrap_or(1),
+        });
+        true
+    }
+
+    fn descend(&mut self, at: ir::SymbolId) {
+        let Some(kids) = self.children.get(&at).cloned() else {
+            return;
+        };
+        for h in kids {
+            let fresh = self.push(h);
+            if fresh && self.expanded.insert(h.node.id) {
+                self.descend(h.node.id);
+            }
+        }
     }
 }
 
@@ -1846,10 +1892,18 @@ fn cmd_neighbors(args: &[String]) -> Result<()> {
                 start.module_path,
                 format_args!("{:?}", start.kind)
             );
-            for h in &tree_order(start.id, &hops, dir) {
+            for row in &tree_order(start.id, &hops, dir) {
+                let h = &row.hop;
+                // several call sites are several edges; collapsing them silently would
+                // hide that a component renders the target three times (#28)
+                let times = if row.sites > 1 {
+                    format!(" ×{}", row.sites)
+                } else {
+                    String::new()
+                };
                 let indent = "  ".repeat(h.depth);
                 println!(
-                    "{indent}{:?}<{:.2}> {} ({})",
+                    "{indent}{:?}<{:.2}>{times} {} ({})",
                     h.edge.kind, h.edge.confidence, h.node.name, h.node.module_path
                 );
             }
@@ -1904,20 +1958,28 @@ mod tests {
     fn a_walk_is_ordered_under_its_parents() {
         let root = ir::SymbolId::of("m.ex", "root");
         // root → a → a2, root → b, plus an orphan whose parent was never reached
+        // `b` twice from the same parent: two call sites, one row, count of 2
         let hops = vec![
             hop("root", "a", 1),
+            hop("root", "b", 1),
             hop("root", "b", 1),
             hop("a", "a2", 2),
             hop("nowhere", "orphan", 2),
         ];
-        let names: Vec<String> = tree_order(root, &hops, Dir::Out)
+        let names: Vec<(String, usize)> = tree_order(root, &hops, Dir::Out)
             .into_iter()
-            .map(|h| h.node.name)
+            .map(|r| (r.hop.node.name, r.sites))
             .collect();
         assert_eq!(
             names,
-            vec!["a", "a2", "b", "orphan"],
-            "a2 follows a, and an unreachable hop is still printed rather than dropped"
+            vec![
+                ("a".to_owned(), 1),
+                ("a2".to_owned(), 1),
+                ("b".to_owned(), 2),
+                ("orphan".to_owned(), 1)
+            ],
+            "a2 follows a; b is reached twice so it says so once; an unreachable hop is \
+             still printed rather than dropped"
         );
     }
 
