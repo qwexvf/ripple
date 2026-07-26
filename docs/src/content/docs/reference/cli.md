@@ -17,6 +17,7 @@ ripple risk <symbol|file> [--root <path>] [--json]
 ripple mcp [--root <path>]
 ripple eval [--commits N] [--skip N] [--root <path>]
 ripple lsp doctor [--root <path>] [--budget 10s] [--json]
+ripple lsp trust [--root <path>]
 ```
 
 Flags shared by nearly every command:
@@ -152,3 +153,24 @@ server before ranking. `--verify-budget` (default `2s`) bounds the wait. When a 
 contradicts an edge, `--floor-contradicted` keeps it at minimum confidence and
 `--drop-contradicted` removes it. Design notes in
 [11-lsp-integration.md](../design/11-lsp-integration.md).
+
+## `ripple lsp trust [--root <path>]`
+
+Configure servers in **`~/.config/ripple/lsp.json`** (or `$XDG_CONFIG_HOME/ripple/lsp.json`,
+or `$RIPPLE_LSP_CONFIG`). That file is outside every repository and is always applied.
+
+A `.ripple/lsp.json` *inside the repository being analysed* is different: it names a command
+that ripple would execute, and the repository is not necessarily yours. It is therefore read
+and reported but **not obeyed**:
+
+```
+⚠ ignored /path/to/repo/.ripple/lsp.json — a config inside the repository names commands to run,
+  and this root is not trusted. Nothing from it was used:
+    go: /bin/touch
+  Move it to /home/you/.config/ripple/lsp.json to apply it everywhere,
+  or run `ripple lsp trust` if you wrote this repository's copy yourself.
+```
+
+`ripple lsp trust` records the root in `~/.config/ripple/trusted-roots` — an exact path per
+line, so trusting one checkout never trusts a sibling or a nested repo. `RIPPLE_TRUST_REPO_LSP=1`
+does the same for CI. Nothing writes trust into the repository itself.

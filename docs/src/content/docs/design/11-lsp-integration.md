@@ -144,7 +144,7 @@ worth a new one. An entry replaces the built-in for that language; omitted field
 take their default.
 
 ```json
-// .ripple/lsp.json
+// ~/.config/ripple/lsp.json
 [
   { "language": "elixir", "command": "lexical", "inline": false, "max_concurrency": 2 },
   { "language": "gleam",  "command": "gleam", "args": ["lsp"], "root_markers": ["gleam.toml"] }
@@ -153,6 +153,33 @@ take their default.
 
 Built-in defaults cover `elixir` (dexter), `typescript`, `go`, `python`, and
 `rust`.
+
+### …but a repository's data is not an instruction
+
+The file above used to be read from `<root>/.ripple/lsp.json` — inside the
+repository being analysed. A `command` in it gets **executed**, so cloning a repo
+and running `ripple lsp doctor` was enough to run whatever that repo said, as the
+user. Demonstrated with a config naming `/bin/touch`, which ran and which `doctor`
+then printed as if it were the name of a language server. That is issue #34, and
+it mattered more here than it would for a normal dev tool: ripple ships an MCP
+server, so the one pulling the trigger is usually an agent reading somebody else's
+code.
+
+The rule now:
+
+| Source | Trusted | Why |
+|---|---|---|
+| built-in defaults | yes | ours |
+| `$RIPPLE_LSP_CONFIG`, else `$XDG_CONFIG_HOME/ripple/lsp.json`, else `~/.config/ripple/lsp.json` | yes | outside every repository, so no repository can write it |
+| `<root>/.ripple/lsp.json` | **only after `ripple lsp trust`** | the analysed tree is attacker-controlled input |
+
+An untrusted in-repo table is not silently dropped — `doctor` prints the file, the
+languages and the commands it wanted to run, and how to accept them. Trust is
+recorded per root in `~/.config/ripple/trusted-roots`, never inside the repository
+(a repo that could mark itself trusted would be no boundary at all), and it is an
+exact path match, so trusting one checkout never trusts anything nested in it.
+`RIPPLE_TRUST_REPO_LSP=1` covers CI, where the checkout is already trusted by
+whoever configured the job.
 
 ## Phases
 
