@@ -399,8 +399,8 @@ fn link(
         files.iter().map(|f| (f.canonical.as_path(), f)).collect();
     for f in files {
         let module_id = module_symbol(&f.module_path);
-        let bindings = resolve_imports(f, idx, &by_path, registry, ws, &mut edges);
-        resolve_calls(f, idx, module_id, &bindings, &mut edges);
+        let (bindings, modules) = resolve_imports(f, idx, &by_path, registry, ws, &mut edges);
+        resolve_calls(f, idx, module_id, &bindings, &modules, &mut edges);
     }
     edges
 }
@@ -462,16 +462,34 @@ fn resolve_imports(
     registry: &[Box<dyn LanguageAdapter>],
     ws: &Workspace,
     edges: &mut Vec<Edge>,
-) -> HashMap<String, SymbolId> {
+) -> (HashMap<String, SymbolId>, HashMap<String, PathBuf>) {
     let module_id = module_symbol(&f.module_path);
     let adapter = lang::adapter_for(registry, &f.canonical);
     let mut bindings = HashMap::new();
+    // local name → the file it names as a whole (`import * as ns`)
+    let mut modules: HashMap<String, PathBuf> = HashMap::new();
 
     for imp in &f.extract.imports {
         let Some(adapter) = adapter else { continue };
         let Some(target) = adapter.resolve_import(&imp.specifier, &f.canonical, ws) else {
             continue; // bare/unresolved specifier (external node_modules dep)
         };
+        if imp.is_namespace() {
+            // the binding names a module, so there is no single symbol to point at;
+            // the file's module node is the honest target
+            modules.insert(imp.local_name.clone(), target.clone());
+            if let Some(m) = by_path.get(target.as_path()) {
+                edges.push(Edge {
+                    src: module_id,
+                    dst: module_symbol(&m.module_path),
+                    kind: EdgeKind::Imports,
+                    confidence: CONF_IMPORT,
+                    site: imp.site,
+                    source: EdgeSource::Extracted,
+                });
+            }
+            continue;
+        }
         let resolved = if imp.imported_name == "default" {
             default_export(idx, &target)
         } else {
@@ -497,7 +515,7 @@ fn resolve_imports(
             });
         }
     }
-    bindings
+    (bindings, modules)
 }
 
 /// Resolve a file's call sites (bare + member) into Calls edges.
@@ -506,6 +524,7 @@ fn resolve_calls(
     idx: &DefIndex,
     module_id: SymbolId,
     bindings: &HashMap<String, SymbolId>,
+    modules: &HashMap<String, PathBuf>,
     edges: &mut Vec<Edge>,
 ) {
     // local identifier → class-name map (M2 approximation: file-wide, last wins)
@@ -557,7 +576,20 @@ fn resolve_calls(
                 },
             },
             RefKind::Member => {
-                resolve_member(&r.name, r.receiver.as_ref(), enclosing, &type_map, idx)
+                // a receiver bound to a whole module is pinned by the import, so the
+                // method is whatever that module exports under this name — no guessing
+                if let Some(target) = module_receiver(r.receiver.as_ref(), modules) {
+                    match idx
+                        .export_table
+                        .get(&(target.clone(), r.name.clone()))
+                        .copied()
+                    {
+                        Some(sym) => (vec![sym], CONF_KNOWN_RECEIVER),
+                        None => (Vec::new(), CONF_KNOWN_RECEIVER),
+                    }
+                } else {
+                    resolve_member(&r.name, r.receiver.as_ref(), enclosing, &type_map, idx)
+                }
             }
         };
 
@@ -683,6 +715,17 @@ fn resolve_member(
             None => (candidates(), CONF_CANDIDATE),
         },
         _ => (candidates(), CONF_CANDIDATE),
+    }
+}
+
+/// The file a member call's receiver names, when the receiver is a namespace import.
+fn module_receiver(
+    receiver: Option<&Receiver>,
+    modules: &HashMap<String, PathBuf>,
+) -> Option<PathBuf> {
+    match receiver {
+        Some(Receiver::Ident(name)) => modules.get(name.as_str()).cloned(),
+        _ => None,
     }
 }
 

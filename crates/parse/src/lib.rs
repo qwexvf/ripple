@@ -26,9 +26,23 @@ pub struct CachedFile {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImportRec {
     pub local_name: String,
-    pub imported_name: String, // "default" for default imports
+    /// Name in the *source* module. `default` for a default import, `*` for a
+    /// namespace import (`import * as ns`, `alias Foo.Bar` — the whole module is bound
+    /// to one local name).
+    pub imported_name: String,
     pub specifier: String,
     pub site: Span,
+}
+
+impl ImportRec {
+    /// Does this binding name a whole module rather than one symbol?
+    ///
+    /// A namespace binding resolves differently: `ns.foo()` has to look `foo` up in the
+    /// target module's exports, which is a member call whose receiver is pinned by the
+    /// import rather than inferred from a type.
+    pub fn is_namespace(&self) -> bool {
+        self.imported_name == "*"
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -298,21 +312,35 @@ fn extract_imports(tree: &Tree, query: &Query, src: &[u8]) -> Result<Vec<ImportR
         }
         let mut specifier = None;
         let mut named: Vec<(String, Span)> = Vec::new();
+        let mut alias: Option<String> = None;
         let mut default: Option<(String, Span)> = None;
+        let mut namespace: Option<(String, Span)> = None;
         for cap in m.captures {
             let text = cap.node.utf8_text(src).unwrap_or("").to_owned();
             match names[cap.index as usize] {
                 "import.source" => specifier = Some(text),
                 "import.name" => named.push((text, span_of(cap.node))),
+                "import.alias" => alias = Some(text),
                 "import.default" => default = Some((text, span_of(cap.node))),
+                "import.namespace" => namespace = Some((text, span_of(cap.node))),
                 _ => {}
             }
         }
         let Some(specifier) = specifier else { continue };
         for (n, site) in named {
             out.push(ImportRec {
-                local_name: n.clone(),
+                // `import { a as b }` binds `b` locally to the source's `a`; comparing
+                // the wrong one made every call through an alias unresolvable
+                local_name: alias.clone().unwrap_or_else(|| n.clone()),
                 imported_name: n,
+                specifier: specifier.clone(),
+                site,
+            });
+        }
+        if let Some((n, site)) = namespace {
+            out.push(ImportRec {
+                local_name: n,
+                imported_name: "*".to_owned(),
                 specifier: specifier.clone(),
                 site,
             });

@@ -575,3 +575,32 @@ fn an_import_through_a_barrel_reaches_the_real_definition() {
         "`export {{ unmask as reveal }} from` renames it on the way out"
     );
 }
+
+/// `import { a as b }` binds `b` to the source's `a`, and `import * as ns` binds a
+/// whole module so `ns.foo()` resolves through its exports (issue #1). Both were
+/// unresolvable, which silently dropped every call made through them.
+#[test]
+fn an_aliased_and_a_namespace_import_both_resolve() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/alias");
+    let r = resolve::build(&root).unwrap();
+
+    let run = SymbolId::of("page.ts", "run");
+    let original = SymbolId::of("util.ts", "original");
+    let other = SymbolId::of("util.ts", "other");
+
+    let call = |dst: SymbolId| {
+        r.edges
+            .iter()
+            .find(|e| e.kind == EdgeKind::Calls && e.src == run && e.dst == dst)
+    };
+    assert!(
+        call(original).is_some(),
+        "renamed('x') is a call to util.original"
+    );
+    let ns = call(other).expect("helpers.other('y') is a call to util.other");
+    assert!(
+        ns.confidence >= 0.9,
+        "a namespace receiver is pinned by the import, not inferred: {}",
+        ns.confidence
+    );
+}

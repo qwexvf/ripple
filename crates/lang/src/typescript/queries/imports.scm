@@ -23,3 +23,24 @@
       name: (identifier) @reexport.name
       alias: (identifier)? @reexport.alias))
   source: (string (string_fragment) @reexport.source))
+
+; Aliased named import:  import { a as b } from "x"
+;
+; The local name is `b`, the source knows it as `a`. Binding the wrong one made every
+; call through an alias unresolvable (issue #1).
+(import_statement
+  (import_clause
+    (named_imports
+      (import_specifier
+        name: (identifier) @import.name
+        alias: (identifier) @import.alias)))
+  source: (string (string_fragment) @import.source))
+
+; Namespace import:  import * as ns from "x"
+;
+; Binds a whole module to one local name, so `ns.foo()` is a member call whose receiver
+; is pinned by the import rather than inferred.
+(import_statement
+  (import_clause
+    (namespace_import (identifier) @import.namespace))
+  source: (string (string_fragment) @import.source))
