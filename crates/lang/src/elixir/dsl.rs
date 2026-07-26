@@ -6,7 +6,9 @@
 //! not touching the walker. See docs/05-language-support.md.
 
 use super::macros::{FunRef, MacroCall, Scan};
-use crate::cross::{camelize, AbsintheField, CrossFacts, ElixirFacts, GQL_ROOT_SCOPES};
+use crate::cross::{
+    camelize, AbsintheContextField, AbsintheField, CrossFacts, ElixirFacts, GQL_ROOT_SCOPES,
+};
 use std::collections::HashMap;
 
 /// A GraphQL-schema DSL: nested type blocks whose members declare a resolver.
@@ -104,7 +106,22 @@ fn schema_facts(scan: &Scan, dsl: &SchemaDsl, out: &mut ElixirFacts) {
         let Some(atom) = call.atoms.first() else {
             continue;
         };
+        let returns = call
+            .atoms
+            .get(1)
+            .or_else(|| call.wrapped_atoms.first())
+            .cloned();
         let Some((module, func)) = resolver_of(call, dsl, &block_resolvers) else {
+            // no named function, but a context module is still an answer: a
+            // `dataloader(Mod)` field is served by Mod, one level coarser
+            if let Some(module) = context_of(call, dsl) {
+                out.context_fields.push(AbsintheContextField {
+                    scope,
+                    field: camelize(atom),
+                    module,
+                    returns,
+                });
+            }
             continue;
         };
         out.fields.push(AbsintheField {
@@ -112,6 +129,9 @@ fn schema_facts(scan: &Scan, dsl: &SchemaDsl, out: &mut ElixirFacts) {
             field: camelize(atom),
             module,
             func,
+            // `field :author, :player` → the second atom; `list_of(:lfg_post)` puts it
+            // one level in. Anything else stays None rather than being guessed at.
+            returns,
         });
     }
 }
@@ -135,6 +155,15 @@ fn resolver_of(
         .iter()
         .find(|(key, _)| key == dsl.resolver)
         .map(|(_, r)| r.clone())
+}
+
+/// The context module a member's resolver names, when it names a module rather than a
+/// function (`resolve: dataloader(App.Teams)`).
+fn context_of(call: &MacroCall, dsl: &SchemaDsl) -> Option<String> {
+    call.keyword_modules
+        .iter()
+        .find(|(key, _)| key == dsl.resolver)
+        .map(|(_, module)| module.clone())
 }
 
 /// Normalize a scope-chain entry to the join key the resolve layer uses: a root

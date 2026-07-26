@@ -657,3 +657,47 @@ fn a_binding_is_scoped_to_the_function_that_declares_it() {
         "two equally plausible targets must split confidence, got {conf}"
     );
 }
+
+/// A nested selection has a resolver of its own, and matching only root fields missed
+/// every one (issue #22): `currentPlayer { team { … } }` must reach `team`'s resolver,
+/// which is declared on `object :player`, not on the root.
+#[test]
+fn a_nested_selection_reaches_its_own_resolver() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/nested");
+    let indexed = resolve::build_incremental(
+        std::slice::from_ref(&root),
+        &std::collections::HashMap::new(),
+    )
+    .unwrap();
+    let r = resolve::link_cross_service(&indexed.files, &indexed.result.nodes);
+
+    let page = SymbolId::module("page.ts");
+    let me = SymbolId::of("resolver.ex", "me");
+    let team_of = SymbolId::of("resolver.ex", "team_of");
+    let reached: Vec<SymbolId> = r
+        .edges
+        .iter()
+        .filter(|e| e.src == page && e.kind == EdgeKind::GraphqlCall)
+        .map(|e| e.dst)
+        .collect();
+
+    assert!(reached.contains(&me), "the root field's resolver");
+    assert!(
+        reached.contains(&team_of),
+        "the nested field's resolver, found by descending currentPlayer's type"
+    );
+
+    // `resolve: dataloader(App.Badges)` names a context, not a function: the honest
+    // target is that module, at a lower confidence than a named resolver
+    let badges = SymbolId::module("badges.ex");
+    let ctx = r
+        .edges
+        .iter()
+        .find(|e| e.src == page && e.dst == badges && e.kind == EdgeKind::GraphqlCall)
+        .expect("a dataloader field reaches its context module");
+    assert!(
+        ctx.confidence < 0.9,
+        "module-granular is worth less than a named function: {}",
+        ctx.confidence
+    );
+}

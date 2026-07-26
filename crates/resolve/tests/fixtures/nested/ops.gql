@@ -1,0 +1,11 @@
+query CurrentPlayer {
+  currentPlayer {
+    id
+    team {
+      name
+    }
+    badges {
+      name
+    }
+  }
+}

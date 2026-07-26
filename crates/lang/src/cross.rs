@@ -33,6 +33,23 @@ pub struct GqlOp {
     pub scope: String,
     /// Root field name, as written in the document (camelCase).
     pub field: String,
+    /// Field names from the root down to this selection, root first. `["lfgPosts",
+    /// "author"]` for `lfgPosts { author { … } }`. A nested selection has a resolver
+    /// too, and matching only the root field missed every one of them.
+    pub path: Vec<String>,
+}
+
+/// A field served by a *context module* rather than a named function —
+/// `resolve: dataloader(App.Teams)`. 138 of 142 dataloader resolvers on one real
+/// schema, so leaving them out left most type-level fields unreachable; but no single
+/// function is named, so the honest target is the module.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AbsintheContextField {
+    pub scope: String,
+    pub field: String,
+    /// Context module FQN — alias-resolved at extraction.
+    pub module: String,
+    pub returns: Option<String>,
 }
 
 /// An Absinthe `field` with a resolver — the producer side of the join.
@@ -48,6 +65,11 @@ pub struct AbsintheField {
     /// Resolver module FQN — alias-resolved at extraction.
     pub module: String,
     pub func: String,
+    /// The type this field returns, as the schema names it (`:player`,
+    /// `list_of(:lfg_post)` → `lfg_post`). What makes descending a nested selection
+    /// possible: the parent field's type is the scope its children are declared in.
+    /// `None` when the type isn't a plain atom — under-link rather than guess.
+    pub returns: Option<String>,
 }
 
 /// Absinthe root scopes. A GraphQL document's root field can only name a field
@@ -62,6 +84,8 @@ pub struct ElixirFacts {
     pub is_schema: bool,
     /// Absinthe fields that declare a resolver.
     pub fields: Vec<AbsintheField>,
+    /// Absinthe fields served by a context module (`resolve: dataloader(Mod)`).
+    pub context_fields: Vec<AbsintheContextField>,
     /// `import_fields(:other)` — (importing scope, included scope). Absinthe
     /// schemas normally declare root fields in `object :x_queries` blocks and
     /// pull them into `query do` this way, so the includes must be followed to
@@ -116,6 +140,49 @@ pub fn graphql(root: TsNode, src: &[u8]) -> CrossFacts {
     }
 }
 
+/// Walk a selection set, emitting one `GqlOp` per selected field with its full path.
+///
+/// Recursive because a nested selection is a field on another type, with its own
+/// resolver — flattening to the root field is what made those resolvers unreachable.
+fn collect_selections(
+    set: TsNode,
+    src: &[u8],
+    op: &str,
+    scope: &str,
+    path: &mut Vec<String>,
+    out: &mut Vec<GqlOp>,
+) {
+    let mut sc = set.walk();
+    for sel in set.named_children(&mut sc) {
+        if sel.kind() != "selection" {
+            continue;
+        }
+        let Some(field) = sel.named_child(0).filter(|f| f.kind() == "field") else {
+            continue; // a fragment spread names no field of its own
+        };
+        let mut fc = field.walk();
+        let children: Vec<TsNode> = field.named_children(&mut fc).collect();
+        let Some(name) = children
+            .iter()
+            .find(|n| n.kind() == "name")
+            .map(|n| text(*n, src).to_owned())
+        else {
+            continue;
+        };
+        path.push(name.clone());
+        out.push(GqlOp {
+            name: op.to_owned(),
+            scope: scope.to_owned(),
+            field: name,
+            path: path.clone(),
+        });
+        for nested in children.iter().filter(|n| n.kind() == "selection_set") {
+            collect_selections(*nested, src, op, scope, path, out);
+        }
+        path.pop();
+    }
+}
+
 fn collect_gql(node: TsNode, src: &[u8], out: &mut Vec<GqlOp>) {
     if node.kind() == "operation_definition" {
         let mut op_name = None;
@@ -132,26 +199,7 @@ fn collect_gql(node: TsNode, src: &[u8], out: &mut Vec<GqlOp>) {
             }
         }
         if let (Some(op), Some(set)) = (op_name, sel_set) {
-            let mut sc = set.walk();
-            for sel in set.named_children(&mut sc) {
-                if sel.kind() != "selection" {
-                    continue;
-                }
-                if let Some(field) = sel.named_child(0).filter(|f| f.kind() == "field") {
-                    let mut fc = field.walk();
-                    let name = field
-                        .named_children(&mut fc)
-                        .find(|n| n.kind() == "name")
-                        .map(|n| text(n, src).to_owned());
-                    if let Some(field) = name {
-                        out.push(GqlOp {
-                            name: op.clone(),
-                            scope: scope.to_owned(),
-                            field,
-                        });
-                    }
-                }
-            }
+            collect_selections(set, src, &op, scope, &mut Vec::new(), out);
         }
     }
     let mut c = node.walk();
@@ -233,6 +281,7 @@ mod tests {
                 field: "currentPlayer".into(),
                 module: "App.Resolvers.PlayerResolver".into(),
                 func: "me".into(),
+                returns: Some("player".into()),
             }]
         );
         assert!(f
@@ -256,6 +305,7 @@ mod tests {
                 field: "followPlayer".into(),
                 module: "PlayerResolver".into(),
                 func: "follow".into(),
+                returns: Some("player".into()),
             }]
         );
     }
@@ -314,19 +364,25 @@ mod tests {
         let src = "query Player($id: ID) { player(playerId: $id) { name } }\nmutation Follow { followPlayer { id } }\n";
         let t = parse(crate::graphql_language(), src);
         let ops = graphql(t.root_node(), src.as_bytes()).gql_ops;
+        // a nested selection is a field on another type with a resolver of its own, so
+        // it is reported with the path that reaches it (issue #22)
+        let seen: Vec<(&str, &str, Vec<&str>)> = ops
+            .iter()
+            .map(|o| {
+                (
+                    o.scope.as_str(),
+                    o.field.as_str(),
+                    o.path.iter().map(String::as_str).collect(),
+                )
+            })
+            .collect();
         assert_eq!(
-            ops,
+            seen,
             vec![
-                GqlOp {
-                    name: "Player".into(),
-                    scope: "query".into(),
-                    field: "player".into()
-                },
-                GqlOp {
-                    name: "Follow".into(),
-                    scope: "mutation".into(),
-                    field: "followPlayer".into()
-                },
+                ("query", "player", vec!["player"]),
+                ("query", "name", vec!["player", "name"]),
+                ("mutation", "followPlayer", vec!["followPlayer"]),
+                ("mutation", "id", vec!["followPlayer", "id"]),
             ]
         );
     }

@@ -22,6 +22,10 @@ pub struct MacroCall {
     pub scope: Vec<String>,
     /// Leading atom arguments, `:` stripped.
     pub atoms: Vec<String>,
+    /// Atoms one level inside a wrapper call — `list_of(:player)`, `non_null(:id)`.
+    /// Kept apart from `atoms` so a wrapper is never mistaken for a leading argument;
+    /// whether the wrapper matters is a framework question, decided in `dsl`.
+    pub wrapped_atoms: Vec<String>,
     /// String arguments, quotes included.
     pub strings: Vec<String>,
     /// Module (alias) arguments, FQN-resolved.
@@ -30,6 +34,10 @@ pub struct MacroCall {
     pub fun_refs: Vec<FunRef>,
     /// Keyword options naming a module function (`resolve: &M.f/3`).
     pub keyword_fun_refs: Vec<(String, FunRef)>,
+    /// Keyword options whose value names a *module* rather than a function —
+    /// `resolve: dataloader(App.Teams)`. Module-granular by nature: the field is
+    /// served by that context, but no single function is named.
+    pub keyword_modules: Vec<(String, String)>,
     pub line: u32,
 }
 
@@ -130,15 +138,29 @@ fn walk(node: TsNode, src: &[u8], scope: &mut Vec<String>, out: &mut Scan) {
     }
 }
 
+/// Atoms one level inside a wrapper call's own arguments.
+fn collect_wrapped_atoms(arg: TsNode, src: &[u8], call: &mut MacroCall) {
+    let Some(inner) = args_node(arg) else { return };
+    let mut c = inner.walk();
+    for a in inner.named_children(&mut c) {
+        if a.kind() == "atom" {
+            call.wrapped_atoms
+                .push(text(a, src).trim_start_matches(':').to_owned());
+        }
+    }
+}
+
 fn macro_call(node: TsNode, name: &str, scope: &[String], src: &[u8]) -> MacroCall {
     let mut call = MacroCall {
         name: name.to_owned(),
         scope: scope.to_vec(),
         atoms: Vec::new(),
+        wrapped_atoms: Vec::new(),
         strings: Vec::new(),
         modules: Vec::new(),
         fun_refs: Vec::new(),
         keyword_fun_refs: Vec::new(),
+        keyword_modules: Vec::new(),
         line: line_of(node),
     };
     let Some(args) = args_node(node) else {
@@ -153,6 +175,8 @@ fn macro_call(node: TsNode, name: &str, scope: &[String], src: &[u8]) -> MacroCa
                 .push(text(arg, src).trim_start_matches(':').to_owned()),
             "string" => call.strings.push(text(arg, src).to_owned()),
             "keywords" => collect_keywords(arg, src, &mut call),
+            // a wrapper call around an atom: `list_of(:player)`, `non_null(:id)`
+            "call" => collect_wrapped_atoms(arg, src, &mut call),
             _ => {}
         }
     }
@@ -175,6 +199,24 @@ fn collect_keywords(keywords: TsNode, src: &[u8], call: &mut MacroCall) {
         let key = text(k, src).trim().trim_end_matches(':').to_owned();
         if let Some(r) = fun_ref(v, src) {
             call.keyword_fun_refs.push((key, r));
+            continue;
+        }
+        // `resolve: dataloader(App.Teams)` — a call whose argument is a module
+        let mut probe = MacroCall {
+            name: String::new(),
+            scope: Vec::new(),
+            atoms: Vec::new(),
+            wrapped_atoms: Vec::new(),
+            strings: Vec::new(),
+            modules: Vec::new(),
+            fun_refs: Vec::new(),
+            keyword_fun_refs: Vec::new(),
+            keyword_modules: Vec::new(),
+            line: line_of(v),
+        };
+        collect_arg_refs(v, src, &mut probe);
+        if let Some(module) = probe.modules.first() {
+            call.keyword_modules.push((key, module.clone()));
         }
     }
 }
@@ -213,10 +255,12 @@ fn fun_ref(node: TsNode, src: &[u8]) -> Option<FunRef> {
         name: String::new(),
         scope: Vec::new(),
         atoms: Vec::new(),
+        wrapped_atoms: Vec::new(),
         strings: Vec::new(),
         modules: Vec::new(),
         fun_refs: Vec::new(),
         keyword_fun_refs: Vec::new(),
+        keyword_modules: Vec::new(),
         line: 0,
     };
     collect_arg_refs(node, src, &mut probe);
