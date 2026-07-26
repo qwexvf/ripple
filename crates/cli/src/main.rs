@@ -64,6 +64,7 @@ const VALUE_FLAGS: &[&str] = &[
     "--calls-budget",
     "--weights",
     "--in-file",
+    "--limit",
     "--skip",
 ];
 
@@ -2057,6 +2058,38 @@ mod tests {
             ],
             "a2 follows a; b is reached twice so it says so once; an unreachable hop is \
              still printed rather than dropped"
+        );
+    }
+
+    /// `VALUE_FLAGS` is hand-maintained, and a flag missing from it does not fail
+    /// loudly — its value leaks out as a positional. `--limit` was missing, so
+    /// `ripple path a b --limit 2` saw three symbols and died on a documented flag.
+    /// Every `--flag <value>` spelled in `USAGE` has to be in the list.
+    #[test]
+    fn every_value_flag_in_usage_is_declared() {
+        let mut missing = Vec::new();
+        for line in USAGE.lines() {
+            let mut tokens = line.split_whitespace().peekable();
+            while let Some(tok) = tokens.next() {
+                let flag = tok.trim_start_matches('[').trim_end_matches([']', '|']);
+                if !flag.starts_with("--") {
+                    continue;
+                }
+                // `[--depth N]` / `[--root <path>]` take a value; `[--json]` does not
+                let takes_value = tokens.peek().is_some_and(|next| {
+                    let n = next.trim_start_matches('[').trim_end_matches([']', '|']);
+                    !n.starts_with("--") && !n.starts_with('(')
+                });
+                if takes_value && !VALUE_FLAGS.contains(&flag) {
+                    missing.push(flag.to_owned());
+                }
+            }
+        }
+        missing.sort();
+        missing.dedup();
+        assert!(
+            missing.is_empty(),
+            "value flags missing from VALUE_FLAGS: {missing:?}"
         );
     }
 
