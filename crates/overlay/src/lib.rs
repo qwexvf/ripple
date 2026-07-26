@@ -111,6 +111,7 @@ fn try_holdout(root: &Path, skip: usize, k: usize) -> Result<Holdout, git2::Erro
     let mut acc = Accum::default();
     let mut train_commits = 0usize;
     let mut skipped = 0usize;
+    let mut renames = Renames::default();
     for oid in revwalk {
         if train_commits >= COMMIT_WINDOW {
             break;
@@ -121,7 +122,11 @@ fn try_holdout(root: &Path, skip: usize, k: usize) -> Result<Holdout, git2::Erro
         if commit.parent_count() != 1 {
             continue; // skip merges and root
         }
-        let files = changed_files(&repo, &commit, &workdir, &index_root);
+        let touched = changed_files(&repo, &commit, &workdir, &index_root);
+        let files: Vec<String> = touched.files.iter().map(|f| renames.current(f)).collect();
+        for (old, new) in &touched.renames {
+            renames.record(old, new);
+        }
         let eligible = files.len() >= 2 && files.len() <= MAX_FILES_PER_COMMIT;
         if skipped < skip {
             skipped += usize::from(eligible);
@@ -204,6 +209,7 @@ fn try_mine(root: &Path) -> Result<GitOverlay, git2::Error> {
     revwalk.set_sorting(git2::Sort::TIME)?;
 
     let mut acc = Accum::default();
+    let mut renames = Renames::default();
 
     for oid in revwalk.take(COMMIT_WINDOW) {
         let Ok(oid) = oid else { continue };
@@ -213,7 +219,12 @@ fn try_mine(root: &Path) -> Result<GitOverlay, git2::Error> {
         if commit.parent_count() != 1 {
             continue; // skip merges (noisy) and the root commit (diffs vs empty tree = all files)
         }
-        let files = changed_files(&repo, &commit, &workdir, &index_root);
+        let touched = changed_files(&repo, &commit, &workdir, &index_root);
+        // attribute to the name the file has now, so a rename doesn't orphan its history
+        let files: Vec<String> = touched.files.iter().map(|f| renames.current(f)).collect();
+        for (old, new) in &touched.renames {
+            renames.record(old, new);
+        }
         if files.is_empty() || files.len() > MAX_FILES_PER_COMMIT {
             continue;
         }
@@ -353,29 +364,93 @@ fn edge(src: SymbolId, dst: SymbolId, score: f32, site: Span) -> Edge {
     }
 }
 
+/// What one commit touched, and any renames it made.
+struct Touched {
+    files: Vec<String>,
+    /// `(path before, path after)` for each rename in this commit.
+    renames: Vec<(String, String)>,
+}
+
 fn changed_files(
     repo: &git2::Repository,
     commit: &git2::Commit,
     workdir: &Path,
     index_root: &Path,
-) -> Vec<String> {
+) -> Touched {
+    let empty = Touched {
+        files: Vec::new(),
+        renames: Vec::new(),
+    };
     let Ok(tree) = commit.tree() else {
-        return Vec::new();
+        return empty;
     };
     let parent_tree = commit.parent(0).ok().and_then(|p| p.tree().ok());
-    let Ok(diff) = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None) else {
-        return Vec::new();
+    let Ok(mut diff) = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None) else {
+        return empty;
     };
-    let mut out = Vec::new();
+    // ask git to pair up deletes and adds: without this a rename looks like a file
+    // appearing with no history, which is exactly how history got orphaned
+    let _ = diff.find_similar(Some(git2::DiffFindOptions::new().renames(true)));
+
+    let rel = |p: Option<&Path>| -> Option<String> {
+        let p = p?;
+        // git path is workdir-relative; re-key to index-root-relative
+        let rel = workdir.join(p).strip_prefix(index_root).ok()?.to_owned();
+        Some(rel.to_string_lossy().replace('\\', "/"))
+    };
+
+    let mut files = Vec::new();
+    let mut renames = Vec::new();
     for delta in diff.deltas() {
-        if let Some(p) = delta.new_file().path() {
-            // git path is workdir-relative; re-key to index-root-relative
-            if let Ok(rel) = workdir.join(p).strip_prefix(index_root) {
-                out.push(rel.to_string_lossy().replace('\\', "/"));
+        if let Some(new) = rel(delta.new_file().path()) {
+            files.push(new.clone());
+            if delta.status() == git2::Delta::Renamed {
+                if let Some(old) = rel(delta.old_file().path()) {
+                    renames.push((old, new));
+                }
             }
         }
     }
-    out
+    Touched { files, renames }
+}
+
+/// Follows a chain of renames to the name a file has *now*.
+///
+/// Identity is (path, qualified name), so a rename mints new `SymbolId`s and the old
+/// path's history — churn, bug-density, co-change — stops counting toward the file that
+/// inherited it. The risk score then drops for a file that was just heavily edited,
+/// which is precisely backwards.
+///
+/// The walk is newest-commit-first, so when a commit renames A → B, every *older*
+/// commit's A means today's B. Recording that as it is seen keeps the mapping to one
+/// lookup per path.
+#[derive(Default)]
+struct Renames {
+    to_current: HashMap<String, String>,
+}
+
+impl Renames {
+    /// The current name for a path seen in a commit.
+    fn current(&self, path: &str) -> String {
+        let mut at = path;
+        // a file renamed repeatedly chains; the cap is a cycle guard, not a limit on
+        // real history (git cannot produce a cycle, a corrupt map could)
+        for _ in 0..16 {
+            match self.to_current.get(at) {
+                Some(next) if next != at => at = next,
+                _ => break,
+            }
+        }
+        at.to_owned()
+    }
+
+    /// Record a rename seen in a commit, resolved to today's name.
+    fn record(&mut self, old: &str, new: &str) {
+        let current = self.current(new);
+        if current != old {
+            self.to_current.insert(old.to_owned(), current);
+        }
+    }
 }
 
 fn is_fix(msg: &str) -> bool {
@@ -655,6 +730,86 @@ mod tests {
             pairs,
             vec![("a.ts", "b.ts")],
             "c.ts/d.ts is what the test set is scored on — mining it is the leak"
+        );
+    }
+
+    /// Rename `from` to `to` and commit it, so git can pair the delete with the add.
+    fn rename(repo: &git2::Repository, n: u32, from: &str, to: &str) {
+        let workdir = repo.workdir().expect("workdir").to_path_buf();
+        std::fs::rename(workdir.join(from), workdir.join(to)).expect("rename");
+        let mut index = repo.index().expect("index");
+        index.remove_path(Path::new(from)).expect("remove");
+        index.add_path(Path::new(to)).expect("add");
+        index.write().expect("write index");
+        let tree = repo
+            .find_tree(index.write_tree().expect("write_tree"))
+            .expect("tree");
+        let sig = git2::Signature::new(
+            "t",
+            "t@e",
+            &git2::Time::new(1_700_000_000 + i64::from(n) * 60, 0),
+        )
+        .expect("sig");
+        let parent = repo
+            .head()
+            .ok()
+            .and_then(|h| h.peel_to_commit().ok())
+            .expect("parent");
+        repo.commit(
+            Some("HEAD"),
+            &sig,
+            &sig,
+            &format!("rename {from} -> {to}"),
+            &tree,
+            &[&parent],
+        )
+        .expect("commit");
+    }
+
+    /// A rename must not orphan a file's history. Identity is (path, qualified name), so
+    /// a renamed file mints new `SymbolId`s — if the mining stopped counting the old
+    /// path, churn and co-change would reset and the risk score would *drop* for a file
+    /// that was just heavily edited.
+    #[test]
+    fn a_rename_keeps_the_history_it_inherited() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = git2::Repository::init(dir.path()).expect("init");
+        commit(&repo, 0, &["old.ts", "friend.ts"]);
+        for n in 1..=3 {
+            commit(&repo, n, &["old.ts", "friend.ts"]); // history under the old name
+        }
+        rename(&repo, 4, "old.ts", "new.ts");
+        commit(&repo, 5, &["new.ts", "friend.ts"]);
+
+        let overlay = mine(dir.path());
+        assert!(
+            !overlay.file_risk.contains_key("old.ts"),
+            "the old name is not a file that exists; its history belongs to the new one"
+        );
+        let new = overlay
+            .file_risk
+            .get("new.ts")
+            .expect("the renamed file carries risk");
+        let friend = overlay.file_risk.get("friend.ts").expect("its co-editor");
+        // `new.ts` inherits four commits from `old.ts`, plus the rename and one after,
+        // so it outranks its co-editor. Lose the inheritance and the order flips: two
+        // commits against five, and the file that was just heavily edited ranks lowest.
+        assert!(
+            new.churn > friend.churn,
+            "the renamed file must keep the churn it inherited: {} vs {}",
+            new.churn,
+            friend.churn
+        );
+        // the pair co-changed under both names, which only holds if they were counted
+        // as one file
+        assert!(
+            overlay
+                .cochange
+                .iter()
+                .any(|(a, b, _)| (a == "friend.ts" && b == "new.ts")
+                    || (a == "new.ts" && b == "friend.ts")),
+            "co-change survives the rename: {:?}",
+            overlay.cochange
         );
     }
 
