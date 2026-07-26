@@ -43,8 +43,10 @@ eval --oracle lsp vs dexter 0.7.1, 40 files (compare by position, state granular
   5 real call sites in lfg_posts_test.exs) — ripple-only at file granularity is capped
   by the oracle's own completeness, so read it with that in mind
 153 call sites still sit inside no indexed symbol; they now link at file granularity
-impact changeset --verify lsp (132 files, ~8s, dexter 0.7.1):
-  1516 confirmed | 0 added | 28 contradicted (reported, not applied) | 331 unresolved
+impact changeset --verify lsp (163 files, dexter 0.7.1):
+  1516 confirmed | 0 added | 18 contradicted (reported, not applied)
+  cold 7.6s → warm 238ms, all 163 files replayed from the verdict cache, no server hit
+  (cache key = file content hash, so an edit invalidates just that file)
 ```
 
 **Build the release binary before timing anything** or compile time lands inside the
@@ -106,6 +108,7 @@ neighbors <symbol> [--in|--out] [--depth N] [--root P] [--json]
 impact <symbol>... [--budget N] [--root P] [--json]     # ranked blast radius
 review [<base-rev>] [--budget N] [--root P] [--json]    # hunks to look at first
   ...both accept --verify lsp [--verify-budget 2s]      # upgrade calls from a language server
+path <from> <to> [--depth 6] [--limit 3] [--root P] [--json]  # how does A reach B?
 risk <symbol|file> [--root P] [--json]
 eval [--commits N] [--root P]        # static vs co-change recall on N held-out commits
 ```
@@ -114,6 +117,11 @@ eval [--commits N] [--root P]        # static vs co-change recall on N held-out 
 - `impact` seeds by name and ranks by confidence-weighted diffusion; `neighbors` is
   a raw traversal. Use `impact` to decide, `neighbors` to understand.
 - `risk` fuses churn / bug-density / ownership from git with structural fan-out.
+  `eval --risk` measures whether it ranks the files a held-out fix later touched
+  (lift 1.50× over base rate; `bug_density` alone is 0.83× — at or below random).
+- `path` enumerates routes A→B along dependency direction, shortest first, and reports
+  the product of the edge confidences. Co-change edges are excluded — a companion is
+  not a route. This is the front-to-DB chain in one command.
 - A server's answer is attributed to a symbol by the **call's position**
   (`fromRanges`), never by the caller name the server chose — dexter credits a call
   inside an ExUnit `test` block to the preceding `defp`, and trusting that added 145
