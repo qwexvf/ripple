@@ -9,7 +9,7 @@ mod verify;
 use anyhow::{bail, Context, Result};
 use ir::EdgeKind;
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use store::{Dir, GraphStore, InMemoryGraph, RedbStore};
@@ -33,7 +33,7 @@ fn main() -> Result<()> {
     }
 }
 
-const USAGE: &str = "usage:\n  ripple parse <file> [--json]\n  ripple index <path>...\n  ripple neighbors <symbol> [--in|--out] [--depth N] [--root <path>] [--json]\n  ripple impact <symbol>... [--budget N] [--root <path>] [--json] [--verify lsp]\n  ripple review [<base>] [--budget N] [--root <path>] [--json] [--verify lsp]\n    --verify lsp [--verify-budget 2s] [--floor-contradicted|--drop-contradicted]  (upgrade call edges from a language server)\n  ripple path <from> <to> [--depth 6] [--limit 3] [--root <path>] [--json]   (how does A reach B?)\n  ripple risk <symbol|file> [--root <path>] [--json]\n  ripple mcp [--root <path>]   (MCP server over stdio for AI agents)\n  ripple lsp doctor [--root <path>] [--budget 10s] [--json]   (are language servers usable here?)";
+const USAGE: &str = "usage:\n  ripple parse <file> [--json]\n  ripple index <path>...\n  ripple neighbors <symbol> [--in|--out] [--depth N] [--in-file <substr>] [--root <path>] [--json]\n  ripple impact <symbol>... [--budget N] [--root <path>] [--json] [--verify lsp]\n  ripple review [<base>] [--budget N] [--root <path>] [--json] [--verify lsp]\n    --verify lsp [--verify-budget 2s] [--floor-contradicted|--drop-contradicted]  (upgrade call edges from a language server)\n  ripple path <from> <to> [--depth 6] [--limit 3] [--root <path>] [--json]   (how does A reach B?)\n  ripple risk <symbol|file> [--root <path>] [--json]\n  ripple mcp [--root <path>]   (MCP server over stdio for AI agents)\n  ripple lsp doctor [--root <path>] [--budget 10s] [--json]   (are language servers usable here?)";
 
 fn db_path(root: &Path) -> PathBuf {
     root.join(".ripple").join("graph.redb")
@@ -61,6 +61,7 @@ const VALUE_FLAGS: &[&str] = &[
     "--verify",
     "--verify-budget",
     "--weights",
+    "--in-file",
     "--skip",
 ];
 
@@ -584,6 +585,66 @@ fn cmd_path(args: &[String]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The node a hop hangs off: for an outward walk that's the edge's source, for an
+/// inward one its destination.
+fn parent_of(hop: &store::Hop, dir: Dir) -> Option<ir::SymbolId> {
+    Some(match dir {
+        Dir::Out => hop.edge.src,
+        Dir::In => hop.edge.dst,
+    })
+}
+
+/// Re-order hops so each one follows its parent, deepest-last within a branch.
+///
+/// `neighbors --depth 3` printed hops sorted by depth, so every second-level hop sat
+/// at the same indentation regardless of which first-level hop it came from — the walk
+/// was unreadable as a chain, which is what a walk is for.
+fn tree_order(root: ir::SymbolId, hops: &[store::Hop], dir: Dir) -> Vec<store::Hop> {
+    let mut children: HashMap<ir::SymbolId, Vec<&store::Hop>> = HashMap::new();
+    for h in hops {
+        if let Some(p) = parent_of(h, dir) {
+            children.entry(p).or_default().push(h);
+        }
+    }
+    let mut out = Vec::with_capacity(hops.len());
+    let mut seen = HashSet::new();
+    walk_tree(root, &children, &mut seen, &mut out);
+    // a hop whose parent was never itself reached (a cycle entered mid-way) still has
+    // to be printed — dropping it would silently shrink the answer
+    for h in hops {
+        if seen.insert(h.node.id) {
+            out.push(clone_hop(h));
+        }
+    }
+    out
+}
+
+fn walk_tree(
+    at: ir::SymbolId,
+    children: &HashMap<ir::SymbolId, Vec<&store::Hop>>,
+    seen: &mut HashSet<ir::SymbolId>,
+    out: &mut Vec<store::Hop>,
+) {
+    let Some(kids) = children.get(&at) else {
+        return;
+    };
+    for h in kids {
+        if !seen.insert(h.node.id) {
+            continue;
+        }
+        out.push(clone_hop(h));
+        walk_tree(h.node.id, children, seen, out);
+    }
+}
+
+fn clone_hop(h: &store::Hop) -> store::Hop {
+    store::Hop {
+        edge: h.edge.clone(),
+        node: h.node.clone(),
+        depth: h.depth,
+    }
 }
 
 /// How a blast-radius hit is named in human output.
@@ -1390,6 +1451,16 @@ fn mcp_tools() -> Value {
             "inputSchema": obj(json!({ "target": { "type": "string" } }), json!(["target"]))
         },
         {
+            "name": "path",
+            "description": "How does one symbol reach another? Routes along dependency direction, shortest first, with the product of the edge confidences.",
+            "inputSchema": obj(json!({
+                "from": { "type": "string", "description": "exact or partial symbol/file name" },
+                "to": { "type": "string" },
+                "depth": { "type": "integer", "description": "max hops (default 6)" },
+                "limit": { "type": "integer", "description": "max routes (default 3)" }
+            }), json!(["from", "to"]))
+        },
+        {
             "name": "explain_edge",
             "description": "Why are two symbols connected? Returns the edge kind, confidence, provenance (Extracted/LspVerified/CoChange), and site between them.",
             "inputSchema": obj(json!({ "from": { "type": "string" }, "to": { "type": "string" } }), json!(["from", "to"]))
@@ -1553,6 +1624,35 @@ fn mcp_call(
                 .collect();
             Ok(mcp_text(json!({ "risk": out })))
         }
+        "path" => {
+            let from = str_arg("from").ok_or("from required")?;
+            let to = str_arg("to").ok_or("to required")?;
+            let widen = |q: &str| graph.lookup(q).map(|(n, _)| n).unwrap_or_default();
+            let (depth, limit) = (usize_arg("depth", 6), usize_arg("limit", 3));
+            let mut routes = Vec::new();
+            for s in widen(&from) {
+                for t in widen(&to) {
+                    if s.id == t.id {
+                        continue;
+                    }
+                    for r in query::paths(graph, s.id, t.id, depth, limit) {
+                        routes.push(json!({
+                            "hops": r.steps.len(),
+                            "confidence": r.confidence,
+                            "from": s.name, "from_module": s.module_path,
+                            "steps": r.steps.iter().map(|st| json!({
+                                "edge": format!("{:?}", st.edge.kind),
+                                "edge_confidence": st.edge.confidence,
+                                "site_line": st.edge.site.start_line,
+                                "symbol": st.node.name, "module": st.node.module_path,
+                            })).collect::<Vec<_>>(),
+                        }));
+                    }
+                }
+            }
+            routes.truncate(limit);
+            Ok(mcp_text(json!({ "routes": routes })))
+        }
         "explain_edge" => {
             let from = str_arg("from").ok_or("from required")?;
             let to = str_arg("to").ok_or("to required")?;
@@ -1707,7 +1807,15 @@ fn cmd_neighbors(args: &[String]) -> Result<()> {
     let store = RedbStore::open(db_path(&root));
     let graph = store.load()?;
 
-    let matches = lookup_or_bail(&graph, &symbol, json)?;
+    let mut matches = lookup_or_bail(&graph, &symbol, json)?;
+    // one name is routinely several symbols (`get` is seven resolvers), and without a
+    // filter the only way to read the right one was to cut the section out with awk
+    if let Some(want) = flag_value(args, "--in-file") {
+        matches.retain(|n| n.module_path.contains(want));
+        if matches.is_empty() {
+            bail!("no symbol '{symbol}' in a file matching '{want}'");
+        }
+    }
 
     let arrow = if dir == Dir::In {
         "callers/importers of"
@@ -1724,6 +1832,9 @@ fn cmd_neighbors(args: &[String]) -> Result<()> {
                         "name": h.node.name, "kind": format!("{:?}", h.node.kind),
                         "edge": format!("{:?}", h.edge.kind), "confidence": h.edge.confidence,
                         "module": h.node.module_path, "depth": h.depth,
+                        // which node this hop hangs off — without it a depth-3 walk is
+                        // a flat list and the chain can't be reconstructed
+                        "from": parent_of(h, dir).and_then(|p| graph.get(p)).map(|n| n.name.clone()),
                     })
                 })
                 .collect();
@@ -1735,7 +1846,7 @@ fn cmd_neighbors(args: &[String]) -> Result<()> {
                 start.module_path,
                 format_args!("{:?}", start.kind)
             );
-            for h in &hops {
+            for h in &tree_order(start.id, &hops, dir) {
                 let indent = "  ".repeat(h.depth);
                 println!(
                     "{indent}{:?}<{:.2}> {} ({})",
@@ -1752,6 +1863,62 @@ mod tests {
     use super::*;
     fn v(a: &[&str]) -> Vec<String> {
         a.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    fn hop(src: &str, dst: &str, depth: usize) -> store::Hop {
+        let span = ir::Span {
+            start_line: 1,
+            start_col: 1,
+            end_line: 1,
+            end_col: 1,
+        };
+        let node = |name: &str| ir::Node {
+            id: ir::SymbolId::of("m.ex", name),
+            kind: ir::NodeKind::Function,
+            name: name.to_owned(),
+            qualified_name: name.to_owned(),
+            module_path: "m.ex".to_owned(),
+            span,
+            extra_spans: Vec::new(),
+            is_exported: true,
+            risk: ir::RiskScores::default(),
+        };
+        store::Hop {
+            edge: ir::Edge {
+                src: node(src).id,
+                dst: node(dst).id,
+                kind: EdgeKind::Calls,
+                confidence: 1.0,
+                site: span,
+                source: ir::EdgeSource::Extracted,
+            },
+            node: node(dst),
+            depth,
+        }
+    }
+
+    /// A depth-2 walk printed every second-level hop at the same indentation whatever
+    /// it came from, so the output could not be read as a chain. Each hop must follow
+    /// its own parent.
+    #[test]
+    fn a_walk_is_ordered_under_its_parents() {
+        let root = ir::SymbolId::of("m.ex", "root");
+        // root → a → a2, root → b, plus an orphan whose parent was never reached
+        let hops = vec![
+            hop("root", "a", 1),
+            hop("root", "b", 1),
+            hop("a", "a2", 2),
+            hop("nowhere", "orphan", 2),
+        ];
+        let names: Vec<String> = tree_order(root, &hops, Dir::Out)
+            .into_iter()
+            .map(|h| h.node.name)
+            .collect();
+        assert_eq!(
+            names,
+            vec!["a", "a2", "b", "orphan"],
+            "a2 follows a, and an unreachable hop is still printed rather than dropped"
+        );
     }
 
     #[test]
