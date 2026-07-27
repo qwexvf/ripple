@@ -51,11 +51,18 @@ Ask each root's language server for the call edges of files whose language has *
 edges ripple already extracted (`impact --verify lsp`); here it produces them, at
 confidence 0.7 with `source: LspVerified`.
 
-Go is the language this exists for today. Without the flag a Go index has symbols and
+Two languages use this today: **Go** (via `gopls`) and **Gleam** (via `gleam lsp`). Without the flag a Go index has symbols and
 co-change but no call graph; with it, `impact` answers. `--calls-budget` caps the whole
 pass (default 120s) and any file it could not reach is named in the report. Verdicts are
 cached by file content hash, so a re-index of unchanged files contacts no server —
 measured 12s cold, 0.33s warm on 81 files.
+
+A server that cannot do `callHierarchy` but can do `references` — `gleam lsp` is the case —
+produces `References` edges instead of `Calls`. A reference may be a type mention rather
+than a call, so it is a weaker claim and gets its own edge kind; it still shows up in
+`impact`, `path` and `neighbors`. Yield depends on the server having a project it can load:
+232 Gleam files in aegis gave 2431 edges, while 208 `.gleam` files scattered through a repo
+with no `gleam.toml` gave 98.
 
 ## `ripple impact <symbol>...`
 

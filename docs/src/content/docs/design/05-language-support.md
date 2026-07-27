@@ -18,7 +18,7 @@ A language is not "supported" or "unsupported." It climbs tiers, and it's useful
 | **0** | grammar + `tags.scm` | File & symbol nodes, `Defines` edges, complexity — **plus the entire git overlay** (churn, co-change, risk, review targeting at file granularity) | minutes |
 | **1** | `imports.scm` + `resolve_import` | `Imports` edges, cross-file linking | hours |
 | **2** | `refs.scm` + scoping policy | `Calls`/`References` edges — the call graph | 1–2 days |
-| **2′** | a language server, via `index --calls lsp` | the same `Calls` edges at `LspVerified`/0.7, with no `refs.scm` at all — measured on Go, see [`11` phase 4](11-lsp-integration.md) | minutes, if a server exists |
+| **2′** | a language server, via `index --calls lsp` | `Calls` edges at `LspVerified`/0.7 with no `refs.scm` at all (Go/gopls), or `References` edges where the server has no call hierarchy (Gleam/`gleam lsp`) — see [`11` phases 4–5](11-lsp-integration.md) | minutes, if a server exists |
 | **3** | `FrameworkDetector`s | `HttpCall`/`GraphqlCall`/`Emits` cross-service edges — full design in [`10-cross-service-resolution.md`](10-cross-service-resolution.md) | per framework |
 
 ### Why Tier 0 already delivers the product

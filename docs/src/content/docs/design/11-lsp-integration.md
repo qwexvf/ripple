@@ -271,6 +271,42 @@ whoever configured the job.
    with a `source`, but the *index* now varies with the server's version when
    `--calls lsp` is passed. Phase 3 confined that risk to query time.
 
+5. **References as a fallback.** ✅ **done.** Adding Gleam (issue #39) broke the
+   phase-4 assumption: `gleam lsp` reports `callHierarchy=false`, so the producer
+   refused it and a Gleam index had symbols and no static edges at all. It does
+   support `textDocument/references`, so the pass now picks a mode from the
+   server's capabilities.
+
+   | server can do | mode | edge |
+   |---|---|---|
+   | `callHierarchy` | who calls this | `Calls`, reconciled per the table above |
+   | `references` only | where this name appears | `References` at 0.7, added only |
+
+   A reference is weaker evidence: it may be a type mention rather than a call. So
+   it never confirms or contradicts an extracted `Calls` edge, it is a different
+   `EdgeKind`, and `kind_weight` puts it at 0.9 — the uncertainty is already in the
+   confidence and should not be discounted twice. Attribution is the same
+   position-based `attribute()` phase 3 built, so a reference inside no indexed
+   symbol is still counted and dropped (#18) rather than credited to a neighbour.
+
+   Cold, with the verdict cache empty:
+
+   | repo | gleam files | edges | time |
+   |---|---|---|---|
+   | aegis | 232 | 2431 (6978 including gopls) | 61s |
+   | poker-platform | 125 | 2277 | 19s |
+   | gleam | 208 | **98** | 22s |
+
+   The third row is the useful one. That repo is the Gleam *compiler* — Rust, with
+   `.gleam` files scattered as fixtures and no `gleam.toml`, so the server has no
+   project to resolve against and answers almost nothing. A references-based
+   producer inherits whatever project model its server has; file count does not
+   predict yield.
+
+   Spot-checked against grep: `scan_schedule_queries.scan_schedules_query ←
+   build_schema` at `schema.gleam:119`, a cross-module edge no `refs.scm` could
+   resolve without type inference.
+
 ## What this does not fix
 
 Held-out recall stays ~10% and most of it is static — co-change adds ~3 points,
