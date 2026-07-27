@@ -271,7 +271,7 @@ whoever configured the job.
    with a `source`, but the *index* now varies with the server's version when
    `--calls lsp` is passed. Phase 3 confined that risk to query time.
 
-5. **References as a fallback.** ✅ **done.** Adding Gleam (issue #39) broke the
+5. **References as a fallback.** ✅ **done.** Adding Gleam (issue #40) broke the
    phase-4 assumption: `gleam lsp` reports `callHierarchy=false`, so the producer
    refused it and a Gleam index had symbols and no static edges at all. It does
    support `textDocument/references`, so the pass now picks a mode from the

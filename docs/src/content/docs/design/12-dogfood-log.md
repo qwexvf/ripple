@@ -27,7 +27,7 @@ is **Gleam**, which has no adapter, so there is nothing to join to. Counting acr
 `~/projects`: **699 `.gleam` files in 9 repositories**, including `services/api` in both
 of these. The 8 graphql edges in ripple's own index all come from its Elixir fixtures.
 
-**Implication (issue #39).** Every quality number for cross-service resolution to date
+**Implication (issue #40).** Every quality number for cross-service resolution to date
 comes from one language pair on one corpus. `tree-sitter-gleam` is on crates.io, already
 ships a `tags.scm`, and `gleam lsp` exists — so Tier 0 plus `index --calls lsp` is the
 same 4-touchpoint shape phase 4 just measured on Go.

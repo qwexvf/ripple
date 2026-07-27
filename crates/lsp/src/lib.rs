@@ -1008,7 +1008,9 @@ mod tests {
             default_concurrency(),
             "omitted fields keep their default"
         );
-        assert!(specs.iter().any(|s| s.language == "zig" && s.command == "zls"));
+        assert!(specs
+            .iter()
+            .any(|s| s.language == "zig" && s.command == "zls"));
         // untouched defaults survive
         assert!(specs
             .iter()

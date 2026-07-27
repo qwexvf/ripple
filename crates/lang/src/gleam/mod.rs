@@ -5,7 +5,7 @@
 //! be, so there is no `refs_query` here. What makes Gleam worth adding first is
 //! measurement rather than preference — it is the backend language of the repos
 //! where cross-service resolution was emitting zero edges, because the producer
-//! side of every GraphQL join was unparsed. See issue #39.
+//! side of every GraphQL join was unparsed. See issue #40.
 
 use crate::LanguageAdapter;
 use tree_sitter::Node;
