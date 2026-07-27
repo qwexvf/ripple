@@ -619,6 +619,19 @@ fn caller_of(call: &Value) -> Option<CallSite> {
     })
 }
 
+/// A `Location` (or `LocationLink`) from a references reply → `(file, 1-based line)`.
+fn location_of(item: &Value) -> Option<(PathBuf, u32)> {
+    let uri = item
+        .get("uri")
+        .or_else(|| item.get("targetUri"))?
+        .as_str()?;
+    let line = item
+        .pointer("/range/start/line")
+        .or_else(|| item.pointer("/targetRange/start/line"))?
+        .as_u64()?;
+    Some((uri_to_path(uri)?, line as u32 + 1))
+}
+
 fn which(command: &str) -> Option<PathBuf> {
     if command.contains('/') {
         let p = PathBuf::from(command);
@@ -800,6 +813,37 @@ impl Client {
         Ok(Some(calls.iter().filter_map(caller_of).collect()))
     }
 
+    /// Every place the symbol at `line`/`character` is referenced, as
+    /// `(file, 1-based line)`.
+    ///
+    /// The fallback for servers with no call hierarchy — `gleam lsp` reports
+    /// `callHierarchy=false` and `references=true`, and without this a Gleam index
+    /// has symbols and no static edges at all. A reference is weaker evidence than
+    /// an incoming call: it may be a type mention rather than a call, which is why
+    /// what gets built from it is an `EdgeKind::References` edge and not a `Calls`
+    /// one. `None` means the server could not answer, the same distinction
+    /// `incoming_calls` makes; an empty vector means "no references".
+    pub fn references(
+        &mut self,
+        path: &Path,
+        line: u32,
+        character: u32,
+    ) -> Result<Option<Vec<(PathBuf, u32)>>> {
+        let result = self.request(
+            "textDocument/references",
+            json!({
+                "textDocument": {"uri": file_uri(path)},
+                "position": {"line": line, "character": character},
+                "context": {"includeDeclaration": false},
+            }),
+            self.timeout,
+        )?;
+        let Some(items) = result.as_array() else {
+            return Ok(None);
+        };
+        Ok(Some(items.iter().filter_map(location_of).collect()))
+    }
+
     pub fn request(&mut self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
         let id = self.next_id;
         self.next_id += 1;
@@ -941,9 +985,12 @@ mod tests {
         dir
     }
 
+    /// The extra language is deliberately one the built-in table does not cover,
+    /// so "the repo added this" stays distinguishable from "we ship this" even as
+    /// the defaults grow.
     const REPO_CONFIG: &str = r#"[
              {"language": "elixir", "command": "lexical", "inline": false},
-             {"language": "gleam", "command": "gleam", "args": ["lsp"]}
+             {"language": "zig", "command": "zls"}
            ]"#;
 
     #[test]
@@ -961,7 +1008,7 @@ mod tests {
             default_concurrency(),
             "omitted fields keep their default"
         );
-        assert!(specs.iter().any(|s| s.language == "gleam"));
+        assert!(specs.iter().any(|s| s.language == "zig" && s.command == "zls"));
         // untouched defaults survive
         assert!(specs
             .iter()
@@ -1013,7 +1060,7 @@ mod tests {
         let elixir = cfg.specs.iter().find(|s| s.language == "elixir").unwrap();
         assert_eq!(elixir.command, "expert");
         assert!(
-            !cfg.specs.iter().any(|s| s.language == "gleam"),
+            !cfg.specs.iter().any(|s| s.language == "zig"),
             "the untrusted repo's extra language is not added either"
         );
         assert!(cfg.untrusted.is_some());

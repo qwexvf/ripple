@@ -40,8 +40,9 @@ fn db_path(root: &Path) -> PathBuf {
 }
 
 /// Edge kinds surfaced by `neighbors` (call/import/co-change/cross-service).
-const NEIGHBOR_KINDS: [EdgeKind; 5] = [
+const NEIGHBOR_KINDS: [EdgeKind; 6] = [
     EdgeKind::Calls,
+    EdgeKind::References,
     EdgeKind::Imports,
     EdgeKind::ChangesWith,
     EdgeKind::GraphqlCall,

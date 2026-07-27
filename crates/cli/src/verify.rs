@@ -118,7 +118,14 @@ pub struct Outcome {
 impl Outcome {
     /// Remember a verdict against the file the *target* lives in, so the next query
     /// about an unchanged file replays instead of asking.
-    fn record(&mut self, pass: &Pass, target: SymbolId, src: SymbolId, verdict: store::Verdict) {
+    fn record(
+        &mut self,
+        pass: &Pass,
+        target: SymbolId,
+        src: SymbolId,
+        verdict: store::Verdict,
+        kind: EdgeKind,
+    ) {
         let Some(module) = pass.graph.get(target).map(|n| n.module_path.clone()) else {
             return;
         };
@@ -132,6 +139,7 @@ impl Outcome {
                 src,
                 dst: target,
                 verdict,
+                kind,
             });
     }
 
@@ -375,14 +383,19 @@ pub fn run(graph: &InMemoryGraph, plan: &Plan) -> Outcome {
             if mine.is_empty() || !lsp::applies(spec, root) {
                 continue;
             }
-            let Some((mut client, server)) = start(spec, root) else {
+            let Some((mut client, server, mode)) = start(spec, root) else {
                 continue;
             };
-            out.servers.push(format!(
-                "{}: {}",
-                spec.language,
-                server.as_deref().unwrap_or(&spec.command)
-            ));
+            let named = server.as_deref().unwrap_or(&spec.command).to_owned();
+            out.servers.push(match mode {
+                Mode::Calls => format!("{}: {named}", spec.language),
+                Mode::References => {
+                    format!(
+                        "{}: {named} (references only, no call hierarchy)",
+                        spec.language
+                    )
+                }
+            });
             let pass = Pass {
                 graph,
                 root,
@@ -407,7 +420,10 @@ pub fn run(graph: &InMemoryGraph, plan: &Plan) -> Outcome {
                     out.out_of_budget.push(module);
                     continue;
                 }
-                verify_file(&pass, &mut client, &module, &mut out);
+                match mode {
+                    Mode::Calls => verify_file(&pass, &mut client, &module, &mut out),
+                    Mode::References => reference_file(&pass, &mut client, &module, &mut out),
+                }
             }
             client.stop();
         }
@@ -444,7 +460,7 @@ fn replay(pass: &Pass, calls: &[store::VerifiedCall], out: &mut Outcome) {
     for c in calls {
         match c.verdict {
             store::Verdict::Confirmed => confirm(pass, c.dst, c.src, out),
-            store::Verdict::Added => add(pass, c.dst, c.src, out),
+            store::Verdict::Added => add(pass, c.dst, c.src, c.kind, out),
             store::Verdict::Contradicted => {
                 contradict(pass, c.dst, c.src, out);
             }
@@ -469,14 +485,31 @@ impl Coverage<'_> {
 
 /// Start and hand-shake a server, or give up on it. A server that can't do
 /// `callHierarchy` cannot verify calls, so it is treated as absent.
-fn start(spec: &lsp::ServerSpec, root: &Path) -> Option<(lsp::Client, Option<String>)> {
+fn start(spec: &lsp::ServerSpec, root: &Path) -> Option<(lsp::Client, Option<String>, Mode)> {
     let mut client = lsp::Client::start(spec, root).ok()?;
     let (caps, server) = client.initialize(root, spec).ok()?;
-    if !caps.call_hierarchy {
+    let mode = if caps.call_hierarchy {
+        Mode::Calls
+    } else if caps.references {
+        Mode::References
+    } else {
         client.stop();
         return None;
-    }
-    Some((client, server))
+    };
+    Some((client, server, mode))
+}
+
+/// What a server can tell us, and therefore what kind of edge it can support.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// `callHierarchy` — who calls this. Verifiable against our `Calls` edges.
+    Calls,
+    /// `references` only — where this name appears. Weaker: a reference may be a
+    /// type mention, so it becomes an `EdgeKind::References` edge and never
+    /// confirms or contradicts an extracted call. `gleam lsp` is the case that
+    /// forced this (`callHierarchy=false`, `references=true`); without it a Gleam
+    /// index has symbols and no static edges at all.
+    References,
 }
 
 fn in_root(module: &str, tag: &str) -> bool {
@@ -497,6 +530,83 @@ fn language_of<'a>(
 /// one entry per clause. Reconciling clause-by-clause made every caller of
 /// `get_player/1` look like a denial of `get_player/2` — 42 fabricated
 /// contradictions on the first real run.
+/// Build `References` edges for one file from `textDocument/references`.
+///
+/// The fallback for a server with no call hierarchy. It answers a different
+/// question — "where does this name appear" rather than "who calls this" — so the
+/// result is treated as strictly weaker: every reference becomes a `References`
+/// edge at `CONF_SERVER_ONLY`, and nothing here ever confirms or contradicts an
+/// extracted `Calls` edge. A reference that lands inside no indexed symbol is
+/// dropped for the same reason it is under `Mode::Calls` (issue #18), and a
+/// reference from a symbol to itself is dropped because recursion is not a
+/// dependency.
+fn reference_file(pass: &Pass, client: &mut lsp::Client, module: &str, out: &mut Outcome) {
+    let rel = module
+        .strip_prefix(&format!("{}/", pass.cov.tag))
+        .unwrap_or(module);
+    let abs = pass.root.join(rel);
+    if client.open(&abs).is_err() {
+        out.no_server.push(module.to_owned());
+        return;
+    }
+    let Ok(symbols) = client.functions(&abs) else {
+        out.no_server.push(module.to_owned());
+        return;
+    };
+    out.files_checked += 1;
+    out.mark_checked(pass, module);
+
+    for sym in symbols {
+        if !is_callable_name(bare_name(&sym.name)) {
+            continue;
+        }
+        let target = match target_for(pass.graph, module, &sym.name) {
+            Target::One(id) => id,
+            Target::Unknown => continue,
+            Target::Ambiguous => {
+                out.ambiguous += 1;
+                continue;
+            }
+        };
+        let Ok(Some(sites)) = client.references(&abs, sym.line, sym.character) else {
+            out.unresolved += 1;
+            continue;
+        };
+        // BTreeSet so the same caller referenced from several lines yields one edge,
+        // in a fixed order
+        let mut sources: BTreeSet<SymbolId> = BTreeSet::new();
+        for (path, line) in sites {
+            let Ok(rel) = path.strip_prefix(pass.root) else {
+                continue; // a reference in code this index does not cover
+            };
+            let referrer = resolve::namespace(pass.cov.tag, &rel.to_string_lossy());
+            let site = lsp::CallSite {
+                path,
+                name: String::new(),
+                line,
+                call_lines: vec![line],
+            };
+            for attributed in attribute(pass.graph, &referrer, &site) {
+                if let Attribution::Symbol(id) = attributed {
+                    if id != target {
+                        sources.insert(id);
+                    }
+                }
+            }
+        }
+        for src in sources {
+            add(pass, target, src, EdgeKind::References, out);
+            out.record(
+                pass,
+                target,
+                src,
+                store::Verdict::Added,
+                EdgeKind::References,
+            );
+        }
+    }
+}
+
 fn verify_file(pass: &Pass, client: &mut lsp::Client, module: &str, out: &mut Outcome) {
     let rel = module
         .strip_prefix(&format!("{}/", pass.cov.tag))
@@ -649,15 +759,27 @@ fn reconcile(pass: &Pass, target: SymbolId, theirs: &HashSet<SymbolId>, out: &mu
 
     for &src in theirs.intersection(&ours) {
         confirm(pass, target, src, out);
-        out.record(pass, target, src, store::Verdict::Confirmed);
+        out.record(
+            pass,
+            target,
+            src,
+            store::Verdict::Confirmed,
+            EdgeKind::Calls,
+        );
     }
     for &src in theirs.difference(&ours) {
-        add(pass, target, src, out);
-        out.record(pass, target, src, store::Verdict::Added);
+        add(pass, target, src, EdgeKind::Calls, out);
+        out.record(pass, target, src, store::Verdict::Added, EdgeKind::Calls);
     }
     for &src in ours.difference(theirs) {
         if contradict(pass, target, src, out) {
-            out.record(pass, target, src, store::Verdict::Contradicted);
+            out.record(
+                pass,
+                target,
+                src,
+                store::Verdict::Contradicted,
+                EdgeKind::Calls,
+            );
         }
     }
 }
@@ -672,7 +794,7 @@ fn confirm(pass: &Pass, target: SymbolId, src: SymbolId, out: &mut Outcome) {
 }
 
 /// Only the server found it. Added below the extracted band — see `CONF_SERVER_ONLY`.
-fn add(pass: &Pass, target: SymbolId, src: SymbolId, out: &mut Outcome) {
+fn add(pass: &Pass, target: SymbolId, src: SymbolId, kind: EdgeKind, out: &mut Outcome) {
     if pass.index.contains_key(&(target, src)) {
         return; // already ours (a replayed verdict from before it was added)
     }
@@ -688,7 +810,7 @@ fn add(pass: &Pass, target: SymbolId, src: SymbolId, out: &mut Outcome) {
     out.edges.push(Edge {
         src,
         dst: target,
-        kind: EdgeKind::Calls,
+        kind,
         confidence: CONF_SERVER_ONLY,
         site,
         source: EdgeSource::LspVerified,
@@ -1093,6 +1215,7 @@ mod tests {
                 src: caller,
                 dst: target,
                 verdict: store::Verdict::Confirmed,
+                kind: EdgeKind::Calls,
             }],
         )]
         .into_iter()
@@ -1167,6 +1290,59 @@ mod tests {
         );
         assert!(!is_callable_name("schema players"));
         assert!(is_callable_name("changeset"));
+    }
+
+    /// A cached verdict must be replayed as the kind it was recorded as. A server
+    /// that can only answer `references` never said anything about a call, so
+    /// replaying its verdict as a `Calls` edge would invent evidence — and a row
+    /// written before the field existed is a call, which is the serde default.
+    #[test]
+    fn a_replayed_verdict_keeps_its_edge_kind() {
+        let f = fixture();
+        let target = SymbolId::of("api/target.ex", "run");
+        let other = SymbolId::of("api/other.ex", "also_calls");
+        let pass_plan = Plan {
+            focus: BTreeSet::new(),
+            roots: &[],
+            budget: Duration::from_secs(1),
+            on_denial: OnDenial::Report,
+            hashes: &HashMap::new(),
+            cached: &HashMap::new(),
+        };
+        let pass = Pass {
+            graph: &f.graph,
+            root: Path::new("/"),
+            cov: Coverage {
+                tag: "",
+                language: "elixir",
+                registry: &[],
+            },
+            index: &f.index,
+            plan: &pass_plan,
+        };
+        let mut out = Outcome {
+            edges: f.graph.edges().cloned().collect(),
+            ..Outcome::default()
+        };
+        let cached = [store::VerifiedCall {
+            src: other,
+            dst: target,
+            verdict: store::Verdict::Added,
+            kind: EdgeKind::References,
+        }];
+        replay(&pass, &cached, &mut out);
+
+        let added: Vec<&Edge> = out.edges.iter().filter(|e| e.src == other).collect();
+        assert_eq!(added.len(), 1);
+        assert_eq!(added[0].kind, EdgeKind::References, "not upgraded to Calls");
+        assert_eq!(added[0].confidence, CONF_SERVER_ONLY);
+
+        let legacy: store::VerifiedCall = serde_json::from_str(&format!(
+            r#"{{"src":{},"dst":{},"verdict":"Added"}}"#,
+            other.0, target.0
+        ))
+        .expect("a row from before the field existed still loads");
+        assert_eq!(legacy.kind, EdgeKind::Calls);
     }
 
     /// gopls spells a method `(*Terminal).Loop`; the Go adapter stores

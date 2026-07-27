@@ -44,6 +44,11 @@ const EPSILON: f32 = 0.02;
 fn kind_weight(kind: EdgeKind) -> f32 {
     match kind {
         EdgeKind::Calls | EdgeKind::GraphqlCall => 1.0,
+        // a reference is a real dependency even when it is a type mention rather
+        // than a call; what is uncertain about it lives in the edge's confidence
+        // (servers that can only answer `references` supply it at 0.7), so it is
+        // not discounted twice here
+        EdgeKind::References => 0.9,
         EdgeKind::DbQuery | EdgeKind::Implements | EdgeKind::Extends => 0.9,
         EdgeKind::Imports => 0.7,
         EdgeKind::ChangesWith => 0.6,

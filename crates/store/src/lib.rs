@@ -263,12 +263,22 @@ pub enum Verdict {
     Contradicted,
 }
 
-/// One recorded verdict: the call `src → dst`, and what the server said about it.
+/// One recorded verdict: the edge `src → dst`, and what the server said about it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerifiedCall {
     pub src: SymbolId,
     pub dst: SymbolId,
     pub verdict: Verdict,
+    /// Which edge kind the verdict is about. A server with no call hierarchy can
+    /// only supply `References`, and replaying that as a `Calls` edge would claim
+    /// more than the server said. Rows written before this field existed are
+    /// calls, which is what the default preserves.
+    #[serde(default = "calls")]
+    pub kind: EdgeKind,
+}
+
+fn calls() -> EdgeKind {
+    EdgeKind::Calls
 }
 
 /// How a name query found what it found. A looser match still answers, but the
