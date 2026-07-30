@@ -33,7 +33,7 @@ fn main() -> Result<()> {
     }
 }
 
-const USAGE: &str = "usage:\n  ripple parse <file> [--json]\n  ripple index <path>... [--calls lsp [--calls-budget 120s]]   (--calls lsp: call edges from a language server, for languages with no refs query)\n  ripple neighbors <symbol> [--in|--out] [--depth N] [--in-file <substr>] [--root <path>] [--json]\n  ripple impact <symbol>... [--budget N] [--in-file <substr>] [--root <path>] [--json] [--verify lsp]\n  ripple review [<base>] [--budget N] [--root <path>] [--json] [--verify lsp]\n    --verify lsp [--verify-budget 2s] [--floor-contradicted|--drop-contradicted]  (upgrade call edges from a language server)\n  ripple path <from> <to> [--depth 6] [--limit 3] [--root <path>] [--json]   (how does A reach B?)\n  ripple risk <symbol|file> [--root <path>] [--json]\n  ripple mcp [--root <path>]   (MCP server over stdio for AI agents)\n  ripple lsp doctor [--root <path>] [--budget 10s] [--json]   (are language servers usable here?)\n  ripple lsp trust [--root <path>]   (allow this repo's own .ripple/lsp.json to launch servers)";
+const USAGE: &str = "usage:\n  ripple parse <file> [--json]\n  ripple index <path>... [--calls lsp [--calls-budget 120s]]   (--calls lsp: call edges from a language server, for languages with no refs query)\n  ripple neighbors <symbol> [--in|--out] [--depth N] [--in-file <substr>] [--root <path>] [--json]\n  ripple impact <symbol>... [--budget N] [--in-file <substr>] [--root <path>] [--json] [--verify lsp]\n  ripple review [<base>] [--budget N] [--root <path>] [--json] [--verify lsp]\n    --verify lsp [--verify-budget 2s] [--floor-contradicted|--drop-contradicted]  (upgrade call edges from a language server)\n  ripple path <from> <to> [--depth 6] [--limit 3] [--root <path>] [--json]   (how does A reach B?)\n  ripple risk <symbol|file> [--root <path>] [--json]\n  ripple mcp [--root <path>]   (MCP server over stdio for AI agents)\n  ripple eval [--commits N] [--skip N] [--weights <spec>] [--root <path>]   (held-out co-change recall)\n    --risk                                        (do the risk terms rank the files a later fix touched?)\n    --oracle lsp [--sample N] [--granularity function|file]   (agree with a language server?)\n  ripple lsp doctor [--root <path>] [--budget 10s] [--json]   (are language servers usable here?)\n  ripple lsp trust [--root <path>]   (allow this repo's own .ripple/lsp.json to launch servers)";
 
 /// Where `root`'s own database would live.
 fn own_db_path(root: &Path) -> PathBuf {
@@ -91,25 +91,36 @@ const NEIGHBOR_KINDS: [EdgeKind; 6] = [
     EdgeKind::DbQuery,
 ];
 
-/// Flags that consume the following token as their value.
-const VALUE_FLAGS: &[&str] = &[
-    "--root",
-    "--depth",
-    "--budget",
-    "--ignore",
-    "--commits",
-    "--oracle",
-    "--sample",
-    "--granularity",
-    "--verify",
-    "--verify-budget",
-    "--calls",
-    "--calls-budget",
-    "--weights",
-    "--in-file",
-    "--limit",
-    "--skip",
-];
+/// Flags that consume the following token as their value, read off `USAGE`.
+///
+/// Derived rather than declared: the list used to be a second copy that had to be
+/// kept in sync by hand, and every value-taking flag added without touching it
+/// reintroduced the bug where `--root <path>` leaked its value as a positional
+/// (#24). `USAGE` is the one place a flag is written down now.
+fn value_flags() -> &'static HashSet<&'static str> {
+    static FLAGS: std::sync::OnceLock<HashSet<&'static str>> = std::sync::OnceLock::new();
+    FLAGS.get_or_init(|| {
+        let mut out = HashSet::new();
+        for line in USAGE.lines() {
+            let mut tokens = line.split_whitespace().peekable();
+            while let Some(tok) = tokens.next() {
+                let flag = tok.trim_start_matches('[').trim_end_matches([']', '|']);
+                if !flag.starts_with("--") {
+                    continue;
+                }
+                // `[--depth N]` / `[--root <path>]` take a value; `[--json]` does not
+                let takes_value = tokens.peek().is_some_and(|next| {
+                    let n = next.trim_start_matches('[').trim_end_matches([']', '|']);
+                    !n.starts_with("--") && !n.starts_with('(')
+                });
+                if takes_value {
+                    out.insert(flag);
+                }
+            }
+        }
+        out
+    })
+}
 
 /// Positional args, correctly skipping `--flag value` pairs (so `--root X` never
 /// leaks `X` as a positional).
@@ -119,7 +130,7 @@ fn positionals(args: &[String]) -> Vec<&String> {
     while i < args.len() {
         let a = &args[i];
         if a.starts_with("--") {
-            i += if VALUE_FLAGS.contains(&a.as_str()) {
+            i += if value_flags().contains(a.as_str()) {
                 2
             } else {
                 1
@@ -2405,36 +2416,32 @@ mod tests {
         );
     }
 
-    /// `VALUE_FLAGS` is hand-maintained, and a flag missing from it does not fail
-    /// loudly — its value leaks out as a positional. `--limit` was missing, so
-    /// `ripple path a b --limit 2` saw three symbols and died on a documented flag.
-    /// Every `--flag <value>` spelled in `USAGE` has to be in the list.
+    /// The parser reads its flag table off `USAGE`, so the failure that remains is
+    /// a flag the code consults but never documents: it would take no value, and
+    /// its argument would come back as a positional — the `--root <path>` bug (#24).
     #[test]
-    fn every_value_flag_in_usage_is_declared() {
-        let mut missing = Vec::new();
-        for line in USAGE.lines() {
-            let mut tokens = line.split_whitespace().peekable();
-            while let Some(tok) = tokens.next() {
-                let flag = tok.trim_start_matches('[').trim_end_matches([']', '|']);
-                if !flag.starts_with("--") {
-                    continue;
-                }
-                // `[--depth N]` / `[--root <path>]` take a value; `[--json]` does not
-                let takes_value = tokens.peek().is_some_and(|next| {
-                    let n = next.trim_start_matches('[').trim_end_matches([']', '|']);
-                    !n.starts_with("--") && !n.starts_with('(')
-                });
-                if takes_value && !VALUE_FLAGS.contains(&flag) {
-                    missing.push(flag.to_owned());
-                }
+    fn every_value_flag_the_code_reads_is_in_usage() {
+        let source = include_str!("main.rs");
+        let mut undocumented = Vec::new();
+        for (i, _) in source.match_indices("flag_value(args, \"") {
+            let rest = &source[i + "flag_value(args, \"".len()..];
+            let Some(end) = rest.find('"') else { continue };
+            let flag = &rest[..end];
+            if !USAGE.contains(flag) {
+                undocumented.push(flag.to_owned());
             }
         }
-        missing.sort();
-        missing.dedup();
+        undocumented.sort();
+        undocumented.dedup();
         assert!(
-            missing.is_empty(),
-            "value flags missing from VALUE_FLAGS: {missing:?}"
+            undocumented.is_empty(),
+            "flags read by the code but absent from USAGE, so the parser will not \
+             skip their values: {undocumented:?}"
         );
+        // and the derivation itself works
+        assert!(value_flags().contains("--root"));
+        assert!(value_flags().contains("--in-file"));
+        assert!(!value_flags().contains("--json"), "--json takes no value");
     }
 
     #[test]
