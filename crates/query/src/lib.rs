@@ -277,6 +277,9 @@ pub struct FocusItem {
 
 pub struct ReviewResult {
     pub focus: Vec<FocusItem>,
+    /// how many symbols the diff touched before `budget` truncated `focus`. A
+    /// caller that doesn't say so reads as "the diff touched this many" (#41).
+    pub total: usize,
     /// files that historically co-change with a changed file but are absent here
     /// (CodeScene's "absence of expected change" bug smell)
     pub missing_cochange: Vec<Node>,
@@ -342,6 +345,7 @@ pub fn review_focus(
             .total_cmp(&a.review_priority)
             .then(a.node.id.0.cmp(&b.node.id.0))
     });
+    let total = focus.len();
     focus.truncate(budget);
 
     // missing co-change: files co-changing with a changed file but not in the diff
@@ -366,6 +370,7 @@ pub fn review_focus(
 
     ReviewResult {
         focus,
+        total,
         missing_cochange: missing,
         untested,
     }
@@ -528,5 +533,22 @@ mod tests {
         let cut = impact(&graph, &[target.id], 1);
         assert_eq!(cut.hits.len(), 1);
         assert_eq!(cut.reached, 3, "the budget must not hide what was reached");
+    }
+
+    /// A truncated focus list that reports its own length reads as "the diff
+    /// touched this much" — on a real release diff that hid 22 of 37 (#41).
+    #[test]
+    fn review_reports_how_many_changed_symbols_the_budget_cut() {
+        let nodes: Vec<Node> = (0..5).map(|i| node("a.ts", &format!("f{i}"))).collect();
+        let graph = InMemoryGraph::from_parts(nodes, Vec::new());
+        let changed = HashMap::from([("a.ts".to_owned(), vec![(1, 1)])]);
+
+        let r = review_focus(&graph, &changed, 2);
+        assert_eq!(r.focus.len(), 2, "budget still truncates");
+        assert_eq!(r.total, 5, "and the count survives the truncation");
+
+        let all = review_focus(&graph, &changed, 20);
+        assert_eq!(all.focus.len(), 5);
+        assert_eq!(all.total, 5, "nothing cut, nothing to report");
     }
 }

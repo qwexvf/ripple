@@ -1892,14 +1892,22 @@ fn cmd_review(args: &[String]) -> Result<()> {
                     "priority": f.review_priority, "downstream": f.downstream,
                     "reasons": f.reasons,
                 })).collect::<Vec<_>>(),
+                "total": r.total,
                 "missing_cochange": r.missing_cochange.iter().map(|n| &n.module_path).collect::<Vec<_>>(),
                 "untested": r.untested.iter().map(|n| &n.name).collect::<Vec<_>>(),
             }))?
         );
     } else {
+        let cut = r.total.saturating_sub(r.focus.len());
+        let note = if cut > 0 {
+            format!(" — {cut} more cut by --budget {budget}")
+        } else {
+            String::new()
+        };
         println!(
-            "review focus ({} changed symbols), highest priority first:",
-            r.focus.len()
+            "review focus ({} of {} changed symbols), highest priority first{note}:",
+            r.focus.len(),
+            r.total
         );
         for f in &r.focus {
             println!(
