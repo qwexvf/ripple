@@ -37,10 +37,13 @@ impl LanguageAdapter for Adapter {
     }
 
     /// Integration tests only. Rust's unit tests live in a `#[cfg(test)] mod tests`
-    /// inside the file under test, which no path can see — `tags.scm` marks that
-    /// scope with `@scope.test`.
+    /// inside the file under test, which no path can see — `test_scopes` finds those.
     fn is_test_path(&self, rel: &str) -> bool {
         rel.starts_with("tests/") || rel.contains("/tests/")
+    }
+
+    fn test_scopes(&self, root: Node, src: &[u8]) -> Vec<ir::Span> {
+        cfg_test_scopes(root, src)
     }
 
     fn tags_query(&self) -> &'static str {
@@ -77,6 +80,64 @@ impl LanguageAdapter for Adapter {
 
 /// The type of the `impl` block enclosing `def`, if any. Uses the `type` field so
 /// `impl Trait for Type` yields `Type` (the trait is a separate node).
+/// Every `mod` gated on `cfg(test)`, as spans.
+///
+/// A tags-query capture cannot do this reliably. The attribute is a *preceding
+/// sibling* of the module, so the pattern needs an anchor — and the anchor then
+/// requires it to be the immediately preceding one, which `#[cfg(test)]`
+/// `#[allow(…)]` `mod tests` violates. Matching the attribute's text needs a
+/// regex predicate, and this project's query engine treats an unsupported
+/// predicate as *passing*, which would mark every `mod` in a repo as tests.
+/// Walking the tree costs one pass and has neither failure mode.
+fn cfg_test_scopes(root: Node, src: &[u8]) -> Vec<ir::Span> {
+    let mut out = Vec::new();
+    let mut cursor = root.walk();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        for child in node.named_children(&mut cursor) {
+            stack.push(child);
+        }
+        if node.kind() != "mod_item" || !gated_on_cfg_test(node, src) {
+            continue;
+        }
+        let (s, e) = (node.start_position(), node.end_position());
+        out.push(ir::Span {
+            start_line: s.row as u32 + 1,
+            start_col: s.column as u32 + 1,
+            end_line: e.row as u32 + 1,
+            end_col: e.column as u32 + 1,
+        });
+    }
+    out.sort_by_key(|s| (s.start_line, s.start_col));
+    out
+}
+
+/// Is any attribute attached to this item a `cfg` naming the `test` feature?
+/// Walks the whole run of attributes, so a `#[cfg(test)]` behind an `#[allow]`
+/// still counts, and reads `cfg(all(test, …))` too.
+fn gated_on_cfg_test(item: Node, src: &[u8]) -> bool {
+    let mut prev = item.prev_named_sibling();
+    while let Some(node) = prev {
+        if node.kind() != "attribute_item" {
+            return false;
+        }
+        if let Ok(text) = node.utf8_text(src) {
+            let after_cfg = text.strip_prefix("#[").map(str::trim_start);
+            if after_cfg.is_some_and(|t| t.starts_with("cfg")) && names_test(text) {
+                return true;
+            }
+        }
+        prev = node.prev_named_sibling();
+    }
+    false
+}
+
+/// `test` as a whole token, so `cfg(feature = "testing")` doesn't qualify.
+fn names_test(attr: &str) -> bool {
+    attr.split(|c: char| !c.is_alphanumeric() && c != '_')
+        .any(|tok| tok == "test")
+}
+
 fn impl_type<'a>(def: Node, src: &'a [u8]) -> Option<&'a str> {
     let mut node = def;
     while let Some(parent) = node.parent() {

@@ -39,11 +39,17 @@ pub trait LanguageAdapter: Send + Sync {
     /// Does this repo-relative path hold tests? Convention, so it is language
     /// knowledge (`*.test.ts`, `*_test.go`, `test/…`). Default: no.
     ///
-    /// A language whose tests live *inside* the file under test (Rust's
-    /// `#[cfg(test)] mod tests`) can't answer by path — it marks the scope with a
-    /// `@scope.test` capture in its tags query instead.
+    /// A language whose tests live *inside* the file under test answers with
+    /// `test_scopes` instead.
     fn is_test_path(&self, _rel_path: &str) -> bool {
         false
+    }
+
+    /// Regions of this file that are test-only, for languages where no path can
+    /// tell (Rust's `#[cfg(test)] mod tests` sits in the file it tests). Spans, so
+    /// nothing language-specific leaves the adapter. Default: none.
+    fn test_scopes(&self, _root: tree_sitter::Node, _src: &[u8]) -> Vec<ir::Span> {
+        Vec::new()
     }
 
     /// Is a definition exported/public? Language-specific (TS `export`, Elixir
