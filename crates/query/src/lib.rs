@@ -120,6 +120,14 @@ pub fn impact(graph: &InMemoryGraph, seeds: &[SymbolId], budget: usize) -> Impac
     Impact { hits, reached }
 }
 
+/// Is this symbol part of the test side — something with a `Tests` edge going out?
+fn is_test_side(graph: &InMemoryGraph, id: SymbolId) -> bool {
+    graph
+        .out_edges(id)
+        .iter()
+        .any(|e: &Edge| e.kind == EdgeKind::Tests)
+}
+
 /// Does anything test this symbol? Either direction: which way a `Tests` edge
 /// points is the linker's convention, not a fact about the symbol.
 fn has_test_edge(graph: &InMemoryGraph, id: SymbolId) -> bool {
@@ -290,14 +298,18 @@ pub struct ReviewResult {
     pub tests_known: bool,
 }
 
-/// How many of a symbol's lines the diff touched.
-fn changed_within(span: &ir::Span, ranges: &[(u32, u32)]) -> u32 {
-    ranges
-        .iter()
-        .map(|&(rs, re)| {
-            let lo = rs.max(span.start_line);
-            let hi = re.min(span.end_line);
-            hi.saturating_sub(lo).saturating_add(u32::from(hi >= lo))
+/// How many of a symbol's lines the diff touched, across every definition site.
+fn changed_within(sym: &Node, ranges: &[(u32, u32)]) -> u32 {
+    sym.definition_spans()
+        .map(|span| {
+            ranges
+                .iter()
+                .map(|&(rs, re)| {
+                    let lo = rs.max(span.start_line);
+                    let hi = re.min(span.end_line);
+                    hi.saturating_sub(lo).saturating_add(u32::from(hi >= lo))
+                })
+                .sum::<u32>()
         })
         .sum()
 }
@@ -311,15 +323,11 @@ fn changed_within(span: &ir::Span, ranges: &[(u32, u32)]) -> u32 {
 /// with a big blast radius (#42). This is the one term that reads the change
 /// itself: rewriting a whole function is worth twice a one-line touch of it.
 fn rewrite_share(sym: &Node, ranges: &[(u32, u32)]) -> f32 {
-    let lines = sym
-        .span
-        .end_line
-        .saturating_sub(sym.span.start_line)
-        .saturating_add(1);
-    if lines == 0 {
-        return 0.0;
-    }
-    (changed_within(&sym.span, ranges) as f32 / lines as f32).min(1.0)
+    let lines: u32 = sym
+        .definition_spans()
+        .map(|s| s.end_line.saturating_sub(s.start_line).saturating_add(1))
+        .sum();
+    (changed_within(sym, ranges) as f32 / lines.max(1) as f32).min(1.0)
 }
 
 /// Rank the symbols touched by a diff (`changed`: file → changed line ranges,
@@ -330,30 +338,54 @@ pub fn review_focus(
     graph: &InMemoryGraph,
     changed: &HashMap<String, Vec<(u32, u32)>>,
     budget: usize,
+    scope: &str,
 ) -> ReviewResult {
-    // changed symbols = def nodes whose span overlaps a changed range in its file
+    // changed symbols = def nodes any of whose definition sites overlaps a changed
+    // range. Several sites is ordinary code — Elixir's multi-clause functions,
+    // reopened classes — and reading only the primary span made editing the second
+    // clause drop the function from the review entirely.
     let mut changed_syms: Vec<Node> = Vec::new();
     for node in graph.nodes() {
         if let Some(ranges) = changed.get(&node.module_path) {
-            let (s, e) = (node.span.start_line, node.span.end_line);
-            if ranges.iter().any(|&(rs, re)| s <= re && e >= rs) {
+            let overlaps = node.definition_spans().any(|sp| {
+                ranges
+                    .iter()
+                    .any(|&(rs, re)| sp.start_line <= re && sp.end_line >= rs)
+            });
+            if overlaps {
                 changed_syms.push(node.clone());
             }
         }
     }
 
-    // a graph with no Tests edge anywhere cannot tell tested from untested, and
-    // flagging every row is the same as flagging none (#36)
-    let tests_known = graph.edges().any(|e| e.kind == EdgeKind::Tests);
+    // a graph with no Tests edge cannot tell tested from untested, and flagging
+    // every row is the same as flagging none (#36). Asked per root: in a multi-root
+    // index one repo's tests used to answer for a repo that has none.
+    let tests_known = graph
+        .edges()
+        .filter(|e| e.kind == EdgeKind::Tests)
+        .any(|e| {
+            graph
+                .get(e.src)
+                .is_some_and(|n| n.module_path.starts_with(scope))
+        });
 
     let mut focus = Vec::new();
     let mut untested = Vec::new();
     for sym in &changed_syms {
         let downstream = impact(graph, &[sym.id], 200).hits;
-        let down_weight: f32 = downstream.iter().map(|h| h.weight).sum();
+        // a test that breaks is how you find out, not damage — the same rule
+        // `overlay::score_structure` applies to fanout, so the two agree (#42).
+        // The hit stays in `impact`'s own answer: "your test will break" is worth
+        // knowing, it just isn't reach.
+        let down_weight: f32 = downstream
+            .iter()
+            .filter(|h| !is_test_side(graph, h.node.id))
+            .map(|h| h.weight)
+            .sum();
         let empty = Vec::new();
         let ranges = changed.get(&sym.module_path).unwrap_or(&empty);
-        let changed_lines = changed_within(&sym.span, ranges);
+        let changed_lines = changed_within(sym, ranges);
         let review_priority = (1.0 + sym.risk.composite)
             * (1.0 + down_weight.ln_1p())
             * (1.0 + (changed_lines as f32).ln_1p() * (0.5 + 0.5 * rewrite_share(sym, ranges)));
@@ -595,12 +627,70 @@ mod tests {
         // the whole of one, a single line of the other
         let changed = HashMap::from([("a.ts".to_owned(), vec![(1, 60), (100, 100)])]);
 
-        let r = review_focus(&graph, &changed, 10);
+        let r = review_focus(&graph, &changed, 10, "");
         let names: Vec<&str> = r.focus.iter().map(|f| f.node.name.as_str()).collect();
         assert_eq!(names, vec!["rewritten", "grazed"]);
 
         let lines: Vec<u32> = r.focus.iter().map(|f| f.changed_lines).collect();
         assert_eq!(lines, vec![60, 1], "and the count is reported, not implied");
+    }
+
+    /// A symbol with several definition sites is ordinary code — Elixir's
+    /// multi-clause functions, a reopened class. Reading only the primary span made
+    /// editing the second clause drop the function from the review entirely.
+    #[test]
+    fn a_second_definition_site_is_still_the_same_changed_symbol() {
+        let mut multi = node("players.ex", "kind");
+        multi.span = ir::Span {
+            start_line: 10,
+            start_col: 1,
+            end_line: 10,
+            end_col: 40,
+        };
+        multi.extra_spans = vec![ir::Span {
+            start_line: 20,
+            start_col: 1,
+            end_line: 20,
+            end_col: 40,
+        }];
+        let graph = InMemoryGraph::from_parts(vec![multi], Vec::new());
+
+        for line in [10, 20] {
+            let changed = HashMap::from([("players.ex".to_owned(), vec![(line, line)])]);
+            let r = review_focus(&graph, &changed, 10, "");
+            assert_eq!(
+                r.focus.len(),
+                1,
+                "editing the clause at line {line} must still name the function"
+            );
+            assert_eq!(r.focus[0].changed_lines, 1);
+        }
+    }
+
+    /// One repository's tests used to answer for another's: `tests_known` scanned
+    /// the whole multi-root graph, so a repo with no tests at all still had every
+    /// row flagged `untested` as if that meant something (#36).
+    #[test]
+    fn tests_are_known_per_root_not_per_index() {
+        let tested = node("web/src/util.ts", "getPath");
+        let test_fn = node("web/src/util.test.ts", "runs");
+        let untested = node("api/src/client.ts", "send");
+        let tests_edge = edge(&test_fn, &tested, EdgeKind::Tests, 0.8);
+        let graph = InMemoryGraph::from_parts(vec![tested, test_fn, untested], vec![tests_edge]);
+
+        let web = HashMap::from([("web/src/util.ts".to_owned(), vec![(1, 1)])]);
+        assert!(review_focus(&graph, &web, 10, "web/").tests_known);
+
+        let api = HashMap::from([("api/src/client.ts".to_owned(), vec![(1, 1)])]);
+        let r = review_focus(&graph, &api, 10, "api/");
+        assert!(
+            !r.tests_known,
+            "the other repo's tests say nothing about this one"
+        );
+        assert!(
+            r.untested.is_empty() && !r.focus[0].reasons.iter().any(|s| s == "untested"),
+            "and nothing is flagged on a judgement that cannot be made"
+        );
     }
 
     /// A truncated focus list that reports its own length reads as "the diff
@@ -611,11 +701,11 @@ mod tests {
         let graph = InMemoryGraph::from_parts(nodes, Vec::new());
         let changed = HashMap::from([("a.ts".to_owned(), vec![(1, 1)])]);
 
-        let r = review_focus(&graph, &changed, 2);
+        let r = review_focus(&graph, &changed, 2, "");
         assert_eq!(r.focus.len(), 2, "budget still truncates");
         assert_eq!(r.total, 5, "and the count survives the truncation");
 
-        let all = review_focus(&graph, &changed, 20);
+        let all = review_focus(&graph, &changed, 20, "");
         assert_eq!(all.focus.len(), 5);
         assert_eq!(all.total, 5, "nothing cut, nothing to report");
     }

@@ -245,7 +245,9 @@ fn index_project(roots: &[PathBuf], lsp_calls: Option<std::time::Duration>) -> R
 
     let edge_count = edges.len();
     let calls_report = match lsp_calls {
-        Some(budget) => Some(lsp_calls_pass(&mut store, &nodes, edges, budget, &scopes)?),
+        Some(budget) => Some(lsp_calls_pass(
+            &mut store, &mut nodes, edges, budget, &scopes,
+        )?),
         None => None,
     };
 
@@ -276,7 +278,7 @@ fn index_project(roots: &[PathBuf], lsp_calls: Option<std::time::Duration>) -> R
 /// whose answer moves with its version.
 fn lsp_calls_pass(
     store: &mut RedbStore,
-    nodes: &[ir::Node],
+    nodes: &mut [ir::Node],
     edges: Vec<ir::Edge>,
     budget: std::time::Duration,
     scopes: &resolve::TestScopes,
@@ -321,6 +323,10 @@ fn lsp_calls_pass(
         edges.retain(|e| e.kind != EdgeKind::Tests);
         let fresh = resolve::link_tests(scopes, &edges);
         edges.extend(fresh);
+        // and re-score: for a Tier-0 language every call edge in the graph was
+        // produced right here, so the fanout computed before this pass was
+        // computed without them — the risk terms and the edges disagreed on disk
+        overlay::score_structure(nodes, &edges);
         store
             .write(nodes, &edges)
             .context("persisting server-sourced call edges")?;
@@ -2015,7 +2021,7 @@ fn mcp_call(
             let store = RedbStore::open(db_path(root).map_err(|e| e.to_string())?);
             let tag = root_tag(&store, root).map_err(|e| e.to_string())?;
             let changed = namespaced(&tag, overlay::diff_lines(root, str_arg("base").as_deref()));
-            let r = query::review_focus(graph, &changed, usize_arg("budget", 15));
+            let r = query::review_focus(graph, &changed, usize_arg("budget", 15), &tag);
             Ok(mcp_text(review_payload(&r)))
         }
         "neighbors" => {
@@ -2127,10 +2133,8 @@ fn cmd_review(args: &[String]) -> Result<()> {
     let mut store = RedbStore::open(db_path(&root)?);
     // a multi-root index stores tag-prefixed module paths, and review compares the
     // diff's paths to them by equality — unnamespaced, every match silently missed
-    let changed = namespaced(
-        &root_tag(&store, &root)?,
-        overlay::diff_lines(&root, base.map(String::as_str)),
-    );
+    let tag = root_tag(&store, &root)?;
+    let changed = namespaced(&tag, overlay::diff_lines(&root, base.map(String::as_str)));
     if changed.is_empty() {
         println!("no changes to review (vs {})", base.map_or("HEAD", |s| s));
         return Ok(());
@@ -2142,7 +2146,7 @@ fn cmd_review(args: &[String]) -> Result<()> {
         .map(|n| n.id)
         .collect();
     graph = verify_upgrade(&mut store, graph, &root, args, &seeds, json)?;
-    let r = query::review_focus(&graph, &changed, budget);
+    let r = query::review_focus(&graph, &changed, budget, &tag);
     // the spans a diff is attributed to come from the index, so an index older
     // than the edits attributes changed lines to whatever used to be there
     warn_if_stale(&store, &changed.keys().map(String::as_str).collect());
