@@ -25,6 +25,10 @@ const CONF_TESTS: f32 = 0.8;
 /// The symbols that live on the test side of a repo.
 pub struct TestScopes {
     ids: HashSet<SymbolId>,
+    /// module nodes of files that are *entirely* tests. Kept apart from `ids`
+    /// because a file whose tests are inline (Rust) is not one of these: its
+    /// module node also holds production code.
+    whole_files: HashSet<SymbolId>,
 }
 
 impl TestScopes {
@@ -40,6 +44,7 @@ impl TestScopes {
         registry: &[Box<dyn LanguageAdapter>],
     ) -> TestScopes {
         let mut ids = HashSet::new();
+        let mut whole_files = HashSet::new();
         for f in files {
             let rel = roots
                 .iter()
@@ -52,7 +57,9 @@ impl TestScopes {
                 lang::adapter_for(registry, &f.canonical).is_some_and(|a| a.is_test_path(&rel));
 
             if is_test_file {
-                ids.insert(SymbolId::module(&f.module_path));
+                let module = SymbolId::module(&f.module_path);
+                ids.insert(module);
+                whole_files.insert(module);
                 ids.extend(f.extract.defs.iter().map(|d| d.id));
                 continue;
             }
@@ -66,11 +73,16 @@ impl TestScopes {
                 }
             }
         }
-        TestScopes { ids }
+        TestScopes { ids, whole_files }
     }
 
     pub fn contains(&self, id: SymbolId) -> bool {
         self.ids.contains(&id)
+    }
+
+    /// Is this the module node of a file that holds nothing but tests?
+    fn is_test_file(&self, id: SymbolId) -> bool {
+        self.whole_files.contains(&id)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -91,7 +103,17 @@ pub fn link_tests(scopes: &TestScopes, edges: &[Edge]) -> Vec<Edge> {
     // keyed for determinism: several call sites between one pair are one relationship
     let mut by_pair: BTreeMap<(u64, u64), Edge> = BTreeMap::new();
     for e in edges {
-        if !matches!(e.kind, EdgeKind::Calls | EdgeKind::References) {
+        // an import is a weaker claim than a call, and only counts from a file that
+        // is nothing but tests: `import { getPath }` at the top of util.test.ts is
+        // the test file exercising getPath, but an import in a file that merely
+        // *contains* a `#[cfg(test)] mod` says nothing. Without this the test
+        // module stayed a dependent and a well-tested symbol still scored fanout (#42).
+        let convertible = match e.kind {
+            EdgeKind::Calls | EdgeKind::References => true,
+            EdgeKind::Imports => scopes.is_test_file(e.src),
+            _ => false,
+        };
+        if !convertible {
             continue;
         }
         if !scopes.contains(e.src) || scopes.contains(e.dst) {

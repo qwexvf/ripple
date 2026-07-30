@@ -937,3 +937,39 @@ fn edges_inside_a_root_survive_a_second_root() {
         "adding a second root changed the first one's edges"
     );
 }
+
+/// A test file's `import` is how it reaches the code it tests; without counting it
+/// the test *module* stayed a dependent, so a well-tested symbol still scored
+/// fanout and #42's fix only worked on the function-level caller.
+#[test]
+fn an_import_from_a_whole_test_file_is_also_a_test_edge() {
+    let ts = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/testlink/ts");
+    let indexed =
+        resolve::build_incremental(std::slice::from_ref(&ts), &std::collections::HashMap::new())
+            .unwrap();
+    let scopes = resolve::TestScopes::of(&indexed.files, &indexed.roots, &lang::registry());
+    let tests = resolve::link_tests(&scopes, &indexed.result.edges);
+
+    let get_path = SymbolId::of("src/util.ts", "getPath");
+    let test_module = SymbolId::module("src/util.test.ts");
+    assert!(
+        tests
+            .iter()
+            .any(|e| e.src == test_module && e.dst == get_path),
+        "the test file itself tests what it imports"
+    );
+
+    // Rust's tests live in the file they test, so that file's module node holds
+    // production code too and must not be marked test-side
+    let rs = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/testlink/rs");
+    let indexed =
+        resolve::build_incremental(std::slice::from_ref(&rs), &std::collections::HashMap::new())
+            .unwrap();
+    let scopes = resolve::TestScopes::of(&indexed.files, &indexed.roots, &lang::registry());
+    let tests = resolve::link_tests(&scopes, &indexed.result.edges);
+    let module = SymbolId::module("lib.rs");
+    assert!(
+        !tests.iter().any(|e| e.src == module),
+        "a file that merely contains a #[cfg(test)] mod is not a test file"
+    );
+}
