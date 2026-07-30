@@ -14,6 +14,10 @@ const NODES: TableDefinition<u64, &[u8]> = TableDefinition::new("nodes");
 const EDGES: TableDefinition<u64, &[u8]> = TableDefinition::new("edges");
 const EXTRACTS: TableDefinition<&str, &[u8]> = TableDefinition::new("extracts");
 const ROOTS: TableDefinition<u64, &[u8]> = TableDefinition::new("roots");
+/// Path + content hash per indexed file. The same facts as the head of an
+/// `extracts` row, kept apart so a query can ask "is this answer still true?"
+/// without deserializing every AST record in the repo.
+const STAMPS: TableDefinition<&str, &[u8]> = TableDefinition::new("stamps");
 /// Verified call verdicts, keyed by the *content hash* of the file they came from.
 const VERIFIED: TableDefinition<&str, &[u8]> = TableDefinition::new("verified");
 
@@ -38,6 +42,10 @@ pub trait GraphStore {
     fn write_extracts(&mut self, files: &[CachedFile]) -> Result<()>;
     /// Load the extract cache keyed by module path; empty if none yet.
     fn read_extracts(&self) -> Result<HashMap<String, CachedFile>>;
+    /// Where each indexed file was and what it hashed to, without paying for the
+    /// extracts. A query that wants to know whether its answer is still true reads
+    /// this; deserializing every AST record to compare two hashes is not worth it.
+    fn read_file_stamps(&self) -> Result<HashMap<String, FileStamp>>;
     /// Persist the (tag, path) roots this index was built from. Commands that
     /// start from a filesystem path need the tag to namespace it the same way
     /// indexing did — without it, a multi-root graph looks empty to them.
@@ -48,6 +56,27 @@ pub trait GraphStore {
     fn write_verified(&mut self, by_hash: &HashMap<String, Vec<VerifiedCall>>) -> Result<()>;
     /// Every cached verdict set, keyed by file content hash.
     fn read_verified(&self) -> Result<HashMap<String, Vec<VerifiedCall>>>;
+}
+
+/// How long to wait out another process's index before giving up. Long enough to
+/// cover a small repo's whole index, short enough that a stuck process is reported
+/// rather than waited on forever.
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+const LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// redb reports the held lock as an I/O error whose message is the only detail.
+fn is_locked(e: &redb::DatabaseError) -> bool {
+    matches!(e, redb::DatabaseError::DatabaseAlreadyOpen)
+        || e.to_string().contains("Cannot acquire lock")
+}
+
+/// The identifying part of a `CachedFile`: where the file was and what it hashed
+/// to. Deserialized from the same rows, ignoring the extract.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileStamp {
+    pub canonical: PathBuf,
+    pub module_path: String,
+    pub hash: String,
 }
 
 pub struct RedbStore {
@@ -61,11 +90,34 @@ impl RedbStore {
 
     /// Open the database, creating the parent directory if needed. Every write path
     /// goes through this so the "create dir, then create db" pairing lives once.
+    ///
+    /// redb holds an exclusive lock, and two indexers is a normal thing to have —
+    /// the MCP `reindex` tool and a CLI run, or two agents on one repo. Waiting
+    /// briefly turns a race into a pause; past that, say who to blame rather than
+    /// surfacing `Database already open. Cannot acquire lock.` (#38).
     fn db(&self) -> Result<Database> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
-        Database::create(&self.path).context("create redb")
+        let mut waited = std::time::Duration::ZERO;
+        loop {
+            match Database::create(&self.path) {
+                Ok(db) => return Ok(db),
+                Err(e) if is_locked(&e) && waited < LOCK_WAIT => {
+                    std::thread::sleep(LOCK_POLL);
+                    waited += LOCK_POLL;
+                }
+                Err(e) if is_locked(&e) => {
+                    return Err(anyhow::Error::new(e).context(format!(
+                        "another ripple is using {} — waited {}s. \
+                         Re-run once it finishes, or point --root elsewhere",
+                        self.path.display(),
+                        LOCK_WAIT.as_secs()
+                    )))
+                }
+                Err(e) => return Err(anyhow::Error::new(e).context("create redb")),
+            }
+        }
     }
 }
 
@@ -91,10 +143,18 @@ fn put_graph(wtx: &redb::WriteTransaction, nodes: &[Node], edges: &[Edge]) -> Re
 
 fn put_extracts(wtx: &redb::WriteTransaction, files: &[CachedFile]) -> Result<()> {
     let _ = wtx.delete_table(EXTRACTS);
+    let _ = wtx.delete_table(STAMPS);
     let mut t = wtx.open_table(EXTRACTS)?;
+    let mut s = wtx.open_table(STAMPS)?;
     for f in files {
         let bytes = serde_json::to_vec(f)?;
         t.insert(f.module_path.as_str(), bytes.as_slice())?;
+        let stamp = serde_json::to_vec(&FileStamp {
+            canonical: f.canonical.clone(),
+            module_path: f.module_path.clone(),
+            hash: f.hash.clone(),
+        })?;
+        s.insert(f.module_path.as_str(), stamp.as_slice())?;
     }
     Ok(())
 }
@@ -154,6 +214,26 @@ impl GraphStore for RedbStore {
                 // a row written by an older extract schema is a cache miss, not a
                 // failure — the file is simply re-extracted
                 let Ok(f) = serde_json::from_slice::<CachedFile>(v.value()) else {
+                    continue;
+                };
+                out.insert(f.module_path.clone(), f);
+            }
+        }
+        Ok(out)
+    }
+
+    fn read_file_stamps(&self) -> Result<HashMap<String, FileStamp>> {
+        let Ok(db) = Database::open(&self.path) else {
+            return Ok(HashMap::new()); // no prior index
+        };
+        let rtx = db.begin_read()?;
+        let mut out = HashMap::new();
+        // absent for an index written before stamps existed: unknown staleness,
+        // which reports nothing rather than claiming everything is fresh
+        if let Ok(t) = rtx.open_table(STAMPS) {
+            for row in t.iter()? {
+                let (_k, v) = row?;
+                let Ok(f) = serde_json::from_slice::<FileStamp>(v.value()) else {
                     continue;
                 };
                 out.insert(f.module_path.clone(), f);

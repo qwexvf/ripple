@@ -266,7 +266,7 @@ fn parse_one(
         .context("adapter vanished between discovery and parse")?;
     let source = std::fs::read_to_string(canonical)
         .with_context(|| format!("cannot read {}", canonical.display()))?;
-    let hash = blake3::hash(source.as_bytes()).to_hex().to_string();
+    let hash = parse::content_hash(&source);
 
     let parse = || {
         let q = queries

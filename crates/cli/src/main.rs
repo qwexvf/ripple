@@ -554,6 +554,14 @@ fn cmd_impact(args: &[String]) -> Result<()> {
 
     let result = query::impact(&graph, &seeds, budget);
     let hits = &result.hits;
+    let mut touched: HashSet<&str> = hits.iter().map(|h| h.node.module_path.as_str()).collect();
+    touched.extend(
+        seeds
+            .iter()
+            .filter_map(|id| graph.get(*id))
+            .map(|n| n.module_path.as_str()),
+    );
+    warn_if_stale(&store, &touched);
     if json {
         let out: Vec<_> = hits
             .iter()
@@ -679,6 +687,59 @@ fn lookup_note(query: &str, nodes: &[&ir::Node], how: store::Match) -> Option<St
             ))
         }
     }
+}
+
+/// Warn when the files an answer is built from have changed since indexing.
+///
+/// There is no watcher and no automatic re-index, so a renamed function keeps
+/// answering with a 0.95 next to it — a fabricated fact presented as a measured
+/// one. The extract cache already stores a content hash per file, so checking the
+/// handful of files in *this* answer costs one read each and no parse (#38).
+fn warn_if_stale(store: &RedbStore, modules: &HashSet<&str>) {
+    if modules.is_empty() {
+        return;
+    }
+    let Ok(stamps) = store.read_file_stamps() else {
+        return; // the answer is worth more than a diagnostic that failed
+    };
+    let stale = stale_modules(&stamps, modules);
+    if stale.is_empty() {
+        return;
+    }
+    let shown: Vec<&str> = stale.iter().take(3).map(String::as_str).collect();
+    let more = stale.len().saturating_sub(shown.len());
+    eprintln!(
+        "⚠ {} of {} files in this answer changed since indexing ({}{}) — re-run `ripple index`",
+        stale.len(),
+        modules.len(),
+        shown.join(", "),
+        if more > 0 {
+            format!(", … {more} more")
+        } else {
+            String::new()
+        }
+    );
+}
+
+/// Which of `modules` no longer hash to what they were indexed as, sorted.
+/// A module the index has never heard of is not a staleness claim we can make;
+/// a file that has since disappeared is.
+fn stale_modules(
+    stamps: &HashMap<String, store::FileStamp>,
+    modules: &HashSet<&str>,
+) -> Vec<String> {
+    let mut stale: Vec<String> = modules
+        .iter()
+        .filter(|m| {
+            stamps.get(**m).is_some_and(|stamp| {
+                std::fs::read_to_string(&stamp.canonical)
+                    .map_or(true, |text| parse::content_hash(&text) != stamp.hash)
+            })
+        })
+        .map(|m| (*m).to_owned())
+        .collect();
+    stale.sort_unstable();
+    stale
 }
 
 /// `--in-file <substr>`: narrow a name that matched several symbols to the ones in
@@ -1960,6 +2021,9 @@ fn cmd_review(args: &[String]) -> Result<()> {
         .collect();
     graph = verify_upgrade(&mut store, graph, &root, args, &seeds, json)?;
     let r = query::review_focus(&graph, &changed, budget);
+    // the spans a diff is attributed to come from the index, so an index older
+    // than the edits attributes changed lines to whatever used to be there
+    warn_if_stale(&store, &changed.keys().map(String::as_str).collect());
 
     if json {
         println!(
@@ -2076,6 +2140,10 @@ fn cmd_neighbors(args: &[String]) -> Result<()> {
     let graph = store.load()?;
 
     let matches = lookup_or_bail(&graph, &symbol, json, args)?;
+    warn_if_stale(
+        &store,
+        &matches.iter().map(|n| n.module_path.as_str()).collect(),
+    );
 
     let arrow = if dir == Dir::In {
         "callers/importers of"
@@ -2324,6 +2392,44 @@ mod tests {
         // a looser rule still says which rule fired
         let loose = lookup_note("run", &[&a], store::Match::Substring).expect("loose");
         assert!(loose.contains("substring"), "{loose}");
+    }
+
+    /// A renamed function kept answering with a 0.95 next to it, because nothing
+    /// ever compared the graph against disk (#38).
+    #[test]
+    fn a_changed_file_is_reported_stale_and_an_unchanged_one_is_not() {
+        let dir = std::env::temp_dir().join(format!("ripple-stale-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (same, edited) = (dir.join("same.ts"), dir.join("edited.ts"));
+        std::fs::write(&same, "export const a = 1;\n").unwrap();
+        std::fs::write(&edited, "export const b = 1;\n").unwrap();
+
+        let stamp = |p: &std::path::Path, module: &str, text: &str| {
+            (
+                module.to_owned(),
+                store::FileStamp {
+                    canonical: p.to_owned(),
+                    module_path: module.to_owned(),
+                    hash: parse::content_hash(text),
+                },
+            )
+        };
+        let stamps = HashMap::from([
+            stamp(&same, "same.ts", "export const a = 1;\n"),
+            stamp(&edited, "edited.ts", "export const b = 1;\n"),
+            stamp(&dir.join("gone.ts"), "gone.ts", "whatever"),
+        ]);
+
+        std::fs::write(&edited, "export const b = 2;\n").unwrap();
+        let asked = HashSet::from(["same.ts", "edited.ts", "gone.ts", "never-indexed.ts"]);
+        assert_eq!(
+            stale_modules(&stamps, &asked),
+            vec!["edited.ts".to_owned(), "gone.ts".to_owned()],
+            "a rewritten file and a deleted one are stale; an unchanged one and an \
+             unindexed one are not"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

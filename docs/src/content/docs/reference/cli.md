@@ -41,8 +41,19 @@ two repos do not collide.
 Re-running is incremental: unchanged files are reused from the content cache. The summary
 line reports added / changed / unchanged / removed alongside the node and edge counts.
 
-There is no watcher and no staleness check. After you edit code, re-index — otherwise
-every other command answers from the old graph without warning.
+There is no watcher and no automatic re-index: after you edit code, re-index. What you do
+get is a warning. `impact`, `neighbors` and `review` hash the files their answer rests on
+and compare against the index, so an answer built from edited code says so on stderr —
+
+```
+⚠ 1 of 1 files in this answer changed since indexing (a.ts) — re-run `ripple index`
+```
+
+— instead of handing you a renamed function with a `0.95` next to it.
+
+Two `ripple index` runs on one repository no longer collide either: redb allows a single
+writer, so the second waits up to 30s for the first and then reports which database is
+held, rather than surfacing `Database already open. Cannot acquire lock.`
 
 ### `--calls lsp`
 

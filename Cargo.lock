@@ -427,6 +427,7 @@ name = "parse"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "ir",
  "lang",
  "serde",
@@ -550,7 +551,6 @@ name = "resolve"
 version = "0.2.0"
 dependencies = [
  "anyhow",
- "blake3",
  "ir",
  "lang",
  "overlay",

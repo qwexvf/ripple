@@ -12,6 +12,13 @@ use tree_sitter::{
     Node as TsNode, Parser, Query, QueryCursor, QueryMatch, QueryPredicateArg, Tree,
 };
 
+/// The content hash a `CachedFile` is keyed on. One definition, because both the
+/// indexer (is this file unchanged?) and the query side (is this answer still
+/// true?) have to agree on what "unchanged" means.
+pub fn content_hash(source: &str) -> String {
+    blake3::hash(source.as_bytes()).to_hex().to_string()
+}
+
 /// A file's extraction plus its content hash — the unit of incremental caching.
 /// Unchanged files reuse this across `index` runs, skipping the parse. See
 /// docs/v0-plan.md "incremental".
