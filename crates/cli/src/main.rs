@@ -53,13 +53,21 @@ const INDEX_POINTER: &str = "index-root";
 /// naming the index that vanished, never a silent fall-through.
 fn db_path(root: &Path) -> Result<PathBuf> {
     let own = own_db_path(root);
-    if own.exists() {
-        return Ok(own);
-    }
     let pointer = root.join(".ripple").join(INDEX_POINTER);
     let Ok(text) = std::fs::read_to_string(&pointer) else {
-        return Ok(own); // never indexed: let the store's own error explain
+        return Ok(own); // never part of a shared index: answer from its own graph
     };
+    // the pointer wins over a local database. A leftover single-root graph next to
+    // a pointer is the stale one, and preferring it silently answered from a graph
+    // that knows nothing about the other repo
+    if own.exists() {
+        eprintln!(
+            "⚠ {} has its own index as well as a pointer to the shared one — using the shared index. \
+             Delete {} if it is stale",
+            root.display(),
+            own.display()
+        );
+    }
     let primary = PathBuf::from(text.trim());
     let shared = own_db_path(&primary);
     if !shared.exists() {
@@ -780,6 +788,28 @@ fn write_index_pointers(primary: &Path, roots: &[(String, PathBuf)]) -> Result<(
         );
     }
     Ok(())
+}
+
+/// The machine-readable form of a review, shared by `--json` and the MCP tool.
+///
+/// One function on purpose: the two surfaces had drifted, and the MCP one — the
+/// surface an agent actually reads — was missing every fix the CLI had gained
+/// (namespacing, `total`, `changed_lines`, `untested_known`).
+fn review_payload(r: &query::ReviewResult) -> Value {
+    json!({
+        "focus": r.focus.iter().map(|f| json!({
+            "symbol": f.node.name, "module": f.node.module_path,
+            "priority": f.review_priority, "downstream": f.downstream,
+            "changed_lines": f.changed_lines,
+            "reasons": f.reasons,
+        })).collect::<Vec<_>>(),
+        // without `total` a caller reads focus.len() as the size of the diff (#41)
+        "total": r.total,
+        "missing_cochange": r.missing_cochange.iter().map(|n| &n.module_path).collect::<Vec<_>>(),
+        "untested": r.untested.iter().map(|n| &n.name).collect::<Vec<_>>(),
+        // and without this it cannot tell "nothing untested" from "cannot tell" (#36)
+        "untested_known": r.tests_known,
+    })
 }
 
 /// Re-key a diff's repo-relative paths as the module paths the graph stores.
@@ -1892,8 +1922,22 @@ fn mcp_call(
 
     match name {
         "reindex" => {
-            let summary = index_project(std::slice::from_ref(&root.to_path_buf()), None)
-                .map_err(|e| e.to_string())?;
+            // re-index the set the graph was built from, not just this root:
+            // narrowing a multi-root index to one root drops the other repo's
+            // symbols and leaves it pointing at a graph that no longer knows it
+            let store = RedbStore::open(db_path(root).map_err(|e| e.to_string())?);
+            let recorded: Vec<PathBuf> = store
+                .read_roots()
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .map(|(_, p)| p)
+                .collect();
+            let roots = if recorded.is_empty() {
+                vec![root.to_path_buf()]
+            } else {
+                recorded
+            };
+            let summary = index_project(&roots, None).map_err(|e| e.to_string())?;
             let db = db_path(root).map_err(|e| e.to_string())?;
             *graph = RedbStore::open(db).load().map_err(|e| e.to_string())?;
             Ok(mcp_text(json!({ "reindexed": summary })))
@@ -1965,16 +2009,14 @@ fn mcp_call(
             })))
         }
         "review_focus" => {
-            let changed = overlay::diff_lines(root, str_arg("base").as_deref());
+            // the same namespacing the CLI does: a multi-root index stores
+            // tag-prefixed module paths, and an unnamespaced diff matches none of
+            // them — this tool answered "nothing changed" for every multi-root repo
+            let store = RedbStore::open(db_path(root).map_err(|e| e.to_string())?);
+            let tag = root_tag(&store, root).map_err(|e| e.to_string())?;
+            let changed = namespaced(&tag, overlay::diff_lines(root, str_arg("base").as_deref()));
             let r = query::review_focus(graph, &changed, usize_arg("budget", 15));
-            Ok(mcp_text(json!({
-                "focus": r.focus.iter().map(|f| json!({
-                    "symbol": f.node.name, "module": f.node.module_path,
-                    "priority": f.review_priority, "downstream": f.downstream, "reasons": f.reasons,
-                })).collect::<Vec<_>>(),
-                "missing_cochange": r.missing_cochange.iter().map(|n| &n.module_path).collect::<Vec<_>>(),
-                "untested": r.untested.iter().map(|n| &n.name).collect::<Vec<_>>(),
-            })))
+            Ok(mcp_text(review_payload(&r)))
         }
         "neighbors" => {
             let sym = str_arg("symbol").ok_or("symbol required")?;
@@ -2106,21 +2148,7 @@ fn cmd_review(args: &[String]) -> Result<()> {
     warn_if_stale(&store, &changed.keys().map(String::as_str).collect());
 
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "focus": r.focus.iter().map(|f| serde_json::json!({
-                    "symbol": f.node.name, "module": f.node.module_path,
-                    "priority": f.review_priority, "downstream": f.downstream,
-                    "changed_lines": f.changed_lines,
-                    "reasons": f.reasons,
-                })).collect::<Vec<_>>(),
-                "total": r.total,
-                "missing_cochange": r.missing_cochange.iter().map(|n| &n.module_path).collect::<Vec<_>>(),
-                "untested": r.untested.iter().map(|n| &n.name).collect::<Vec<_>>(),
-                "untested_known": r.tests_known,
-            }))?
-        );
+        println!("{}", serde_json::to_string_pretty(&review_payload(&r))?);
     } else {
         let cut = r.total.saturating_sub(r.focus.len());
         let note = if cut > 0 {
@@ -2473,6 +2501,31 @@ mod tests {
         // a looser rule still says which rule fired
         let loose = lookup_note("run", &[&a], store::Match::Substring).expect("loose");
         assert!(loose.contains("substring"), "{loose}");
+    }
+
+    /// The CLI and the MCP tool answer the same question and must not drift: the
+    /// MCP one silently missed every fix the CLI gained until they shared this.
+    #[test]
+    fn the_review_payload_carries_what_a_caller_needs_to_read_it() {
+        let node = named("changed", "a.ts");
+        let r = query::ReviewResult {
+            focus: vec![query::FocusItem {
+                node,
+                review_priority: 1.5,
+                downstream: 2,
+                changed_lines: 7,
+                reasons: vec!["untested".into()],
+            }],
+            total: 9,
+            missing_cochange: Vec::new(),
+            untested: Vec::new(),
+            tests_known: true,
+        };
+        let v = review_payload(&r);
+        assert_eq!(v["total"], 9, "the pre-truncation count survives (#41)");
+        assert_eq!(v["untested_known"], true, "tested vs unknowable (#36)");
+        assert_eq!(v["focus"][0]["changed_lines"], 7);
+        assert_eq!(v["focus"][0]["symbol"], "changed");
     }
 
     /// A renamed function kept answering with a 0.95 next to it, because nothing
