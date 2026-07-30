@@ -13,6 +13,39 @@ the roadmap beforehand. Using the tool finds different bugs than reading it.
 
 ---
 
+## 2026-07-30 — an agent with the raw diff beat ripple at ripple's own job
+
+**Asked:** review the `v0.1.2..v0.2.0` diff (15 files, +542) two ways — `ripple review`,
+and an independent agent given the same diff and no tool — then compare.
+
+**Said:** the two agreed at file granularity (`crates/cli/src/verify.rs` was 6 of
+ripple's 15 rows and 2 of the agent's top 3) and disagreed at symbol granularity, which
+is the granularity `review` sells. The agent's first pick, `reference_file` — the
+release's largest new function — was ripple's 11th. Ripple's first pick, `registry`, was
+one line: `Box::new(gleam::Adapter::new()),`.
+
+**True:** both, in a way that says what ripple is for. `registry` really does have 46
+dependents and the agent could not have known that from the diff. `reference_file` really
+was the code most likely to be wrong, and ripple ranked it low because *every* term it
+scores with — dependents, churn, bug-density, ownership — is backwards-looking, so code
+the diff adds has no history and scores at the floor.
+
+**Implies:** four bugs, all now fixed, and one conclusion.
+
+- 22 of 37 changed symbols were never printed: `--budget 15` truncated silently ([#41](https://github.com/qwexvf/ripple/issues/41)).
+- `untested` was true on all 37 rows, including on the test functions themselves, because nothing in the workspace ever constructed an `EdgeKind::Tests` ([#36](https://github.com/qwexvf/ripple/issues/36)). Now 28 of 41, and a repo where tests can't be seen says so instead of flagging everything.
+- Test functions counted as dependents, so a well-tested symbol ranked riskier than an untested one ([#42](https://github.com/qwexvf/ripple/issues/42)).
+- Ranking rewritten: reach is logarithmic and the diff itself is a term. Same diff: `reference_file` 11 → 2, `start` 12 → 8, `registry` 1 → 6.
+
+The conclusion is the uncomfortable one. On a diff an agent can read whole, ripple's
+ranking is a worse version of what the agent already does. What ripple had that the agent
+could not get — the 46 dependents, and the co-change warning naming three files that
+always move with `registry` and didn't this time — is information from *outside* the
+diff. That is the product, and it only pays when the repository is bigger than the
+context window, or when the answer crosses a service or a repository boundary.
+
+---
+
 ## 2026-07-26 — the differentiator emits nothing on the two repos it was built for
 
 **Asked:** index the two real polyglot repos on this machine and look at the
