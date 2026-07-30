@@ -796,40 +796,6 @@ fn a_cfg_test_module_tests_the_file_it_sits_in() {
     );
 }
 
-/// A `Tests` edge always duplicates the endpoints of a call that already exists,
-/// so structural risk counts no new dependent. That is what makes #36 a bug fix
-/// rather than a ranking change — the ranking work is #42.
-#[test]
-fn test_edges_do_not_move_structural_risk() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/testlink/ts");
-    let indexed = resolve::build_incremental(
-        std::slice::from_ref(&root),
-        &std::collections::HashMap::new(),
-    )
-    .unwrap();
-    let scopes = resolve::TestScopes::of(&indexed.files, &indexed.roots, &lang::registry());
-    let tests = resolve::link_tests(&scopes, &indexed.result.edges);
-    assert!(!tests.is_empty(), "otherwise this proves nothing");
-
-    let mut without = indexed.result.nodes.clone();
-    overlay::score_structure(&mut without, &indexed.result.edges);
-
-    let mut with = indexed.result.nodes.clone();
-    let mut all = indexed.result.edges.clone();
-    all.extend(tests);
-    overlay::score_structure(&mut with, &all);
-
-    for (a, b) in without.iter().zip(with.iter()) {
-        assert_eq!(a.id, b.id);
-        assert_eq!(
-            a.risk.fanout, b.risk.fanout,
-            "{} gained a dependent it already had",
-            a.name
-        );
-        assert_eq!(a.risk.composite, b.risk.composite, "{}", a.name);
-    }
-}
-
 fn xrepo() -> (std::path::PathBuf, std::path::PathBuf) {
     let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/xrepo");
     (base.join("web"), base.join("api"))

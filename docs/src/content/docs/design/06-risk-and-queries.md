@@ -41,7 +41,7 @@ risk(n) =  ( w_churn·churn
   - `churn`, `bug_density`, `ownership` ← `git2` log/blame mining.
   - `bug_density` is a **heuristic**: fraction of touching commits whose message matches fix/revert patterns, refined by issue links where available. Message-based fix detection is noisy (many repos don't follow conventional commits) — treat as a signal, not ground truth.
   - `complexity` ← AST. Approximable language-agnostically (rust-code-analysis, arborist do this over tree-sitter) **but not zero-config**: each grammar names decision nodes differently (`if_statement` vs `if_expression`, …), and a faithful McCabe count must also add short-circuit `&&`/`||`, ternaries, `case`, and `catch`/`except`. Budget a **per-grammar decision-node map** per adapter; "count branch/loop nodes" alone undercounts.
-  - `fanout` ← graph: **static dependents ∪ co-change dependents** (the fusion).
+  - `fanout` ← graph: **static dependents ∪ co-change dependents** (the fusion), minus test callers. Fanout asks "how much breaks if this changes"; a test breaking is how you find out, not damage, and counting it ranked a well-tested symbol above an untested one. A test is whatever has an outgoing `Tests` edge, so the rule stays language-blind.
   - `test_proximity` ← `Tests`/`TestsFile` edges. This is "a test references this symbol," **not line coverage** — do not present it as coverage. Still unpopulated and still absent from `blend`; the `Tests` edges it would read now exist (below).
   - A resolution that **crosses repositories** is multiplied by `CROSS_ROOT` (0.85): an import resolved through a package name is pinned exactly as well as an in-repo one, but the premise underneath it — that these two working trees are one program — is not something the syntax says. A consumer normally resolves a published artifact, so the file on disk is the right symbol at a version nobody checked. Cross-*service* edges are not discounted: there the repo boundary is the designed case and the wire contract is the evidence.
   - `Tests` edges are built by `resolve::link_tests` from calls that leave the test side of a repo, at `0.8 ×` the confidence of the call they rest on — the call is the evidence, "a call from a test exercises this" is the inference on top of it, and fixtures and `support/` helpers are why it isn't 1.0. Every such edge duplicates the endpoints of an existing call, so structural risk counts no new dependent and no ranking moves.
@@ -139,7 +139,15 @@ The one no MCP server offers. **Input:** a PR (base..head), a budget. **Output:*
 }
 ```
 
-`missing_cochange` implements CodeScene's best idea — *the absence of an expected co-change is a bug smell* — as an agent-queryable primitive. `review_priority` = hunk risk × downstream blast weight.
+`missing_cochange` implements CodeScene's best idea — *the absence of an expected co-change is a bug smell* — as an agent-queryable primitive.
+
+`review_priority` = `(1 + risk) × (1 + ln(1 + downstream weight)) × (1 + ln(1 + changed lines) × (½ + ½ · rewritten share))`. Three properties it has to hold at once, learned the hard way:
+
+- **Reach is logarithmic, not linear.** Multiplied raw, a one-line edit to a hub outranked every real change in the diff: on ripple's own `v0.1.2..v0.2.0`, `registry` — a single `Box::new(gleam::Adapter::new()),` — ranked first at 34.4 on 46 dependents, while the release's largest new function ranked 11th.
+- **The change itself is a term.** Every other signal (dependents, churn, bug-density, ownership) looks backwards, so code the diff *adds* has no history and scores at the floor — exactly the code a reviewer opens first.
+- **Size and share both matter.** 60 lines of a 60-line function is a rewrite; 60 lines of a 2000-line file is a patch. Hence the share factor multiplying the log of the count.
+
+These weights are argued, not fitted — the fitting is [#19](https://github.com/qwexvf/ripple/issues/19), and until it lands this ranking is defensible rather than measured.
 
 ## Budget-aware output
 

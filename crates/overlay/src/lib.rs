@@ -514,8 +514,21 @@ fn blend(terms: &[(f32, f32, bool)]) -> f32 {
 ///
 /// Returns how many nodes got a non-zero fanout.
 pub fn score_structure(nodes: &mut [Node], edges: &[Edge]) -> usize {
+    // A test is not a dependent in the sense fanout means. Fanout asks "how much
+    // breaks if this changes"; a test breaking is how you find out, not damage. Left
+    // in, it ranked a well-tested symbol as riskier than an untested one — backwards.
+    // Language-blind: a test is whatever has an outgoing Tests edge (#42).
+    let tests: HashSet<SymbolId> = edges
+        .iter()
+        .filter(|e| e.kind == EdgeKind::Tests)
+        .map(|e| e.src)
+        .collect();
+
     let mut dependents: HashMap<SymbolId, HashSet<SymbolId>> = HashMap::new();
     for e in edges {
+        if tests.contains(&e.src) {
+            continue;
+        }
         dependents.entry(e.dst).or_default().insert(e.src);
     }
     let counts: Vec<f32> = nodes
@@ -630,6 +643,50 @@ mod tests {
 
     fn overlay_score(nodes: &mut [Node], edges: &[Edge]) -> usize {
         score_structure(nodes, edges)
+    }
+
+    /// Fanout answers "how much breaks if this changes". A test breaking is how
+    /// you find out, so counting tests as dependents ranked a well-tested symbol
+    /// above an untested one — backwards (#42).
+    #[test]
+    fn a_test_caller_is_not_a_dependent() {
+        let mut nodes = vec![
+            module_node("tested.ts"),
+            module_node("untested.ts"),
+            module_node("caller.ts"),
+            module_node("spec.ts"),
+        ];
+        let (tested, untested) = (nodes[0].id, nodes[1].id);
+        let (caller, spec) = (nodes[2].id, nodes[3].id);
+        let e = |src, dst, kind| Edge {
+            src,
+            dst,
+            kind,
+            confidence: 1.0,
+            site: Span {
+                start_line: 1,
+                start_col: 1,
+                end_line: 1,
+                end_col: 1,
+            },
+            source: EdgeSource::Extracted,
+        };
+        // each symbol has exactly one caller; only one of the callers is a test
+        let edges = vec![
+            e(caller, untested, EdgeKind::Calls),
+            e(spec, tested, EdgeKind::Calls),
+            e(spec, tested, EdgeKind::Tests),
+        ];
+
+        let scored = overlay_score(&mut nodes, &edges);
+        assert_eq!(scored, 1, "only the production caller counts");
+
+        let of = |id: SymbolId| nodes.iter().find(|n| n.id == id).expect("node").risk;
+        assert_eq!(of(tested).fanout, 0.0, "its only caller is its test");
+        assert!(
+            of(untested).fanout > of(tested).fanout,
+            "a real dependent still outranks a test one"
+        );
     }
 
     #[test]

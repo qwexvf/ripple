@@ -269,6 +269,8 @@ pub struct FocusItem {
     pub node: Node,
     pub review_priority: f32,
     pub downstream: usize, // impacted-node count
+    /// lines of this symbol the diff touched
+    pub changed_lines: u32,
     pub reasons: Vec<String>,
 }
 
@@ -288,9 +290,42 @@ pub struct ReviewResult {
     pub tests_known: bool,
 }
 
+/// How many of a symbol's lines the diff touched.
+fn changed_within(span: &ir::Span, ranges: &[(u32, u32)]) -> u32 {
+    ranges
+        .iter()
+        .map(|&(rs, re)| {
+            let lo = rs.max(span.start_line);
+            let hi = re.min(span.end_line);
+            hi.saturating_sub(lo).saturating_add(u32::from(hi >= lo))
+        })
+        .sum()
+}
+
+/// What share of the symbol this diff rewrote, 0..1.
+///
+/// Every other term in the ranking looks backwards — dependents, churn,
+/// bug-density — so a function *added* by the diff under review scores at the
+/// floor no matter how much logic it carries. On ripple's own v0.1.2..v0.2.0 that
+/// put the largest new function at rank 11 of 37, under a one-line registry entry
+/// with a big blast radius (#42). This is the one term that reads the change
+/// itself: rewriting a whole function is worth twice a one-line touch of it.
+fn rewrite_share(sym: &Node, ranges: &[(u32, u32)]) -> f32 {
+    let lines = sym
+        .span
+        .end_line
+        .saturating_sub(sym.span.start_line)
+        .saturating_add(1);
+    if lines == 0 {
+        return 0.0;
+    }
+    (changed_within(&sym.span, ranges) as f32 / lines as f32).min(1.0)
+}
+
 /// Rank the symbols touched by a diff (`changed`: file → changed line ranges,
-/// keyed by module_path) for review, by risk × downstream blast radius. Also
-/// surfaces missing-co-change and untested changes. See docs/06-risk-and-queries.md.
+/// keyed by module_path) for review, by risk × downstream blast radius × how much
+/// of the symbol the diff rewrote. Also surfaces missing-co-change and untested
+/// changes. See docs/06-risk-and-queries.md.
 pub fn review_focus(
     graph: &InMemoryGraph,
     changed: &HashMap<String, Vec<(u32, u32)>>,
@@ -316,7 +351,12 @@ pub fn review_focus(
     for sym in &changed_syms {
         let downstream = impact(graph, &[sym.id], 200).hits;
         let down_weight: f32 = downstream.iter().map(|h| h.weight).sum();
-        let review_priority = (1.0 + sym.risk.composite) * (1.0 + down_weight);
+        let empty = Vec::new();
+        let ranges = changed.get(&sym.module_path).unwrap_or(&empty);
+        let changed_lines = changed_within(&sym.span, ranges);
+        let review_priority = (1.0 + sym.risk.composite)
+            * (1.0 + down_weight.ln_1p())
+            * (1.0 + (changed_lines as f32).ln_1p() * (0.5 + 0.5 * rewrite_share(sym, ranges)));
 
         let mut reasons = Vec::new();
         if sym.risk.bug_density > 0.6 {
@@ -328,6 +368,9 @@ pub fn review_focus(
         if !downstream.is_empty() {
             reasons.push(format!("{} downstream", downstream.len()));
         }
+        if changed_lines > 0 {
+            reasons.push(format!("{changed_lines} lines changed"));
+        }
         if tests_known && !has_test_edge(graph, sym.id) {
             reasons.push("untested".into());
             untested.push(sym.clone());
@@ -337,6 +380,7 @@ pub fn review_focus(
             node: sym.clone(),
             review_priority,
             downstream: downstream.len(),
+            changed_lines,
             reasons,
         });
     }
@@ -534,6 +578,29 @@ mod tests {
         let cut = impact(&graph, &[target.id], 1);
         assert_eq!(cut.hits.len(), 1);
         assert_eq!(cut.reached, 3, "the budget must not hide what was reached");
+    }
+
+    /// Every other term looks backwards, so a function the diff *adds* scored at
+    /// the floor: on ripple's own v0.1.2..v0.2.0 the largest new function ranked
+    /// 11 of 37, under a one-line registry entry (#42).
+    #[test]
+    fn a_rewritten_symbol_outranks_a_one_line_touch_of_its_neighbour() {
+        let mut big = node("a.ts", "rewritten");
+        big.span.end_line = 60;
+        let mut small = node("a.ts", "grazed");
+        small.span.start_line = 100;
+        small.span.end_line = 160;
+
+        let graph = InMemoryGraph::from_parts(vec![big.clone(), small.clone()], Vec::new());
+        // the whole of one, a single line of the other
+        let changed = HashMap::from([("a.ts".to_owned(), vec![(1, 60), (100, 100)])]);
+
+        let r = review_focus(&graph, &changed, 10);
+        let names: Vec<&str> = r.focus.iter().map(|f| f.node.name.as_str()).collect();
+        assert_eq!(names, vec!["rewritten", "grazed"]);
+
+        let lines: Vec<u32> = r.focus.iter().map(|f| f.changed_lines).collect();
+        assert_eq!(lines, vec![60, 1], "and the count is reported, not implied");
     }
 
     /// A truncated focus list that reports its own length reads as "the diff

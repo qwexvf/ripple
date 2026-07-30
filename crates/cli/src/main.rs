@@ -2112,6 +2112,7 @@ fn cmd_review(args: &[String]) -> Result<()> {
                 "focus": r.focus.iter().map(|f| serde_json::json!({
                     "symbol": f.node.name, "module": f.node.module_path,
                     "priority": f.review_priority, "downstream": f.downstream,
+                    "changed_lines": f.changed_lines,
                     "reasons": f.reasons,
                 })).collect::<Vec<_>>(),
                 "total": r.total,
