@@ -124,6 +124,11 @@ impl LanguageAdapter for Adapter {
         }
     }
 
+    fn is_test_path(&self, rel: &str) -> bool {
+        let file = rel.rsplit('/').next().unwrap_or(rel);
+        file.contains(".test.") || file.contains(".spec.") || rel.contains("__tests__/")
+    }
+
     fn tags_query(&self) -> &'static str {
         include_str!("queries/tags.scm")
     }

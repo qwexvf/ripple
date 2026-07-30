@@ -36,6 +36,13 @@ impl LanguageAdapter for Adapter {
         &["*.rs"]
     }
 
+    /// Integration tests only. Rust's unit tests live in a `#[cfg(test)] mod tests`
+    /// inside the file under test, which no path can see — `tags.scm` marks that
+    /// scope with `@scope.test`.
+    fn is_test_path(&self, rel: &str) -> bool {
+        rel.starts_with("tests/") || rel.contains("/tests/")
+    }
+
     fn tags_query(&self) -> &'static str {
         include_str!("queries/tags.scm")
     }

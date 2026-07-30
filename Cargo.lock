@@ -553,6 +553,7 @@ dependencies = [
  "blake3",
  "ir",
  "lang",
+ "overlay",
  "parse",
  "rayon",
  "serde_json",

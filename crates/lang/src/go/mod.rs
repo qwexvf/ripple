@@ -36,6 +36,10 @@ impl LanguageAdapter for Adapter {
         &["*.go"]
     }
 
+    fn is_test_path(&self, rel: &str) -> bool {
+        rel.ends_with("_test.go")
+    }
+
     fn tags_query(&self) -> &'static str {
         include_str!("queries/tags.scm")
     }

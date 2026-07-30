@@ -16,3 +16,5 @@ rayon = { workspace = true }
 
 [dev-dependencies]
 ir = { workspace = true }
+# the Tests-edge tests assert the ranking does not move, which needs the risk pass
+overlay = { workspace = true }

@@ -49,6 +49,14 @@ The `parse` layer reads the capture prefix (`def.function` → `NodeKind::Functi
 | `import` (in `imports.scm`) | `Imports` edge (resolved via `resolve_import`) |
 | `ref.call` / `ref.use` (in `refs.scm`) | `Calls` / `References` edge (resolved via scoping) |
 | `@name` | the symbol name within a `@def.*` |
+| `scope.test` (in `tags.scm`) | a span whose definitions are test-side, for languages whose tests live inside the file they test |
+
+Test convention is the other piece of language knowledge here, and it comes in two
+shapes because one doesn't cover the other. By path — `*.test.ts`, `*_test.go`,
+`test/**` — it is `LanguageAdapter::is_test_path`, a string predicate. Inside the
+file — Rust's `#[cfg(test)] mod tests` — no path can see it, so `tags.scm` marks the
+span with `@scope.test`. Either way `resolve::link_tests` turns "a call leaves the
+test side" into a `Tests` edge without knowing which language produced it.
 
 Adding a Tier-0 language ≈ writing this one file. No Rust beyond the 4 required trait methods.
 

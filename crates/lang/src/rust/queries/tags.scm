@@ -12,3 +12,12 @@
 ; module-level bindings, not locals
 (const_item name: (identifier) @name) @def.variable
 (static_item name: (identifier) @name) @def.variable
+
+; a Rust unit test sits in the file it tests, so only the attribute distinguishes
+; it. Everything defined inside this span is test-side (see `is_test_path`).
+((attribute_item
+   (attribute (identifier) @_cfg arguments: (token_tree) @_args))
+ .
+ (mod_item body: (declaration_list)) @scope.test
+ (#eq? @_cfg "cfg")
+ (#eq? @_args "(test)"))

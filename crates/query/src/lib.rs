@@ -120,17 +120,14 @@ pub fn impact(graph: &InMemoryGraph, seeds: &[SymbolId], budget: usize) -> Impac
     Impact { hits, reached }
 }
 
-/// True if any impacted hit lacks a test edge (used by review to flag risk).
-pub fn untested<'a>(graph: &InMemoryGraph, hits: &'a [ImpactHit]) -> Vec<&'a ImpactHit> {
-    hits.iter()
-        .filter(|h| {
-            !graph
-                .in_edges(h.node.id)
-                .iter()
-                .chain(graph.out_edges(h.node.id))
-                .any(|e: &Edge| e.kind == EdgeKind::Tests)
-        })
-        .collect()
+/// Does anything test this symbol? Either direction: which way a `Tests` edge
+/// points is the linker's convention, not a fact about the symbol.
+fn has_test_edge(graph: &InMemoryGraph, id: SymbolId) -> bool {
+    graph
+        .in_edges(id)
+        .iter()
+        .chain(graph.out_edges(id))
+        .any(|e: &Edge| e.kind == EdgeKind::Tests)
 }
 
 /// The set of module paths reachable from `seeds` within `depth` over the given
@@ -285,6 +282,10 @@ pub struct ReviewResult {
     pub missing_cochange: Vec<Node>,
     /// changed symbols with no test edge
     pub untested: Vec<Node>,
+    /// whether this graph knows about tests at all. False means `untested` is
+    /// empty because nothing could be determined, not because everything is
+    /// covered — the two read identically otherwise (#36).
+    pub tests_known: bool,
 }
 
 /// Rank the symbols touched by a diff (`changed`: file → changed line ranges,
@@ -306,6 +307,10 @@ pub fn review_focus(
         }
     }
 
+    // a graph with no Tests edge anywhere cannot tell tested from untested, and
+    // flagging every row is the same as flagging none (#36)
+    let tests_known = graph.edges().any(|e| e.kind == EdgeKind::Tests);
+
     let mut focus = Vec::new();
     let mut untested = Vec::new();
     for sym in &changed_syms {
@@ -323,12 +328,7 @@ pub fn review_focus(
         if !downstream.is_empty() {
             reasons.push(format!("{} downstream", downstream.len()));
         }
-        let has_test = graph
-            .in_edges(sym.id)
-            .iter()
-            .chain(graph.out_edges(sym.id))
-            .any(|e| e.kind == EdgeKind::Tests);
-        if !has_test {
+        if tests_known && !has_test_edge(graph, sym.id) {
             reasons.push("untested".into());
             untested.push(sym.clone());
         }
@@ -373,6 +373,7 @@ pub fn review_focus(
         total,
         missing_cochange: missing,
         untested,
+        tests_known,
     }
 }
 

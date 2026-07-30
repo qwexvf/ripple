@@ -176,6 +176,13 @@ fn index_project(roots: &[PathBuf], lsp_calls: Option<std::time::Duration>) -> R
     let file_granular = cross.file_granular;
     edges.append(&mut cross.edges);
 
+    // tests last: an Elixir call edge only exists after the cross-service pass, and
+    // a test that calls nothing ripple resolved is a test ripple can't see (#36)
+    let scopes = resolve::TestScopes::of(&indexed.files, &indexed.roots, &lang::registry());
+    let mut test_edges = resolve::link_tests(&scopes, &edges);
+    let tests = test_edges.len();
+    edges.append(&mut test_edges);
+
     // structural risk needs every edge, including the cross-service ones
     let with_dependents = overlay::score_structure(&mut nodes, &edges);
     // several call sites between the same pair are several edges. Counted rather than
@@ -195,16 +202,16 @@ fn index_project(roots: &[PathBuf], lsp_calls: Option<std::time::Duration>) -> R
 
     let edge_count = edges.len();
     let calls_report = match lsp_calls {
-        Some(budget) => Some(lsp_calls_pass(&mut store, &nodes, edges, budget)?),
+        Some(budget) => Some(lsp_calls_pass(&mut store, &nodes, edges, budget, &scopes)?),
         None => None,
     };
 
     let s = indexed.stats;
     let mut summary = format!(
-        "indexed {} files across {} root(s) ({} added, {} changed, {} unchanged, {} removed) → {} nodes, {} edges ({} co-change, {} graphql, {} db, {} imported, {} file-granular, {} repeated, {} with dependents) ({})",
+        "indexed {} files across {} root(s) ({} added, {} changed, {} unchanged, {} removed) → {} nodes, {} edges ({} co-change, {} graphql, {} db, {} imported, {} tests, {} file-granular, {} repeated, {} with dependents) ({})",
         indexed.result.files_indexed, indexed.roots.len(),
         s.added, s.changed, s.unchanged, s.removed,
-        nodes.len(), edge_count, cochange_applied, graphql, db, imported, file_granular, repeated, with_dependents,
+        nodes.len(), edge_count, cochange_applied, graphql, db, imported, tests, file_granular, repeated, with_dependents,
         db_path(&roots[0]).display()
     );
     if let Some(report) = calls_report {
@@ -229,6 +236,7 @@ fn lsp_calls_pass(
     nodes: &[ir::Node],
     edges: Vec<ir::Edge>,
     budget: std::time::Duration,
+    scopes: &resolve::TestScopes,
 ) -> Result<String> {
     let graph = InMemoryGraph::from_parts(nodes.to_vec(), edges);
     let focus = verify::server_sourced_files(&graph);
@@ -263,8 +271,15 @@ fn lsp_calls_pass(
             .context("persisting verified verdicts")?;
     }
     if outcome.changed() {
+        // Go and Gleam have no refs query, so their call edges exist only here —
+        // without a second pass every symbol in those repos stays "untested" (#36).
+        // Re-derive rather than add: the pass carries the first round's Tests edges.
+        let mut edges = outcome.edges;
+        edges.retain(|e| e.kind != EdgeKind::Tests);
+        let fresh = resolve::link_tests(scopes, &edges);
+        edges.extend(fresh);
         store
-            .write(nodes, &outcome.edges)
+            .write(nodes, &edges)
             .context("persisting server-sourced call edges")?;
     }
     Ok(report)
@@ -1895,6 +1910,7 @@ fn cmd_review(args: &[String]) -> Result<()> {
                 "total": r.total,
                 "missing_cochange": r.missing_cochange.iter().map(|n| &n.module_path).collect::<Vec<_>>(),
                 "untested": r.untested.iter().map(|n| &n.name).collect::<Vec<_>>(),
+                "untested_known": r.tests_known,
             }))?
         );
     } else {

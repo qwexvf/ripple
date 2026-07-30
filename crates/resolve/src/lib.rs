@@ -17,9 +17,11 @@ use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 mod crossservice;
+mod testlink;
 mod workspace;
 
 pub use crossservice::{link_cross_service, CrossEdges};
+pub use testlink::{link_tests, TestScopes};
 
 /// Directories that hold code nobody is going to change in this repo:
 /// dependencies, build output, and tool caches. Indexing them is not just waste —

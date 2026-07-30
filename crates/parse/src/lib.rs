@@ -110,6 +110,11 @@ pub struct FileExtract {
     pub reexports: Vec<ReexportRec>,
     pub refs: Vec<RefRec>,
     pub bindings: Vec<BindRec>,
+    /// Spans a language marked test-only from inside the file (Rust's
+    /// `#[cfg(test)] mod tests`). A definition inside one is test-side even
+    /// though its path says nothing. No `serde(default)`, same reason as
+    /// `reexports`: an older cache row must be a miss, not a silent "no tests".
+    pub test_scopes: Vec<Span>,
     /// Cross-service facts (Absinthe fields, GraphQL ops, TS Document usage, …),
     /// extracted from the same parse so files aren't parsed twice.
     pub cross: lang::cross::CrossFacts,
@@ -167,7 +172,7 @@ pub fn extract_file(
         .context("tree-sitter returned no tree")?;
     let src = source.as_bytes();
 
-    let defs = extract_defs(&tree, &queries.tags, src, module_path, adapter)?;
+    let tags = extract_defs(&tree, &queries.tags, src, module_path, adapter)?;
     let imports = queries
         .imports
         .as_ref()
@@ -195,11 +200,12 @@ pub fn extract_file(
     let cross = adapter.extract_cross(tree.root_node(), src);
 
     Ok(FileExtract {
-        defs,
+        defs: tags.defs,
         imports,
         reexports,
         refs,
         bindings,
+        test_scopes: tags.test_scopes,
         cross,
     })
 }
@@ -210,18 +216,26 @@ pub fn extract(source: &str, adapter: &dyn LanguageAdapter) -> Result<Vec<Node>>
     Ok(extract_file(source, adapter, "<file>", &queries)?.defs)
 }
 
+/// What one pass of the tags query yields: the definitions, and the spans a
+/// language marked as test-only (`@scope.test`).
+struct Tags {
+    defs: Vec<Node>,
+    test_scopes: Vec<Span>,
+}
+
 fn extract_defs(
     tree: &Tree,
     query: &Query,
     src: &[u8],
     module_path: &str,
     adapter: &dyn LanguageAdapter,
-) -> Result<Vec<Node>> {
+) -> Result<Tags> {
     let names = query.capture_names();
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(query, tree.root_node(), src);
 
     let mut nodes = Vec::new();
+    let mut test_scopes = Vec::new();
     while let Some(m) = matches.next() {
         if !predicates_hold(query, m, src) {
             continue;
@@ -233,6 +247,8 @@ fn extract_defs(
             let cap_name = names[cap.index as usize];
             if cap_name == "name" {
                 name = cap.node.utf8_text(src).ok().map(str::to_owned);
+            } else if cap_name == "scope.test" {
+                test_scopes.push(span_of(cap.node));
             } else if let Some(k) = NodeKind::from_capture(cap_name) {
                 kind = Some(k);
                 def_node = Some(cap.node);
@@ -254,7 +270,10 @@ fn extract_defs(
             });
         }
     }
-    Ok(nodes)
+    Ok(Tags {
+        defs: nodes,
+        test_scopes,
+    })
 }
 
 /// Re-export statements, from the same query as imports (`reexport.*` captures).
@@ -671,5 +690,40 @@ mod tests {
             .bindings
             .iter()
             .any(|b| b.name == "c" && b.type_name == "Bar"));
+    }
+
+    /// Rust unit tests sit in the file they test, so no path can see them. The
+    /// `@scope.test` capture is the only thing standing between #36's fix and
+    /// "every Rust symbol is untested" — and an over-capture would be worse than
+    /// no capture, so a plain `mod` must not match.
+    #[test]
+    fn a_cfg_test_module_is_a_test_scope_and_a_plain_module_is_not() {
+        let adapter = lang::rust::Adapter::new();
+        let queries = Queries::compile(&adapter).unwrap();
+        let fx = extract_file(
+            "pub fn real() {}\n\
+             mod helpers {\n\
+                 pub fn shared() {}\n\
+             }\n\
+             #[cfg(test)]\n\
+             mod tests {\n\
+                 #[test]\n\
+                 fn covers_real() {}\n\
+             }\n",
+            &adapter,
+            "lib.rs",
+            &queries,
+        )
+        .unwrap();
+
+        assert_eq!(fx.test_scopes.len(), 1, "only the cfg(test) module");
+        let scope = &fx.test_scopes[0];
+        let inside = |name: &str| {
+            let d = fx.defs.iter().find(|d| d.name == name).expect(name);
+            d.span.start_line >= scope.start_line && d.span.end_line <= scope.end_line
+        };
+        assert!(inside("covers_real"), "the test fn is in the scope");
+        assert!(!inside("real"), "the code under test is not");
+        assert!(!inside("shared"), "an ordinary module is not");
     }
 }

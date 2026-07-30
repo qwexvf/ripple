@@ -36,6 +36,16 @@ pub trait LanguageAdapter: Send + Sync {
     /// tags.scm: captures (`@def.function`, `@name`) → IR nodes.
     fn tags_query(&self) -> &'static str;
 
+    /// Does this repo-relative path hold tests? Convention, so it is language
+    /// knowledge (`*.test.ts`, `*_test.go`, `test/…`). Default: no.
+    ///
+    /// A language whose tests live *inside* the file under test (Rust's
+    /// `#[cfg(test)] mod tests`) can't answer by path — it marks the scope with a
+    /// `@scope.test` capture in its tags query instead.
+    fn is_test_path(&self, _rel_path: &str) -> bool {
+        false
+    }
+
     /// Is a definition exported/public? Language-specific (TS `export`, Elixir
     /// `def` vs `defp`, Go capitalization, …). Default: not exported.
     fn is_exported(&self, _def: tree_sitter::Node, _src: &[u8]) -> bool {

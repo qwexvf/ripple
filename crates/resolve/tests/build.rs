@@ -728,3 +728,104 @@ fn an_operation_named_lowercase_still_joins() {
         "the page reaches the resolver despite the casing difference"
     );
 }
+
+/// The hono case from #36: a `.test.ts` file imports and calls the function it
+/// tests. Nothing in the workspace ever built a `Tests` edge before, so `review`
+/// called every symbol in every repo untested.
+#[test]
+fn a_test_file_tests_what_it_calls() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/testlink/ts");
+    let indexed = resolve::build_incremental(
+        std::slice::from_ref(&root),
+        &std::collections::HashMap::new(),
+    )
+    .unwrap();
+    let scopes = resolve::TestScopes::of(&indexed.files, &indexed.roots, &lang::registry());
+    let tests = resolve::link_tests(&scopes, &indexed.result.edges);
+
+    let get_path = SymbolId::of("src/util.ts", "getPath");
+    let runs = SymbolId::of("src/util.test.ts", "runs");
+    let fixture_fn = SymbolId::of("src/util.test.ts", "fixture");
+
+    assert!(
+        tests
+            .iter()
+            .any(|e| e.src == runs && e.dst == get_path && e.kind == EdgeKind::Tests),
+        "the test reaches the function it calls: {:?}",
+        tests.iter().map(|e| (e.src, e.dst)).collect::<Vec<_>>()
+    );
+    assert!(
+        !tests.iter().any(|e| e.dst == fixture_fn),
+        "a helper the test calls inside itself is not a tested symbol"
+    );
+    assert!(
+        !tests.iter().any(|e| e.src == get_path),
+        "nothing flows out of the file under test"
+    );
+    // priced off the call it rests on, never at 1.0
+    let edge = tests.iter().find(|e| e.dst == get_path).unwrap();
+    assert!(
+        edge.confidence > 0.0 && edge.confidence < 0.8,
+        "a Tests edge is an inference on top of a call: {}",
+        edge.confidence
+    );
+}
+
+/// Rust's unit tests live in the file under test, so no path convention can see
+/// them — the `@scope.test` capture is the only signal, and this is the case that
+/// proves the two mechanisms are both needed.
+#[test]
+fn a_cfg_test_module_tests_the_file_it_sits_in() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/testlink/rs");
+    let indexed = resolve::build_incremental(
+        std::slice::from_ref(&root),
+        &std::collections::HashMap::new(),
+    )
+    .unwrap();
+    let scopes = resolve::TestScopes::of(&indexed.files, &indexed.roots, &lang::registry());
+    let tests = resolve::link_tests(&scopes, &indexed.result.edges);
+
+    let real = SymbolId::of("lib.rs", "real");
+    let covers = SymbolId::of("lib.rs", "covers_real");
+    assert!(
+        tests
+            .iter()
+            .any(|e| e.src == covers && e.dst == real && e.kind == EdgeKind::Tests),
+        "a test and the code it tests share a file: {:?}",
+        tests.iter().map(|e| (e.src, e.dst)).collect::<Vec<_>>()
+    );
+}
+
+/// A `Tests` edge always duplicates the endpoints of a call that already exists,
+/// so structural risk counts no new dependent. That is what makes #36 a bug fix
+/// rather than a ranking change — the ranking work is #42.
+#[test]
+fn test_edges_do_not_move_structural_risk() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/testlink/ts");
+    let indexed = resolve::build_incremental(
+        std::slice::from_ref(&root),
+        &std::collections::HashMap::new(),
+    )
+    .unwrap();
+    let scopes = resolve::TestScopes::of(&indexed.files, &indexed.roots, &lang::registry());
+    let tests = resolve::link_tests(&scopes, &indexed.result.edges);
+    assert!(!tests.is_empty(), "otherwise this proves nothing");
+
+    let mut without = indexed.result.nodes.clone();
+    overlay::score_structure(&mut without, &indexed.result.edges);
+
+    let mut with = indexed.result.nodes.clone();
+    let mut all = indexed.result.edges.clone();
+    all.extend(tests);
+    overlay::score_structure(&mut with, &all);
+
+    for (a, b) in without.iter().zip(with.iter()) {
+        assert_eq!(a.id, b.id);
+        assert_eq!(
+            a.risk.fanout, b.risk.fanout,
+            "{} gained a dependent it already had",
+            a.name
+        );
+        assert_eq!(a.risk.composite, b.risk.composite, "{}", a.name);
+    }
+}

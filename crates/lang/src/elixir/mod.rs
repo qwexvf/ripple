@@ -34,6 +34,10 @@ impl LanguageAdapter for Adapter {
         &["*.ex", "*.exs"]
     }
 
+    fn is_test_path(&self, rel: &str) -> bool {
+        rel.ends_with("_test.exs") || rel.starts_with("test/") || rel.contains("/test/")
+    }
+
     fn tags_query(&self) -> &'static str {
         include_str!("queries/tags.scm")
     }
