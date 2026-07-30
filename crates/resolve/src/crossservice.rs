@@ -33,8 +33,13 @@ pub struct CrossEdges {
 /// Link cross-service edges from the per-file facts already on each `CachedFile`.
 pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
     // ── maps derived from the built graph ──
-    let mut fqn_to_module: HashMap<&str, &str> = HashMap::new();
-    let mut fqn_to_class: HashMap<&str, SymbolId> = HashMap::new();
+    // Several files can define one FQN once more than one repository is indexed —
+    // an umbrella split across repos, a vendored copy. Keeping one was last-write-
+    // wins, which silently attached every edge through that name to whichever file
+    // the map happened to see last. They are candidates now, and the confidence is
+    // split across them like any other ambiguity (#44).
+    let mut fqn_to_module: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut fqn_to_class: HashMap<&str, Vec<SymbolId>> = HashMap::new();
     let mut fqns_in_file: HashMap<&str, Vec<&str>> = HashMap::new();
     let mut fn_by_loc: HashMap<(&str, &str), SymbolId> = HashMap::new();
     // (start, end, id, is the container a function or the whole module body?)
@@ -42,8 +47,14 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
     for n in nodes {
         match n.kind {
             NodeKind::Class => {
-                fqn_to_module.insert(n.qualified_name.as_str(), n.module_path.as_str());
-                fqn_to_class.insert(n.qualified_name.as_str(), n.id);
+                fqn_to_module
+                    .entry(n.qualified_name.as_str())
+                    .or_default()
+                    .push(n.module_path.as_str());
+                fqn_to_class
+                    .entry(n.qualified_name.as_str())
+                    .or_default()
+                    .push(n.id);
                 fqns_in_file
                     .entry(n.module_path.as_str())
                     .or_default()
@@ -158,17 +169,18 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
                 }
             }
             // `field.module` is already resolved (alias→FQN) at extraction time
-            let Some(&file) = fqn_to_module.get(field.module.as_str()) else {
+            let Some(files) = fqn_to_module.get(field.module.as_str()) else {
                 continue;
             };
-            let Some(&id) = fn_by_loc.get(&(file, field.func.as_str())) else {
-                continue;
-            };
+            let ids: Vec<SymbolId> = files
+                .iter()
+                .filter_map(|file| fn_by_loc.get(&(*file, field.func.as_str())).copied())
+                .collect();
             for scope in scopes {
                 producer
                     .entry((scope, field.field.as_str()))
                     .or_default()
-                    .push(id);
+                    .extend(ids.iter().copied());
             }
         }
         // context-module fields: no function is named, so the module node is the target
@@ -182,15 +194,14 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
                     field_type.insert((scope, field.field.as_str()), format!("object:{returns}"));
                 }
             }
-            let Some(&file) = fqn_to_module.get(field.module.as_str()) else {
+            let Some(files) = fqn_to_module.get(field.module.as_str()) else {
                 continue;
             };
-            let id = SymbolId::module(file);
             for scope in scopes {
                 context_producer
                     .entry((scope, field.field.as_str()))
                     .or_default()
-                    .push(id);
+                    .extend(files.iter().map(|f| SymbolId::module(f)));
             }
         }
     }
@@ -334,6 +345,7 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
                 .imports
                 .iter()
                 .filter_map(|fqn| fqn_to_module.get(fqn.as_str()))
+                .flatten()
                 .filter_map(|file| fn_by_loc.get(&(*file, r.name.as_str())).copied())
                 .collect();
             targets.sort_unstable();
@@ -367,19 +379,19 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
         let spans = fn_spans.get(f.module_path.as_str()).unwrap_or(&empty);
 
         for (fqn, func, line) in &ex.remote_calls {
-            let Some(&file) = fqn_to_module.get(fqn.as_str()) else {
+            let Some(files) = fqn_to_module.get(fqn.as_str()) else {
                 continue;
             };
+            let mut targets: Vec<SymbolId> = files
+                .iter()
+                .filter_map(|file| fn_by_loc.get(&(*file, func.as_str())).copied())
+                .collect();
+            targets.sort_unstable();
+            targets.dedup();
             let (caller, grain) = caller_at(spans, &f.module_path, *line);
-            if let Some(&target) = fn_by_loc.get(&(file, func.as_str())) {
-                if emit(
-                    &mut edges,
-                    caller,
-                    target,
-                    EdgeKind::Calls,
-                    CONF_ELIXIR_CALL,
-                    *line,
-                ) {
+            let conf = CONF_ELIXIR_CALL / targets.len().max(1) as f32;
+            for target in targets {
+                if emit(&mut edges, caller, target, EdgeKind::Calls, conf, *line) {
                     elixir_calls += 1;
                     file_granular += usize::from(grain == Granularity::File);
                 }
@@ -389,20 +401,23 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
             if !schema_fqns.contains(fqn.as_str()) {
                 continue;
             }
-            let Some(&target) = fqn_to_class.get(fqn.as_str()) else {
+            let Some(targets) = fqn_to_class.get(fqn.as_str()) else {
                 continue;
             };
             let (caller, grain) = caller_at(spans, &f.module_path, *line);
-            if emit(
-                &mut edges,
-                caller,
-                target,
-                EdgeKind::DbQuery,
-                CONF_DB_QUERY,
-                *line,
-            ) {
-                db += 1;
-                file_granular += usize::from(grain == Granularity::File);
+            let conf_each = CONF_DB_QUERY / targets.len().max(1) as f32;
+            for &target in targets {
+                if emit(
+                    &mut edges,
+                    caller,
+                    target,
+                    EdgeKind::DbQuery,
+                    conf_each,
+                    *line,
+                ) {
+                    db += 1;
+                    file_granular += usize::from(grain == Granularity::File);
+                }
             }
         }
     }

@@ -973,3 +973,36 @@ fn an_import_from_a_whole_test_file_is_also_a_test_edge() {
         "a file that merely contains a #[cfg(test)] mod is not a test file"
     );
 }
+
+/// Two repositories can define the same Elixir module — an umbrella split across
+/// repos, a vendored copy. The FQN map kept one of them, so every edge through
+/// that name silently attached to whichever file was seen last (#44).
+#[test]
+fn a_module_defined_in_two_roots_becomes_candidates_not_a_coin_flip() {
+    let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/xrepo_ex");
+    let roots = vec![base.join("consumer"), base.join("a"), base.join("b")];
+    let indexed = resolve::build_incremental(&roots, &std::collections::HashMap::new()).unwrap();
+    let r = resolve::link_cross_service(&indexed.files, &indexed.result.nodes);
+
+    let show = SymbolId::of("consumer/lib/web.ex", "show");
+    let in_a = SymbolId::of("a/lib/accounts.ex", "fetch");
+    let in_b = SymbolId::of("b/lib/accounts.ex", "fetch");
+
+    let targets: Vec<&ir::Edge> = r
+        .edges
+        .iter()
+        .filter(|e| e.src == show && e.kind == EdgeKind::Calls)
+        .collect();
+    let hit: Vec<SymbolId> = targets.iter().map(|e| e.dst).collect();
+    assert!(
+        hit.contains(&in_a) && hit.contains(&in_b),
+        "both, not one: {hit:?}"
+    );
+    for e in &targets {
+        assert!(
+            e.confidence < 0.5,
+            "two equally plausible targets split the confidence: {}",
+            e.confidence
+        );
+    }
+}

@@ -10,7 +10,7 @@
 //! `EdgeKind::Tests`, so `review` printed `untested` on every row of every repo
 //! (issue #36).
 
-use ir::{Edge, EdgeKind, SymbolId};
+use ir::{Edge, EdgeKind, EdgeSource, SymbolId};
 use lang::LanguageAdapter;
 use parse::CachedFile;
 use std::collections::{BTreeMap, HashSet};
@@ -125,7 +125,11 @@ pub fn link_tests(scopes: &TestScopes, edges: &[Edge]) -> Vec<Edge> {
             kind: EdgeKind::Tests,
             confidence: e.confidence * CONF_TESTS,
             site: e.site,
-            source: e.source,
+            // ripple's own inference, whatever the call underneath came from. A
+            // server verified a *call*; nothing verified "this call is a test", and
+            // verification keys off provenance — an LspVerified stamp here is a
+            // claim the edge did not earn.
+            source: EdgeSource::Extracted,
         };
         by_pair
             .entry((e.src.0, e.dst.0))

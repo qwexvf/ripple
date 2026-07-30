@@ -238,10 +238,26 @@ fn index_project(roots: &[PathBuf], lsp_calls: Option<std::time::Duration>) -> R
             .count()
     };
 
+    // which roots the previous index covered, read before it is overwritten: a
+    // root dropped from the set keeps a pointer to a graph that no longer knows
+    // it, and every query from there fails blaming the wrong thing (#43)
+    let dropped: Vec<PathBuf> = {
+        let now: HashSet<&PathBuf> = indexed.roots.iter().map(|(_, p)| p).collect();
+        store
+            .read_roots()?
+            .into_iter()
+            .map(|(_, p)| p)
+            .filter(|p| !now.contains(p))
+            .collect()
+    };
+
     // one transaction: a crash between these three would leave the graph, the
     // extract cache and the roots describing different indexes
     store.write_index(&nodes, &edges, &indexed.files, &indexed.roots)?;
     write_index_pointers(&roots[0], &indexed.roots)?;
+    for root in &dropped {
+        let _ = std::fs::remove_file(root.join(".ripple").join(INDEX_POINTER));
+    }
 
     let edge_count = edges.len();
     let calls_report = match lsp_calls {
@@ -259,6 +275,17 @@ fn index_project(roots: &[PathBuf], lsp_calls: Option<std::time::Duration>) -> R
         nodes.len(), edge_count, cochange_applied, graphql, db, imported, tests, file_granular, repeated, with_dependents,
         own_db_path(&roots[0]).display()
     );
+    if !dropped.is_empty() {
+        summary.push_str(&format!(
+            "\n⚠ dropped {} root(s) no longer indexed ({}) — their symbols are gone from this graph",
+            dropped.len(),
+            dropped
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
     if let Some(report) = calls_report {
         summary.push('\n');
         summary.push_str(&report);

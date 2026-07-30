@@ -126,7 +126,13 @@ impl LanguageAdapter for Adapter {
 
     fn is_test_path(&self, rel: &str) -> bool {
         let file = rel.rsplit('/').next().unwrap_or(rel);
-        file.contains(".test.") || file.contains(".spec.") || rel.contains("__tests__/")
+        let named = file.contains(".test.") || file.contains(".spec.");
+        // every other adapter honours a directory convention too, and vitest's
+        // default `include` covers `test/**` and `tests/**` with no suffix at all
+        let dir = ["__tests__/", "test/", "tests/", "spec/"]
+            .iter()
+            .any(|d| rel.starts_with(d) || rel.contains(&format!("/{d}")));
+        named || dir
     }
 
     fn tags_query(&self) -> &'static str {
