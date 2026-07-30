@@ -18,8 +18,11 @@ Last measured 2026-07-25 on the 5noobs stack (web + api). A count that moves wit
 an explanation is the cheapest bug signal this project has, so re-measure and diff:
 
 ```
-1153 files → 9179 nodes, 20316 edges
-  (2569 co-change, 825 graphql, 941 db, 134 imported, 1634 file-granular, 4471 with dependents)
+1153 files → 9179 nodes, 21407 edges
+  (2569 co-change, 846 graphql, 941 db, 134 imported, 1070 tests, 1634 file-granular)
+  ↑ re-measured 2026-07-31. +1070 tests (new: EdgeKind::Tests, #36) and +21 graphql
+    (#44: an elixir FQN resolvable in two roots yields candidates, not last-write-wins).
+    every other count byte-identical
   ↑ +4313 edges on 2026-07-25/26. TS side: .tsx uses the TSX grammar, JSX rendering is
     a call, `export { X }` lists count as exports, barrels (`export * from`) are followed,
     aliased/namespace imports resolve. GraphQL side: nested selections descend the type
@@ -95,9 +98,9 @@ cargo run -p ripple-cli -- index <path>...        # graph → <path0>/.ripple/gr
 cargo run -p ripple-cli -- lsp doctor --root <p>  # which language servers are usable here
 ```
 
-Indexes `*.ts` `*.tsx` `*.ex` `*.exs` `*.gql` `*.graphql`. **No Rust adapter yet**, so
-ripple cannot index its own source — dogfood it against an indexed repo (e.g. the
-5noobs stack) until that lands.
+Indexes `*.ts` `*.tsx` `*.ex` `*.exs` `*.rs` `*.go` `*.gleam` `*.gql` `*.graphql`.
+Ripple indexes its own source, so `ripple review <base>` on this repo is the fastest
+dogfood loop; the 5noobs stack is still where the cross-service numbers come from.
 
 Multiple roots become one graph: `index <web> <api>`. The database lives under the
 **first** root.
@@ -111,7 +114,8 @@ review [<base-rev>] [--budget N] [--root P] [--json]    # hunks to look at first
   ...both accept --verify lsp [--verify-budget 2s]      # upgrade calls from a language server
 path <from> <to> [--depth 6] [--limit 3] [--root P] [--json]  # how does A reach B?
 risk <symbol|file> [--root P] [--json]
-eval [--commits N] [--root P]        # static vs co-change recall on N held-out commits
+eval [--commits N] [--skip N] [--weights <spec>] [--root P]   # held-out co-change recall
+eval --risk | --oracle lsp [--sample N] [--granularity function|file]
 ```
 
 - `--in` = callers/importers (what breaks if this changes). `--out` = dependencies.
