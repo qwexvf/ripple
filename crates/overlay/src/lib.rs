@@ -19,15 +19,31 @@ const MIN_SHARED: u32 = 2;
 /// Minimum coupling score to emit a co-change edge.
 const MIN_COUPLING: f32 = 0.3;
 
-// composite risk weights. Public so `eval --risk` can score the blend that actually
+// Composite risk weights. Public so `eval --risk` can score the blend that actually
 // ships rather than a copy of it that drifts.
-pub const W_CHURN: f32 = 0.4;
-pub const W_BUG: f32 = 0.4;
-pub const W_OWN: f32 = 0.2;
-/// Structural dependents. Weighted comparably to churn: a symbol many things
-/// depend on is risky to change even with a calm history — the case the static
-/// graph exists to catch.
-pub const W_FANOUT: f32 = 0.4;
+//
+// Fitted rather than chosen, at last (#19). `eval --risk` on the two corpora with
+// enough held-out fix history to score — this repo, and a two-root Elixir+TS stack —
+// says the file-level git terms do not survive blending:
+//
+//   weights (churn,bug,own,fanout)   5noobs lift@25%   ripple lift@25%
+//   0.4, 0.4, 0.2, 0.4  (was)              0.94×             2.80×
+//   0,   0,   0,   1    (now)              1.95×             2.80×
+//   0.5, 0,   0,   1                       1.30×             3.20×
+//
+// Fanout-only is the only vector that beats the old blend on one corpus without
+// losing on the other. It is not "drop the git signal": `fanout` is the fusion —
+// static dependents ∪ co-change dependents — so history still decides most of it.
+// What it drops is churn/bug-density/ownership as *blend inputs*; the terms are
+// still mined, still reported by `risk`, and still available via `--weights`,
+// because they disagree per repo (churn wins here, ownership wins there) and two
+// corpora cannot settle that.
+pub const W_CHURN: f32 = 0.0;
+pub const W_BUG: f32 = 0.0;
+pub const W_OWN: f32 = 0.0;
+/// Structural dependents ∪ co-change dependents — the one term that ranked
+/// fix-touched files well on every corpus measured.
+pub const W_FANOUT: f32 = 1.0;
 
 #[derive(Default)]
 struct RawMetrics {

@@ -36,7 +36,15 @@ risk(n) =  ( w_churn·churn
 ```
 
 - Each raw term is **normalized to [0,1]** across the repo (percentile rank, robust to outliers) before weighting — so the score is comparable within a repo, not an absolute. **Cost note:** percentile rank needs the whole distribution, so it recomputes on the *commit* trigger (the git overlay's cadence), not per edit; for very large repos maintain approximate quantiles (t-digest) instead of a full re-rank.
-- Weights `w_*` are config with sane defaults; `bug_density` and `churn` carry the most signal (Nagappan/Ball 2005: relative churn **discriminated fault-prone Windows-Server-2003 binaries at ~89% accuracy** — a classification result, not a defect-density regression).
+- Weights `w_*` were **fitted, not chosen** (#19), by `eval --risk` on the two corpora with enough held-out fix history to score — this repo, and a two-root Elixir + TypeScript stack:
+
+  | weights (churn, bug, own, fanout) | Elixir+TS stack | this repo |
+  |---|---|---|
+  | `0.4, 0.4, 0.2, 0.4` (the old guess) | 0.94× | 2.80× |
+  | **`0, 0, 0, 1` (shipped)** | **1.95×** | **2.80×** |
+  | `0.5, 0, 0, 1` | 1.30× | 3.20× |
+
+  Fanout-only is the only vector that beats the old blend on one corpus without losing on the other — the old one was *worse than no ranking at all* (0.94×) on the larger corpus. This is not "drop the git signal": `fanout` is the fusion, static dependents ∪ co-change dependents, so history still decides most of it. What it drops is churn / bug-density / ownership as blend *inputs*. They are still mined, still printed by `risk`, and still reachable through `--weights`, because the two corpora disagree about which of them matters (churn wins on one, ownership on the other) and two corpora cannot settle that. The literature (Nagappan/Ball 2005, relative churn discriminating fault-prone binaries at ~89%) says these terms carry signal; our measurement says our *blend* of them did not.
 - **Signal provenance & honesty:**
   - `churn`, `bug_density`, `ownership` ← `git2` log/blame mining.
   - `bug_density` is a **heuristic**: fraction of touching commits whose message matches fix/revert patterns, refined by issue links where available. Message-based fix detection is noisy (many repos don't follow conventional commits) — treat as a signal, not ground truth.

@@ -122,10 +122,12 @@ eval --risk | --oracle lsp [--sample N] [--granularity function|file]
 - `impact` seeds by name and ranks by confidence-weighted diffusion; `neighbors` is
   a raw traversal. Use `impact` to decide, `neighbors` to understand.
 - `risk` fuses churn / bug-density / ownership from git with structural fan-out.
-  `eval --risk` measures whether it ranks the files a held-out fix later touched. Latest:
-  ownership 2.09× / fanout 1.95× / churn 1.22× / bug_density 0.79× / **composite 0.94×**.
-  The blend is worse than three of its four inputs — its heaviest weights sit on its
-  weakest terms (#19). Read `risk`'s composite ordering as unreliable for now.
+  `eval --risk` measures whether it ranks the files a held-out fix later touched. The
+  weights were fitted on 2026-07-31 (#19): churn/bug/ownership went to 0 and fanout to
+  1, which is the only vector that beat the old blend on one corpus without losing on
+  the other (5noobs 0.94× → **1.95×**, ripple 2.80× unchanged). The single terms still
+  disagree per repo — ownership 2.09× on 5noobs, churn 3.20× here — so per-repo tuning
+  via `--weights` is still worth doing before trusting a composite ordering.
 - `path` enumerates routes A→B along dependency direction, shortest first, and reports
   the product of the edge confidences. Co-change edges are excluded — a companion is
   not a route. This is the front-to-DB chain in one command.
