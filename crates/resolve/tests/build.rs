@@ -829,3 +829,145 @@ fn test_edges_do_not_move_structural_risk() {
         assert_eq!(a.risk.composite, b.risk.composite, "{}", a.name);
     }
 }
+
+fn xrepo() -> (std::path::PathBuf, std::path::PathBuf) {
+    let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/xrepo");
+    (base.join("web"), base.join("api"))
+}
+
+/// The point of indexing two repositories at once: the frontend's
+/// `import { send } from "@org/api-client"` lands on the backend's source, because
+/// one repo declares that package name and the other consumes it.
+#[test]
+fn a_workspace_package_import_crosses_roots() {
+    let (web, api) = xrepo();
+    let r = resolve::build_incremental(&[web, api], &std::collections::HashMap::new()).unwrap();
+
+    let main = SymbolId::module("web/src/main.ts");
+    let run = SymbolId::of("web/src/main.ts", "run");
+    let send = SymbolId::of("api/src/client.ts", "send");
+
+    // through the barrel: the package resolves to api/src/index.ts, which only
+    // re-exports ./client
+    let import = r
+        .result
+        .edges
+        .iter()
+        .find(|e| e.src == main && e.dst == send && e.kind == EdgeKind::Imports)
+        .expect("the import crosses the repo boundary");
+    let call = r
+        .result
+        .edges
+        .iter()
+        .find(|e| e.src == run && e.dst == send && e.kind == EdgeKind::Calls)
+        .expect("and so does the call through it");
+
+    // priced below an in-repo resolution: the syntax pins the target, the premise
+    // that these two trees are one program does not
+    for e in [import, call] {
+        assert!(
+            e.confidence > 0.7 && e.confidence < 0.95,
+            "a cross-root edge is discounted, not free: {}",
+            e.confidence
+        );
+    }
+}
+
+/// One root's tsconfig aliases must not resolve another root's imports: `@web/*`
+/// belongs to the web repo, and `api/src/leak.ts` naming it means an external
+/// dependency ripple doesn't have, not the web repo's file.
+#[test]
+fn a_tsconfig_alias_does_not_leak_into_another_root() {
+    let (web, api) = xrepo();
+    let r = resolve::build_incremental(&[web, api], &std::collections::HashMap::new()).unwrap();
+
+    let x = SymbolId::of("web/src/util.ts", "x");
+    assert!(
+        !r.result.edges.iter().any(|e| e.dst == x),
+        "@web/util resolved from the api root, through the web root's tsconfig"
+    );
+}
+
+/// Name-guessed resolution stays inside its root. Both repos define `Dup.run`; a
+/// receiver-typed call in one must not become a 1/N split across both — otherwise
+/// adding a second repo silently rewrites the first one's confidences.
+#[test]
+fn a_same_named_method_in_another_root_is_not_a_candidate() {
+    let (web, api) = xrepo();
+    let r = resolve::build_incremental(&[web, api], &std::collections::HashMap::new()).unwrap();
+
+    let caller = SymbolId::of("web/src/dup.ts", "callsDup");
+    let ours = SymbolId::of("web/src/dup.ts", "Dup.run");
+    let theirs = SymbolId::of("api/src/client.ts", "Dup.run");
+
+    let targets: Vec<_> = r
+        .result
+        .edges
+        .iter()
+        .filter(|e| e.src == caller && e.kind == EdgeKind::Calls)
+        .collect();
+    assert_eq!(
+        targets.len(),
+        1,
+        "one target, not one per repo: {targets:?}"
+    );
+    assert_eq!(targets[0].dst, ours);
+    assert!(!r.result.edges.iter().any(|e| e.dst == theirs));
+}
+
+/// The regression guard for the whole global-index change: indexing a repo alone
+/// and indexing it beside another must produce the same edges inside it. SymbolIds
+/// differ (multi-root namespaces the module path), so compare by name.
+#[test]
+fn edges_inside_a_root_survive_a_second_root() {
+    let proj = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/proj");
+    let members = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/members");
+
+    let named = |r: &resolve::Indexed, tag: &str| {
+        let by_id: std::collections::HashMap<_, _> = r
+            .result
+            .nodes
+            .iter()
+            .map(|n| (n.id, (n.qualified_name.clone(), n.module_path.clone())))
+            .collect();
+        let mut out: Vec<String> = r
+            .result
+            .edges
+            .iter()
+            .filter_map(|e| {
+                let (sn, sm) = by_id.get(&e.src)?;
+                let (dn, dm) = by_id.get(&e.dst)?;
+                // a module node's qualified name *is* its (namespaced) path, so the
+                // tag has to come off both halves of the label
+                let strip = |m: &str| m.strip_prefix(tag).unwrap_or(m).to_owned();
+                Some(format!(
+                    "{}:{} -> {}:{} {:?} {:.4}",
+                    strip(sm),
+                    strip(sn),
+                    strip(dm),
+                    strip(dn),
+                    e.kind,
+                    e.confidence
+                ))
+            })
+            .filter(|line| !line.contains("members/"))
+            .collect();
+        out.sort();
+        out
+    };
+
+    let alone = resolve::build_incremental(
+        std::slice::from_ref(&proj),
+        &std::collections::HashMap::new(),
+    )
+    .unwrap();
+    let together =
+        resolve::build_incremental(&[proj.clone(), members], &std::collections::HashMap::new())
+            .unwrap();
+
+    assert_eq!(
+        named(&alone, ""),
+        named(&together, "proj/"),
+        "adding a second root changed the first one's edges"
+    );
+}

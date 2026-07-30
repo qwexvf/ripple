@@ -3,7 +3,8 @@
 //! config degrades to relative-only resolution, never an error.
 
 use lang::Workspace;
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 const IGNORED_DIRS: &[&str] = &["node_modules", "dist", "build", "out", ".git", ".ripple"];
@@ -13,6 +14,62 @@ pub fn discover(root: &Path) -> Workspace {
     read_tsconfig(root, &mut ws);
     read_packages(root, &mut ws);
     ws
+}
+
+/// One resolution context per indexed root, because they are not interchangeable:
+/// two repos both defining `@/*` in their tsconfig mean different directories, and
+/// sharing them would resolve an import to the wrong repo's file.
+///
+/// Package *names* are the exception, and the reason this type exists: a name
+/// declared in exactly one root is visible from every root, which is what makes
+/// `import "@org/api-client"` in one repo land in another. A name declared in two
+/// roots stays local to each — two candidate directories is an ambiguity, and
+/// `resolve_import` returns one path, so there is nothing to split 1/N over.
+pub struct Workspaces {
+    by_root: Vec<(PathBuf, Workspace)>,
+    empty: Workspace,
+}
+
+impl Workspaces {
+    pub fn discover_all(roots: &[(String, PathBuf)]) -> Workspaces {
+        let mut by_root: Vec<(PathBuf, Workspace)> = roots
+            .iter()
+            .map(|(_, r)| (r.clone(), discover(r)))
+            .collect();
+
+        // how many roots declare each package name
+        let mut declared: HashMap<String, usize> = HashMap::new();
+        for (_, ws) in &by_root {
+            for name in ws.packages.keys() {
+                *declared.entry(name.clone()).or_default() += 1;
+            }
+        }
+        let shared: Vec<(String, PathBuf)> = by_root
+            .iter()
+            .flat_map(|(_, ws)| ws.packages.iter())
+            .filter(|(name, _)| declared.get(*name) == Some(&1))
+            .map(|(n, d)| (n.clone(), d.clone()))
+            .collect();
+        for (_, ws) in &mut by_root {
+            for (name, dir) in &shared {
+                ws.packages.entry(name.clone()).or_insert(dir.clone());
+            }
+        }
+        Workspaces {
+            by_root,
+            empty: Workspace::default(),
+        }
+    }
+
+    /// The context of the root this file belongs to. Longest matching root wins, so
+    /// a root nested inside another is answered by the more specific one.
+    pub fn for_file(&self, file: &Path) -> &Workspace {
+        self.by_root
+            .iter()
+            .filter(|(root, _)| file.starts_with(root))
+            .max_by_key(|(root, _)| root.as_os_str().len())
+            .map_or(&self.empty, |(_, ws)| ws)
+    }
 }
 
 /// Parse `compilerOptions.baseUrl` + `paths` from the root tsconfig.

@@ -38,6 +38,23 @@ cross-repo tracing works, and it is the only way to get it, since git co-change 
 bridge two histories. Module paths are namespaced per root so identical relative paths in
 two repos do not collide.
 
+Resolution runs once over every root, so an import that names a package another indexed
+repo declares lands on that repo's source. Measured on a real pair (`apps/web` +
+`packages/shared`): the `Tag` interface in `shared/src/types.ts` reaches 11 files in
+`web`, through the package name and its barrel. Such an edge is priced at `0.85 ×` an
+in-repo one — the two working trees being one program is an assumption, not something the
+import says.
+
+Two things deliberately stay inside a root: a repo's tsconfig `paths`/`baseUrl` (both
+repos defining `@/*` mean different directories) and name-guessed resolution — a bare
+identifier matching in the other repo. So indexing a second repository never changes the
+first one's edges, which is asserted by a test.
+
+The graph lives under the **first** root. Every other root gets a
+`.ripple/index-root` pointer to it, so `cd packages/shared && ripple review` answers from
+the shared graph instead of creating an empty one beside it. A pointer whose database has
+gone is an error naming it, not a silently empty answer.
+
 Re-running is incremental: unchanged files are reused from the content cache. The summary
 line reports added / changed / unchanged / removed alongside the node and edge counts.
 

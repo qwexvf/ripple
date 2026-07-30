@@ -9,7 +9,7 @@
 
 use anyhow::{Context, Result};
 use ir::{Edge, EdgeKind, EdgeSource, Node, NodeKind, Span, SymbolId};
-use lang::{LanguageAdapter, Workspace};
+use lang::LanguageAdapter;
 use parse::{CachedFile, Queries, Receiver, RefKind};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
@@ -19,6 +19,8 @@ use walkdir::WalkDir;
 mod crossservice;
 mod testlink;
 mod workspace;
+
+use workspace::Workspaces;
 
 pub use crossservice::{link_cross_service, CrossEdges};
 pub use testlink::{link_tests, TestScopes};
@@ -106,10 +108,17 @@ pub fn build(root: &Path) -> Result<BuildResult> {
 }
 
 /// Build one or more roots into a single graph, reusing `cached` per-file
-/// extracts (unchanged files skip the parse). Each root is resolved
-/// independently (imports never cross repos by file path — that's cross-service,
-/// v1 #5); module paths are namespaced by a per-root tag so same-relative-path
-/// files in different repos don't collide on SymbolId. See docs/08-roadmap.md.
+/// extracts (unchanged files skip the parse).
+///
+/// Discovery is per root (its own tag, its own relative paths); resolution is not.
+/// One `index_defs`/`link` pass over every file is what lets an import name a
+/// package that lives in another indexed repo — the frontend's
+/// `import "@org/api-client"` landing on the backend's source. What stays inside a
+/// root is name-guessed resolution (see `DefIndex`) and tsconfig context (see
+/// `Workspaces`), so adding a second repo cannot change the first one's edges.
+///
+/// Module paths are namespaced by the per-root tag, so same-relative-path files in
+/// different repos don't collide on SymbolId. See docs/08-roadmap.md.
 pub fn build_incremental(
     roots: &[PathBuf],
     cached: &HashMap<String, CachedFile>,
@@ -124,14 +133,14 @@ pub fn build_incremental(
     let single = roots.len() == 1;
     let mut tags = HashMap::new();
     let mut all_files: Vec<CachedFile> = Vec::new();
-    let mut all_nodes: Vec<Node> = Vec::new();
-    let mut all_edges: Vec<Edge> = Vec::new();
+    // which root each file in `all_files` came from, same order
+    let mut file_root: Vec<usize> = Vec::new();
     let mut used_roots: Vec<(String, PathBuf)> = Vec::new();
     let mut stats = IndexStats::default();
     // dedup files across roots (a root nested inside another would double-index)
     let mut seen_canon: HashSet<PathBuf> = HashSet::new();
 
-    for root in roots {
+    for (i, root) in roots.iter().enumerate() {
         let root = root
             .canonicalize()
             .with_context(|| format!("cannot access {}", root.display()))?;
@@ -142,18 +151,17 @@ pub fn build_incremental(
         };
 
         let (files, s) = discover(&root, &tag, &registry, &queries, cached, &mut seen_canon)?;
-        let ws = workspace::discover(&root);
-        let (index, mut nodes) = index_defs(&files);
-        let mut edges = link(&files, &index, &registry, &ws);
-
         stats.added += s.added;
         stats.changed += s.changed;
         stats.unchanged += s.unchanged;
-        all_nodes.append(&mut nodes);
-        all_edges.append(&mut edges);
+        file_root.extend(std::iter::repeat_n(i, files.len()));
         all_files.extend(files);
         used_roots.push((tag, root));
     }
+
+    let ws = Workspaces::discover_all(&used_roots);
+    let (index, nodes) = index_defs(&all_files, &file_root);
+    let edges = link(&all_files, &file_root, &index, &registry, &ws);
 
     // removed = cached entries no longer present in any root
     let seen: HashSet<&str> = all_files.iter().map(|f| f.module_path.as_str()).collect();
@@ -162,8 +170,8 @@ pub fn build_incremental(
     Ok(Indexed {
         result: BuildResult {
             files_indexed: all_files.len(),
-            nodes: all_nodes,
-            edges: all_edges,
+            nodes,
+            edges,
         },
         files: all_files,
         roots: used_roots,
@@ -228,6 +236,10 @@ fn discover(
         let module_path = namespace(tag, &rel_module_path(root, &canonical));
         candidates.push((canonical, module_path));
     }
+    // WalkDir hands back readdir order, which differs between machines and between
+    // runs after a rewrite. File order is edge order, and the store keys edges by
+    // insertion index, so this is what makes two indexes of one tree comparable.
+    candidates.sort();
 
     let parsed: Vec<(CachedFile, Change)> = candidates
         .par_iter()
@@ -290,7 +302,15 @@ fn parse_one(
     ))
 }
 
-/// Lookup tables built once from all definitions.
+/// Lookup tables built once from all definitions, across every root.
+///
+/// The split down the middle is the rule that makes a multi-repo index safe:
+/// **path-evidenced lookups cross roots, name-guessed ones don't.** An import that
+/// resolved to a file landed on *that* file, wherever it lives. A bare identifier
+/// matching in another repo is not evidence of anything — and letting it match
+/// would change repo A's edges whenever repo B is added to the index, both by
+/// diluting 1/N confidences and by pushing candidate sets past
+/// `MAX_PATH_CANDIDATES` until an edge disappears.
 #[derive(Default)]
 struct DefIndex {
     /// (file, exported name) → symbol
@@ -299,18 +319,21 @@ struct DefIndex {
     file_defs: HashMap<PathBuf, HashMap<String, Vec<SymbolId>>>,
     /// file → exported symbols (for the single-default-export heuristic)
     file_exports: HashMap<PathBuf, Vec<SymbolId>>,
-    /// (class, method) → symbols
-    methods_by_class: HashMap<(String, String), Vec<SymbolId>>,
-    /// method → symbols (candidate fallback)
-    methods_by_name: HashMap<String, Vec<SymbolId>>,
-    /// (owner, name) → symbols, for qualified calls. The owner is whatever the
+    /// (root, class, method) → symbols
+    methods_by_class: HashMap<(usize, String, String), Vec<SymbolId>>,
+    /// (root, method) → symbols (candidate fallback)
+    methods_by_name: HashMap<(usize, String), Vec<SymbolId>>,
+    /// (root, owner, name) → symbols, for qualified calls. The owner is whatever the
     /// language puts before the name in a qualified name: `Client` for Rust's
     /// `Client::new`, `A` for TypeScript's `A.foo`.
-    by_owner: HashMap<(String, String), Vec<SymbolId>>,
-    /// name → every definition with that name, anywhere. Only consulted for a
-    /// qualified call whose owner didn't match, and only when few enough
+    by_owner: HashMap<(usize, String, String), Vec<SymbolId>>,
+    /// (root, name) → every definition with that name in that root. Only consulted
+    /// for a qualified call whose owner didn't match, and only when few enough
     /// candidates remain to mean something.
-    by_name: HashMap<String, Vec<SymbolId>>,
+    by_name: HashMap<(usize, String), Vec<SymbolId>>,
+    /// which root each symbol came from, so an edge that leaves one can be priced
+    /// for it
+    root_of: HashMap<SymbolId, usize>,
 }
 
 /// The trailing identifier of a qualified name or path — `Client` from
@@ -323,8 +346,9 @@ fn last_segment(path: &str) -> &str {
     path.rsplit([':', '.']).next().unwrap_or(path).trim()
 }
 
-/// Phase 2: emit def + module nodes and build the lookup tables.
-fn index_defs(files: &[CachedFile]) -> (DefIndex, Vec<Node>) {
+/// Phase 2: emit def + module nodes and build the lookup tables. `file_root[i]` is
+/// which indexed root `files[i]` came from — one entry per file, in the same order.
+fn index_defs(files: &[CachedFile], file_root: &[usize]) -> (DefIndex, Vec<Node>) {
     let mut idx = DefIndex::default();
     let mut nodes: Vec<Node> = Vec::new();
     // identity is (path, qualified name), so several definitions of one symbol share
@@ -334,7 +358,7 @@ fn index_defs(files: &[CachedFile]) -> (DefIndex, Vec<Node>) {
     // keep the spans.
     let mut at: HashMap<SymbolId, usize> = HashMap::new();
 
-    for f in files {
+    for (f, &root) in files.iter().zip(file_root) {
         let by_name = idx.file_defs.entry(f.canonical.clone()).or_default();
         for d in &f.extract.defs {
             by_name.entry(d.name.clone()).or_default().push(d.id);
@@ -349,23 +373,27 @@ fn index_defs(files: &[CachedFile]) -> (DefIndex, Vec<Node>) {
             if d.kind == NodeKind::Method {
                 if let Some((class, method)) = d.qualified_name.split_once('.') {
                     idx.methods_by_class
-                        .entry((class.to_owned(), method.to_owned()))
+                        .entry((root, class.to_owned(), method.to_owned()))
                         .or_default()
                         .push(d.id);
                     idx.methods_by_name
-                        .entry(method.to_owned())
+                        .entry((root, method.to_owned()))
                         .or_default()
                         .push(d.id);
                 }
             }
-            idx.by_name.entry(d.name.clone()).or_default().push(d.id);
+            idx.by_name
+                .entry((root, d.name.clone()))
+                .or_default()
+                .push(d.id);
+            idx.root_of.insert(d.id, root);
             // an owner is anything the qualified name carries in front of the name
             if d.qualified_name.len() > d.name.len() && d.qualified_name.ends_with(&d.name) {
                 let owner =
                     last_segment(&d.qualified_name[..d.qualified_name.len() - d.name.len()]);
                 if !owner.is_empty() {
                     idx.by_owner
-                        .entry((owner.to_owned(), d.name.clone()))
+                        .entry((root, owner.to_owned(), d.name.clone()))
                         .or_default()
                         .push(d.id);
                 }
@@ -383,28 +411,52 @@ fn index_defs(files: &[CachedFile]) -> (DefIndex, Vec<Node>) {
                 }
             }
         }
-        nodes.push(module_node(&f.module_path));
+        let module = module_node(&f.module_path);
+        idx.root_of.insert(module.id, root);
+        nodes.push(module);
     }
     (idx, nodes)
 }
 
-/// Phase 3: resolve imports and calls into edges.
+/// Phase 3: resolve imports and calls into edges, over every root at once.
+///
+/// One pass rather than one per root: an import that names a package declared in
+/// another indexed repo resolves to a file that only a shared `by_path` knows
+/// about. What stays per-root is the *guessing* — see `DefIndex` — and the
+/// tsconfig context, which `Workspaces` picks per file.
 fn link(
     files: &[CachedFile],
+    file_root: &[usize],
     idx: &DefIndex,
     registry: &[Box<dyn LanguageAdapter>],
-    ws: &Workspace,
+    ws: &Workspaces,
 ) -> Vec<Edge> {
     let mut edges = Vec::new();
     // a barrel file has to be looked up by path when an import lands on it
     let by_path: HashMap<&Path, &CachedFile> =
         files.iter().map(|f| (f.canonical.as_path(), f)).collect();
-    for f in files {
+    for (f, &root) in files.iter().zip(file_root) {
         let module_id = module_symbol(&f.module_path);
-        let (bindings, modules) = resolve_imports(f, idx, &by_path, registry, ws, &mut edges);
-        resolve_calls(f, idx, module_id, &bindings, &modules, &mut edges);
+        let (bindings, modules) = resolve_imports(f, root, idx, &by_path, registry, ws, &mut edges);
+        resolve_calls(f, root, idx, module_id, &bindings, &modules, &mut edges);
     }
     edges
+}
+
+/// How much a resolution that leaves its repo is worth. The syntax pins the target
+/// exactly as well as it does in-repo; what is weaker is the premise underneath —
+/// that these two working trees are one program. A consumer usually resolves a
+/// published artifact, so the file on disk is the right symbol at a version nobody
+/// checked. Multiplied into the edge's own confidence, so an already-ambiguous
+/// 1/N call stays proportionally weak (invariant 5).
+const CROSS_ROOT: f32 = 0.85;
+
+/// Price an edge for the boundary it crosses, if it crosses one.
+fn cross_root_conf(idx: &DefIndex, from_root: usize, dst: SymbolId, conf: f32) -> f32 {
+    match idx.root_of.get(&dst) {
+        Some(&r) if r != from_root => conf * CROSS_ROOT,
+        _ => conf,
+    }
 }
 
 /// How many re-export hops to follow. Barrels nest (a package index re-exporting
@@ -421,7 +473,7 @@ fn resolve_export(
     idx: &DefIndex,
     by_path: &HashMap<&Path, &CachedFile>,
     registry: &[Box<dyn LanguageAdapter>],
-    ws: &Workspace,
+    ws: &Workspaces,
     file: &Path,
     name: &str,
     hops: usize,
@@ -442,7 +494,9 @@ fn resolve_export(
             exposed if exposed == name => re.name.as_str(),
             _ => continue,
         };
-        let Some(next) = adapter.resolve_import(&re.specifier, file, ws) else {
+        // the barrel's own context, not the importer's: a chain can hop into
+        // another root, where a different tsconfig applies
+        let Some(next) = adapter.resolve_import(&re.specifier, file, ws.for_file(file)) else {
             continue;
         };
         // `next` differs from `file` for any real re-export, so a chain shortens the
@@ -459,10 +513,11 @@ fn resolve_export(
 /// local-name → symbol binding map used by call resolution.
 fn resolve_imports(
     f: &CachedFile,
+    root: usize,
     idx: &DefIndex,
     by_path: &HashMap<&Path, &CachedFile>,
     registry: &[Box<dyn LanguageAdapter>],
-    ws: &Workspace,
+    ws: &Workspaces,
     edges: &mut Vec<Edge>,
 ) -> (HashMap<String, SymbolId>, HashMap<String, PathBuf>) {
     let module_id = module_symbol(&f.module_path);
@@ -473,7 +528,9 @@ fn resolve_imports(
 
     for imp in &f.extract.imports {
         let Some(adapter) = adapter else { continue };
-        let Some(target) = adapter.resolve_import(&imp.specifier, &f.canonical, ws) else {
+        let Some(target) =
+            adapter.resolve_import(&imp.specifier, &f.canonical, ws.for_file(&f.canonical))
+        else {
             continue; // bare/unresolved specifier (external node_modules dep)
         };
         if imp.is_namespace() {
@@ -481,11 +538,12 @@ fn resolve_imports(
             // the file's module node is the honest target
             modules.insert(imp.local_name.clone(), target.clone());
             if let Some(m) = by_path.get(target.as_path()) {
+                let dst = module_symbol(&m.module_path);
                 edges.push(Edge {
                     src: module_id,
-                    dst: module_symbol(&m.module_path),
+                    dst,
                     kind: EdgeKind::Imports,
-                    confidence: CONF_IMPORT,
+                    confidence: cross_root_conf(idx, root, dst, CONF_IMPORT),
                     site: imp.site,
                     source: EdgeSource::Extracted,
                 });
@@ -511,7 +569,7 @@ fn resolve_imports(
                 src: module_id,
                 dst: sym,
                 kind: EdgeKind::Imports,
-                confidence: CONF_IMPORT,
+                confidence: cross_root_conf(idx, root, sym, CONF_IMPORT),
                 site: imp.site,
                 source: EdgeSource::Extracted,
             });
@@ -523,6 +581,7 @@ fn resolve_imports(
 /// Resolve a file's call sites (bare + member) into Calls edges.
 fn resolve_calls(
     f: &CachedFile,
+    root: usize,
     idx: &DefIndex,
     module_id: SymbolId,
     bindings: &HashMap<String, SymbolId>,
@@ -558,19 +617,21 @@ fn resolve_calls(
         }
 
         let (targets, base_conf) = match r.kind {
-            RefKind::Call => match resolve_qualified(&r.name, r.qualifier.as_deref(), local, idx) {
-                // an explicit qualifier names its target, so it decides — including
-                // deciding that nothing here matches. Consulting same-file names
-                // first made `Client::new()` resolve to whatever local `new` existed.
-                Some(resolved) => resolved,
-                None => match local.get(&r.name) {
-                    Some(ids) if !ids.is_empty() => (ids.clone(), CONF_LOCAL_CALL),
-                    _ => (
-                        bindings.get(&r.name).into_iter().copied().collect(),
-                        CONF_LOCAL_CALL,
-                    ),
-                },
-            },
+            RefKind::Call => {
+                match resolve_qualified(&r.name, r.qualifier.as_deref(), local, idx, root) {
+                    // an explicit qualifier names its target, so it decides — including
+                    // deciding that nothing here matches. Consulting same-file names
+                    // first made `Client::new()` resolve to whatever local `new` existed.
+                    Some(resolved) => resolved,
+                    None => match local.get(&r.name) {
+                        Some(ids) if !ids.is_empty() => (ids.clone(), CONF_LOCAL_CALL),
+                        _ => (
+                            bindings.get(&r.name).into_iter().copied().collect(),
+                            CONF_LOCAL_CALL,
+                        ),
+                    },
+                }
+            }
             RefKind::Member => {
                 // a receiver bound to a whole module is pinned by the import, so the
                 // method is whatever that module exports under this name — no guessing
@@ -590,6 +651,7 @@ fn resolve_calls(
                         enclosing,
                         &types.at(r.site, enclosing, &defs_by_start),
                         idx,
+                        root,
                     )
                 }
             }
@@ -605,11 +667,12 @@ fn resolve_calls(
 
         let n = targets.len() as f32;
         for t in targets.into_iter().filter(|&t| t != src_id) {
+            let conf = if n <= 1.0 { base_conf } else { base_conf / n };
             edges.push(Edge {
                 src: src_id,
                 dst: t,
                 kind: EdgeKind::Calls,
-                confidence: if n <= 1.0 { base_conf } else { base_conf / n },
+                confidence: cross_root_conf(idx, root, t, conf),
                 site: r.site,
                 source: EdgeSource::Extracted,
             });
@@ -634,10 +697,11 @@ fn resolve_qualified(
     qualifier: Option<&str>,
     local: &HashMap<String, Vec<SymbolId>>,
     idx: &DefIndex,
+    root: usize,
 ) -> Option<(Vec<SymbolId>, f32)> {
     let qualifier = qualifier?;
     let owner = last_segment(qualifier);
-    if let Some(ids) = idx.by_owner.get(&(owner.to_owned(), name.to_owned())) {
+    if let Some(ids) = idx.by_owner.get(&(root, owner.to_owned(), name.to_owned())) {
         return Some((prefer_local(ids, name, local), CONF_QUALIFIED_OWNER));
     }
     // A capitalized qualifier names a *type*, and the type is either ours or it
@@ -649,7 +713,7 @@ fn resolve_qualified(
     }
     // A lowercase qualifier is a module or crate path (`resolve::link_cross_service`),
     // where the name alone is the only handle we have.
-    Some(match idx.by_name.get(name) {
+    Some(match idx.by_name.get(&(root, name.to_owned())) {
         Some(ids) if ids.len() <= MAX_PATH_CANDIDATES => {
             (prefer_local(ids, name, local), CONF_QUALIFIED_NAME)
         }
@@ -688,11 +752,17 @@ fn resolve_member(
     enclosing: Option<&Node>,
     type_map: &HashMap<&str, &str>,
     idx: &DefIndex,
+    root: usize,
 ) -> (Vec<SymbolId>, f32) {
-    let candidates = || idx.methods_by_name.get(method).cloned().unwrap_or_default();
+    let candidates = || {
+        idx.methods_by_name
+            .get(&(root, method.to_owned()))
+            .cloned()
+            .unwrap_or_default()
+    };
     let in_class = |class: &str| {
         idx.methods_by_class
-            .get(&(class.to_owned(), method.to_owned()))
+            .get(&(root, class.to_owned(), method.to_owned()))
             .cloned()
             .unwrap_or_default()
     };

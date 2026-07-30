@@ -35,8 +35,42 @@ fn main() -> Result<()> {
 
 const USAGE: &str = "usage:\n  ripple parse <file> [--json]\n  ripple index <path>... [--calls lsp [--calls-budget 120s]]   (--calls lsp: call edges from a language server, for languages with no refs query)\n  ripple neighbors <symbol> [--in|--out] [--depth N] [--in-file <substr>] [--root <path>] [--json]\n  ripple impact <symbol>... [--budget N] [--in-file <substr>] [--root <path>] [--json] [--verify lsp]\n  ripple review [<base>] [--budget N] [--root <path>] [--json] [--verify lsp]\n    --verify lsp [--verify-budget 2s] [--floor-contradicted|--drop-contradicted]  (upgrade call edges from a language server)\n  ripple path <from> <to> [--depth 6] [--limit 3] [--root <path>] [--json]   (how does A reach B?)\n  ripple risk <symbol|file> [--root <path>] [--json]\n  ripple mcp [--root <path>]   (MCP server over stdio for AI agents)\n  ripple lsp doctor [--root <path>] [--budget 10s] [--json]   (are language servers usable here?)\n  ripple lsp trust [--root <path>]   (allow this repo's own .ripple/lsp.json to launch servers)";
 
-fn db_path(root: &Path) -> PathBuf {
+/// Where `root`'s own database would live.
+fn own_db_path(root: &Path) -> PathBuf {
     root.join(".ripple").join("graph.redb")
+}
+
+/// The name of the pointer a secondary root carries to the shared index.
+const INDEX_POINTER: &str = "index-root";
+
+/// The database that answers for `root`.
+///
+/// `ripple index A B` writes one graph, under A. Standing in B — which is the
+/// normal thing to do, since B is a repository you work in — the old rule
+/// (`<root>/.ripple/graph.redb`) pointed at a path redb would happily *create*,
+/// so every query answered "nothing" from an empty database. Indexing therefore
+/// leaves a pointer in each secondary root, and a dangling pointer is an error
+/// naming the index that vanished, never a silent fall-through.
+fn db_path(root: &Path) -> Result<PathBuf> {
+    let own = own_db_path(root);
+    if own.exists() {
+        return Ok(own);
+    }
+    let pointer = root.join(".ripple").join(INDEX_POINTER);
+    let Ok(text) = std::fs::read_to_string(&pointer) else {
+        return Ok(own); // never indexed: let the store's own error explain
+    };
+    let primary = PathBuf::from(text.trim());
+    let shared = own_db_path(&primary);
+    if !shared.exists() {
+        bail!(
+            "{} says its index lives at {}, and that database is gone — \
+             re-run `ripple index` for both roots",
+            root.display(),
+            shared.display()
+        );
+    }
+    Ok(shared)
 }
 
 /// Edge kinds surfaced by `neighbors` (call/import/co-change/cross-service).
@@ -149,7 +183,7 @@ fn cmd_index(args: &[String]) -> Result<()> {
 /// Build the graph for `roots` (parse + git overlay + cross-service) and persist
 /// it. Returns a one-line summary. Shared by `index` and the MCP `reindex` tool.
 fn index_project(roots: &[PathBuf], lsp_calls: Option<std::time::Duration>) -> Result<String> {
-    let mut store = RedbStore::open(db_path(&roots[0])); // db + cache live under root[0]
+    let mut store = RedbStore::open(own_db_path(&roots[0])); // db + cache live under root[0]
 
     let cached = store.read_extracts()?;
     let indexed = resolve::build_incremental(roots, &cached)?;
@@ -199,6 +233,7 @@ fn index_project(roots: &[PathBuf], lsp_calls: Option<std::time::Duration>) -> R
     // one transaction: a crash between these three would leave the graph, the
     // extract cache and the roots describing different indexes
     store.write_index(&nodes, &edges, &indexed.files, &indexed.roots)?;
+    write_index_pointers(&roots[0], &indexed.roots)?;
 
     let edge_count = edges.len();
     let calls_report = match lsp_calls {
@@ -212,7 +247,7 @@ fn index_project(roots: &[PathBuf], lsp_calls: Option<std::time::Duration>) -> R
         indexed.result.files_indexed, indexed.roots.len(),
         s.added, s.changed, s.unchanged, s.removed,
         nodes.len(), edge_count, cochange_applied, graphql, db, imported, tests, file_granular, repeated, with_dependents,
-        db_path(&roots[0]).display()
+        own_db_path(&roots[0]).display()
     );
     if let Some(report) = calls_report {
         summary.push('\n');
@@ -359,7 +394,7 @@ fn cmd_lsp_doctor(args: &[String]) -> Result<()> {
         .canonicalize()
         .with_context(|| format!("cannot access {}", root.display()))?;
 
-    let store = RedbStore::open(db_path(&root));
+    let store = RedbStore::open(db_path(&root)?);
     let graph = store.load().ok();
     // A cross-repo index spans several roots, and each root has its own language
     // mix — the Elixir server belongs to the repo that has mix.exs, not to the one
@@ -543,7 +578,7 @@ fn cmd_impact(args: &[String]) -> Result<()> {
         bail!("{USAGE}");
     }
 
-    let mut store = RedbStore::open(db_path(&root));
+    let mut store = RedbStore::open(db_path(&root)?);
     let mut graph = store.load()?;
     let mut seeds: Vec<ir::SymbolId> = Vec::new();
     for s in &symbols {
@@ -721,6 +756,47 @@ fn warn_if_stale(store: &RedbStore, modules: &HashSet<&str>) {
     );
 }
 
+/// Leave every secondary root a note saying where the shared index lives, so
+/// `cd api && ripple review` answers from the graph that actually knows about
+/// `api` rather than creating an empty database next to it.
+///
+/// Best-effort per root: a read-only checkout is a reason to lose the shortcut,
+/// not a reason to fail an index that already succeeded.
+fn write_index_pointers(primary: &Path, roots: &[(String, PathBuf)]) -> Result<()> {
+    let primary = primary
+        .canonicalize()
+        .unwrap_or_else(|_| primary.to_owned());
+    for (_, root) in roots {
+        if *root == primary {
+            continue;
+        }
+        let dir = root.join(".ripple");
+        if std::fs::create_dir_all(&dir).is_err() {
+            continue;
+        }
+        let _ = std::fs::write(
+            dir.join(INDEX_POINTER),
+            primary.to_string_lossy().as_bytes(),
+        );
+    }
+    Ok(())
+}
+
+/// Re-key a diff's repo-relative paths as the module paths the graph stores.
+/// A single-root index has an empty tag and this is the identity.
+fn namespaced(
+    tag: &str,
+    changed: HashMap<String, Vec<(u32, u32)>>,
+) -> HashMap<String, Vec<(u32, u32)>> {
+    if tag.is_empty() {
+        return changed;
+    }
+    changed
+        .into_iter()
+        .map(|(path, ranges)| (resolve::namespace(tag, &path), ranges))
+        .collect()
+}
+
 /// Which of `modules` no longer hash to what they were indexed as, sorted.
 /// A module the index has never heard of is not a staleness claim we can make;
 /// a file that has since disappeared is.
@@ -782,7 +858,7 @@ fn cmd_path(args: &[String]) -> Result<()> {
         bail!("path wants two symbols: ripple path <from> <to>\n{USAGE}");
     };
 
-    let graph = RedbStore::open(db_path(&root)).load()?;
+    let graph = RedbStore::open(db_path(&root)?).load()?;
     // no --in-file here: one filter over two endpoints has no unambiguous meaning
     let starts = lookup_or_bail(&graph, from, json, &[])?;
     let targets = lookup_or_bail(&graph, to, json, &[])?;
@@ -1096,7 +1172,7 @@ fn cmd_eval_oracle(args: &[String]) -> Result<()> {
         Some(other) => bail!("--granularity takes function or file, not {other}"),
     };
 
-    let store = RedbStore::open(db_path(&root));
+    let store = RedbStore::open(db_path(&root)?);
     let graph = store.load()?;
     let mut roots = store.read_roots()?;
     if roots.is_empty() {
@@ -1477,7 +1553,7 @@ fn cmd_eval_risk(args: &[String]) -> Result<()> {
     let k: usize = flag_value(args, "--commits")
         .and_then(|s| s.parse().ok())
         .unwrap_or(50);
-    let store = RedbStore::open(db_path(&root));
+    let store = RedbStore::open(db_path(&root)?);
     let graph = store.load()?;
     let tag = root_tag(&store, &root)?;
 
@@ -1559,7 +1635,7 @@ fn cmd_eval(args: &[String]) -> Result<()> {
     let k: usize = flag_value(args, "--commits")
         .and_then(|s| s.parse().ok())
         .unwrap_or(200);
-    let store = RedbStore::open(db_path(&root));
+    let store = RedbStore::open(db_path(&root)?);
     let graph = store.load()?;
     // a multi-root index namespaces module paths by root tag, so raw git paths
     // must be namespaced the same way or every lookup misses
@@ -1685,10 +1761,10 @@ fn cmd_eval(args: &[String]) -> Result<()> {
 fn cmd_mcp(args: &[String]) -> Result<()> {
     let root: PathBuf = flag_value(args, "--root").map_or_else(|| ".".into(), PathBuf::from);
     // index-if-missing so an agent can point at a repo that was never indexed
-    if !db_path(&root).exists() {
+    if !db_path(&root)?.exists() {
         index_project(std::slice::from_ref(&root), None)?;
     }
-    let mut graph = RedbStore::open(db_path(&root)).load()?;
+    let mut graph = RedbStore::open(db_path(&root)?).load()?;
 
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
@@ -1818,9 +1894,8 @@ fn mcp_call(
         "reindex" => {
             let summary = index_project(std::slice::from_ref(&root.to_path_buf()), None)
                 .map_err(|e| e.to_string())?;
-            *graph = RedbStore::open(db_path(root))
-                .load()
-                .map_err(|e| e.to_string())?;
+            let db = db_path(root).map_err(|e| e.to_string())?;
+            *graph = RedbStore::open(db).load().map_err(|e| e.to_string())?;
             Ok(mcp_text(json!({ "reindexed": summary })))
         }
         "search" => {
@@ -2007,12 +2082,17 @@ fn cmd_review(args: &[String]) -> Result<()> {
         .unwrap_or(15);
     let base = positional(args); // optional rev; default = working tree vs HEAD
 
-    let changed = overlay::diff_lines(&root, base.map(String::as_str));
+    let mut store = RedbStore::open(db_path(&root)?);
+    // a multi-root index stores tag-prefixed module paths, and review compares the
+    // diff's paths to them by equality — unnamespaced, every match silently missed
+    let changed = namespaced(
+        &root_tag(&store, &root)?,
+        overlay::diff_lines(&root, base.map(String::as_str)),
+    );
     if changed.is_empty() {
         println!("no changes to review (vs {})", base.map_or("HEAD", |s| s));
         return Ok(());
     }
-    let mut store = RedbStore::open(db_path(&root));
     let mut graph = store.load()?;
     let seeds: Vec<ir::SymbolId> = changed
         .keys()
@@ -2080,7 +2160,7 @@ fn cmd_risk(args: &[String]) -> Result<()> {
     let query = positional(args).context(USAGE)?.clone();
     let root: PathBuf = flag_value(args, "--root").map_or_else(|| ".".into(), PathBuf::from);
 
-    let graph = RedbStore::open(db_path(&root)).load()?;
+    let graph = RedbStore::open(db_path(&root)?).load()?;
     // match by symbol name/qualified name, or by module path (file)
     let mut hits: Vec<_> = graph
         .lookup(&query)
@@ -2136,7 +2216,7 @@ fn cmd_neighbors(args: &[String]) -> Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(1);
 
-    let store = RedbStore::open(db_path(&root));
+    let store = RedbStore::open(db_path(&root)?);
     let graph = store.load()?;
 
     let matches = lookup_or_bail(&graph, &symbol, json, args)?;
@@ -2337,7 +2417,7 @@ mod tests {
         let (web, api) = (dir.join("web"), dir.join("api"));
         std::fs::create_dir_all(&web).unwrap();
         std::fs::create_dir_all(&api).unwrap();
-        let mut store = RedbStore::open(db_path(&web));
+        let mut store = RedbStore::open(own_db_path(&web));
 
         // no roots recorded yet (an index built before roots existed)
         assert_eq!(root_tag(&store, &web).unwrap(), "");

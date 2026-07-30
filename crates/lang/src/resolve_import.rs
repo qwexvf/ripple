@@ -22,8 +22,15 @@ pub fn tsconfig_paths(spec: &str, ws: &Workspace, globs: &[&str]) -> Option<Path
 }
 
 /// Resolve a bare specifier to a workspace package (`@org/pkg` or `@org/pkg/sub`).
+///
+/// Longest name wins, which is both npm's rule and the only deterministic one:
+/// with `@org/a` and `@org/a/sub` both registered, iterating a `HashMap` resolved
+/// `@org/a/sub/x` differently from run to run.
 pub fn workspace_package(spec: &str, ws: &Workspace, globs: &[&str]) -> Option<PathBuf> {
-    for (name, dir) in &ws.packages {
+    let mut names: Vec<&String> = ws.packages.keys().collect();
+    names.sort_by(|a, b| b.len().cmp(&a.len()).then(a.cmp(b)));
+    for name in names {
+        let dir = &ws.packages[name];
         if spec == name {
             return probe(&dir.join("index"), globs)
                 .or_else(|| probe(&dir.join("src/index"), globs));
