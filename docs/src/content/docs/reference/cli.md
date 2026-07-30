@@ -55,6 +55,11 @@ The graph lives under the **first** root. Every other root gets a
 the shared graph instead of creating an empty one beside it. A pointer whose database has
 gone is an error naming it, not a silently empty answer.
 
+A graph written by an older ripple whose on-disk format this build cannot read is
+deleted and rebuilt: indexing rewrites every table anyway, so there is nothing to
+migrate. A *query* against one says so and names the command to run, rather than
+surfacing redb's `Manual upgrade required`.
+
 Re-running is incremental: unchanged files are reused from the content cache. The summary
 line reports added / changed / unchanged / removed alongside the node and edge counts.
 

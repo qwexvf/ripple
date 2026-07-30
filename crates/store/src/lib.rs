@@ -5,7 +5,7 @@
 use anyhow::{Context, Result};
 use ir::{Edge, EdgeKind, Node, SymbolId};
 use parse::CachedFile;
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -99,6 +99,18 @@ impl RedbStore {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
+        // A graph written by an older redb cannot be opened, and there is nothing in
+        // it worth migrating: indexing rewrites every table anyway, and re-parsing a
+        // repo costs seconds. Delete and rebuild rather than making the user do it.
+        if let Err(redb::DatabaseError::UpgradeRequired(_)) = Database::create(&self.path) {
+            std::fs::remove_file(&self.path).with_context(|| {
+                format!(
+                    "{} was written by an older ripple and must be rebuilt, \
+                     but it could not be removed",
+                    self.path.display()
+                )
+            })?;
+        }
         self.wait_for_lock(|| Database::create(&self.path), "create redb")
     }
 
@@ -112,8 +124,26 @@ impl RedbStore {
         if !self.path.exists() {
             return Ok(None);
         }
-        self.wait_for_lock(|| Database::open(&self.path), "open redb")
-            .map(Some)
+        match self.wait_for_lock(|| Database::open(&self.path), "open redb") {
+            Ok(db) => Ok(Some(db)),
+            // a query can't rebuild the graph — say what to run, not what redb said
+            Err(e) if needs_rebuild(&e) => Err(e).with_context(|| {
+                format!(
+                    "{} was written by an older ripple — re-run `ripple index`",
+                    self.path.display()
+                )
+            }),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Like `read_db`, but an unreadable old format is "nothing cached" rather than
+    /// an error: the caller is the indexer, and the write path rebuilds the file.
+    fn cache_db(&self) -> Result<Option<Database>> {
+        match self.read_db() {
+            Err(e) if needs_rebuild(&e) => Ok(None),
+            other => other,
+        }
     }
 
     fn wait_for_lock(
@@ -141,6 +171,14 @@ impl RedbStore {
             }
         }
     }
+}
+
+/// Was this database written by an older redb, whose format this build can't read?
+fn needs_rebuild(e: &anyhow::Error) -> bool {
+    matches!(
+        e.downcast_ref::<redb::DatabaseError>(),
+        Some(redb::DatabaseError::UpgradeRequired(_))
+    )
 }
 
 /// Replace the graph tables inside an open write transaction. The extract cache and
@@ -225,8 +263,10 @@ impl GraphStore for RedbStore {
     }
 
     fn read_extracts(&self) -> Result<HashMap<String, CachedFile>> {
-        let Some(db) = self.read_db()? else {
-            return Ok(HashMap::new()); // no prior index
+        // an old-format file is nothing this build can read, which for a cache is the
+        // same as nothing cached — `index` deletes and rebuilds it on the write side
+        let Some(db) = self.cache_db()? else {
+            return Ok(HashMap::new());
         };
         let rtx = db.begin_read()?;
         let mut out = HashMap::new();
@@ -245,8 +285,10 @@ impl GraphStore for RedbStore {
     }
 
     fn read_file_stamps(&self) -> Result<HashMap<String, FileStamp>> {
-        let Some(db) = self.read_db()? else {
-            return Ok(HashMap::new()); // no prior index
+        // an old-format file is nothing this build can read, which for a cache is the
+        // same as nothing cached — `index` deletes and rebuilds it on the write side
+        let Some(db) = self.cache_db()? else {
+            return Ok(HashMap::new());
         };
         let rtx = db.begin_read()?;
         let mut out = HashMap::new();
@@ -289,7 +331,9 @@ impl GraphStore for RedbStore {
     }
 
     fn read_verified(&self) -> Result<HashMap<String, Vec<VerifiedCall>>> {
-        let Some(db) = self.read_db()? else {
+        // an old-format file is nothing this build can read, which for a cache is the
+        // same as nothing cached — `index` deletes and rebuilds it on the write side
+        let Some(db) = self.cache_db()? else {
             return Ok(HashMap::new());
         };
         let rtx = db.begin_read()?;
@@ -307,8 +351,10 @@ impl GraphStore for RedbStore {
     }
 
     fn read_roots(&self) -> Result<Vec<(String, PathBuf)>> {
-        let Some(db) = self.read_db()? else {
-            return Ok(Vec::new()); // no prior index
+        // an old-format file is nothing this build can read, which for a cache is the
+        // same as nothing cached — `index` deletes and rebuilds it on the write side
+        let Some(db) = self.cache_db()? else {
+            return Ok(Vec::new());
         };
         let rtx = db.begin_read()?;
         let mut out = Vec::new();
