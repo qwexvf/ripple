@@ -183,3 +183,29 @@ fn redb_store_satisfies_contract() {
     run_contract(&mut s);
     let _ = std::fs::remove_file(&path);
 }
+
+/// A missing index and a locked one are different problems, and the message has
+/// to say which. Before #38's follow-up, a query issued while an index was
+/// running reported "run `ripple index` first" — advice for the wrong problem,
+/// given an index was exactly what was running.
+#[test]
+fn a_missing_index_says_so_and_a_lock_is_not_confused_with_it() {
+    let path = tmp("absent").join("graph.redb");
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+
+    let err = match RedbStore::open(&path).load() {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("loading an absent index must fail"),
+    };
+    assert!(err.contains("run `ripple index` first"), "{err}");
+    assert!(
+        !err.contains("Cannot acquire lock"),
+        "an absent database is not a contended one: {err}"
+    );
+
+    // the read paths treat "no database" as "nothing cached", not as an error
+    let s = RedbStore::open(&path);
+    assert!(s.read_extracts().unwrap().is_empty());
+    assert!(s.read_roots().unwrap().is_empty());
+    assert!(s.read_file_stamps().unwrap().is_empty());
+}

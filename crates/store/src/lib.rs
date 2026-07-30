@@ -99,9 +99,31 @@ impl RedbStore {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
+        self.wait_for_lock(|| Database::create(&self.path), "create redb")
+    }
+
+    /// Open an existing database for reading, waiting out a held lock the same way
+    /// the write path does. `None` means there is no database yet.
+    ///
+    /// Reading is the *more* common collision — a query while an index runs — and
+    /// it used to fail instantly with redb's raw message, wrapped in "run `ripple
+    /// index` first" while an index was in fact running (#38).
+    fn read_db(&self) -> Result<Option<Database>> {
+        if !self.path.exists() {
+            return Ok(None);
+        }
+        self.wait_for_lock(|| Database::open(&self.path), "open redb")
+            .map(Some)
+    }
+
+    fn wait_for_lock(
+        &self,
+        mut attempt: impl FnMut() -> std::result::Result<Database, redb::DatabaseError>,
+        what: &str,
+    ) -> Result<Database> {
         let mut waited = std::time::Duration::ZERO;
         loop {
-            match Database::create(&self.path) {
+            match attempt() {
                 Ok(db) => return Ok(db),
                 Err(e) if is_locked(&e) && waited < LOCK_WAIT => {
                     std::thread::sleep(LOCK_POLL);
@@ -115,7 +137,7 @@ impl RedbStore {
                         LOCK_WAIT.as_secs()
                     )))
                 }
-                Err(e) => return Err(anyhow::Error::new(e).context("create redb")),
+                Err(e) => return Err(anyhow::Error::new(e).context(what.to_owned())),
             }
         }
     }
@@ -203,7 +225,7 @@ impl GraphStore for RedbStore {
     }
 
     fn read_extracts(&self) -> Result<HashMap<String, CachedFile>> {
-        let Ok(db) = Database::open(&self.path) else {
+        let Some(db) = self.read_db()? else {
             return Ok(HashMap::new()); // no prior index
         };
         let rtx = db.begin_read()?;
@@ -223,7 +245,7 @@ impl GraphStore for RedbStore {
     }
 
     fn read_file_stamps(&self) -> Result<HashMap<String, FileStamp>> {
-        let Ok(db) = Database::open(&self.path) else {
+        let Some(db) = self.read_db()? else {
             return Ok(HashMap::new()); // no prior index
         };
         let rtx = db.begin_read()?;
@@ -267,7 +289,7 @@ impl GraphStore for RedbStore {
     }
 
     fn read_verified(&self) -> Result<HashMap<String, Vec<VerifiedCall>>> {
-        let Ok(db) = Database::open(&self.path) else {
+        let Some(db) = self.read_db()? else {
             return Ok(HashMap::new());
         };
         let rtx = db.begin_read()?;
@@ -285,7 +307,7 @@ impl GraphStore for RedbStore {
     }
 
     fn read_roots(&self) -> Result<Vec<(String, PathBuf)>> {
-        let Ok(db) = Database::open(&self.path) else {
+        let Some(db) = self.read_db()? else {
             return Ok(Vec::new()); // no prior index
         };
         let rtx = db.begin_read()?;
@@ -300,9 +322,9 @@ impl GraphStore for RedbStore {
     }
 
     fn load(&self) -> Result<InMemoryGraph> {
-        let db = Database::open(&self.path).with_context(|| {
+        let db = self.read_db()?.with_context(|| {
             format!(
-                "open redb at {} (run `ripple index` first)",
+                "no index at {} — run `ripple index` first",
                 self.path.display()
             )
         })?;

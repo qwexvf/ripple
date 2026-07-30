@@ -68,9 +68,11 @@ and compare against the index, so an answer built from edited code says so on st
 
 — instead of handing you a renamed function with a `0.95` next to it.
 
-Two `ripple index` runs on one repository no longer collide either: redb allows a single
-writer, so the second waits up to 30s for the first and then reports which database is
-held, rather than surfacing `Database already open. Cannot acquire lock.`
+Concurrent runs no longer collide either: redb allows a single writer at a time, so any
+process — a second `ripple index`, or a query issued while one is running — waits up to
+30s and then reports which database is held, rather than surfacing `Database already open.
+Cannot acquire lock.` A query during an index is the common case, and it used to fail
+instantly advising you to run `ripple index`, which was exactly what was running.
 
 ### `--calls lsp`
 
