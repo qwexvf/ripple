@@ -9,8 +9,8 @@ sidebar:
 ```
 ripple parse <file> [--json]
 ripple index <path>... [--calls lsp [--calls-budget 120s]]
-ripple neighbors <symbol> [--in|--out] [--depth N] [--root <path>] [--json]
-ripple impact <symbol>... [--budget N] [--root <path>] [--json] [--verify lsp]
+ripple neighbors <symbol> [--in|--out] [--depth N] [--in-file <substr>] [--root <path>] [--json]
+ripple impact <symbol>... [--budget N] [--in-file <substr>] [--root <path>] [--json] [--verify lsp]
 ripple review [<base>] [--budget N] [--root <path>] [--json] [--verify lsp]
 ripple path <from> <to> [--depth 6] [--limit 3] [--root <path>] [--json]
 ripple risk <symbol|file> [--root <path>] [--json]
@@ -70,8 +70,13 @@ The risk-ranked blast radius: what depends on this symbol, ordered by how much o
 change reaches it scaled by how risky it is. Accepts more than one symbol to model a
 multi-symbol change.
 
-Each line carries its edge kind, that edge's confidence, and the depth it was found at.
-`--budget` defaults to 20.
+Each line carries its edge kind, that edge's confidence, the depth it was found at, and
+the file and line it lives on. `--budget` defaults to 20.
+
+A name that matches several symbols exactly seeds all of them and says so — six unrelated
+`run`s across three languages produce one union that otherwise reads like one symbol's
+blast radius. `--in-file <substr>` narrows the seeds to symbols whose path contains the
+substring, and no match is an error rather than an empty answer.
 
 ## `ripple review [<base>]`
 

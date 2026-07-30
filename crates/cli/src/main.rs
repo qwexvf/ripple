@@ -33,7 +33,7 @@ fn main() -> Result<()> {
     }
 }
 
-const USAGE: &str = "usage:\n  ripple parse <file> [--json]\n  ripple index <path>... [--calls lsp [--calls-budget 120s]]   (--calls lsp: call edges from a language server, for languages with no refs query)\n  ripple neighbors <symbol> [--in|--out] [--depth N] [--in-file <substr>] [--root <path>] [--json]\n  ripple impact <symbol>... [--budget N] [--root <path>] [--json] [--verify lsp]\n  ripple review [<base>] [--budget N] [--root <path>] [--json] [--verify lsp]\n    --verify lsp [--verify-budget 2s] [--floor-contradicted|--drop-contradicted]  (upgrade call edges from a language server)\n  ripple path <from> <to> [--depth 6] [--limit 3] [--root <path>] [--json]   (how does A reach B?)\n  ripple risk <symbol|file> [--root <path>] [--json]\n  ripple mcp [--root <path>]   (MCP server over stdio for AI agents)\n  ripple lsp doctor [--root <path>] [--budget 10s] [--json]   (are language servers usable here?)\n  ripple lsp trust [--root <path>]   (allow this repo's own .ripple/lsp.json to launch servers)";
+const USAGE: &str = "usage:\n  ripple parse <file> [--json]\n  ripple index <path>... [--calls lsp [--calls-budget 120s]]   (--calls lsp: call edges from a language server, for languages with no refs query)\n  ripple neighbors <symbol> [--in|--out] [--depth N] [--in-file <substr>] [--root <path>] [--json]\n  ripple impact <symbol>... [--budget N] [--in-file <substr>] [--root <path>] [--json] [--verify lsp]\n  ripple review [<base>] [--budget N] [--root <path>] [--json] [--verify lsp]\n    --verify lsp [--verify-budget 2s] [--floor-contradicted|--drop-contradicted]  (upgrade call edges from a language server)\n  ripple path <from> <to> [--depth 6] [--limit 3] [--root <path>] [--json]   (how does A reach B?)\n  ripple risk <symbol|file> [--root <path>] [--json]\n  ripple mcp [--root <path>]   (MCP server over stdio for AI agents)\n  ripple lsp doctor [--root <path>] [--budget 10s] [--json]   (are language servers usable here?)\n  ripple lsp trust [--root <path>]   (allow this repo's own .ripple/lsp.json to launch servers)";
 
 fn db_path(root: &Path) -> PathBuf {
     root.join(".ripple").join("graph.redb")
@@ -547,7 +547,8 @@ fn cmd_impact(args: &[String]) -> Result<()> {
     let mut graph = store.load()?;
     let mut seeds: Vec<ir::SymbolId> = Vec::new();
     for s in &symbols {
-        seeds.extend(lookup_or_bail(&graph, s, json)?.iter().map(|n| n.id));
+        let matches = lookup_or_bail(&graph, s, json, args)?;
+        seeds.extend(matches.iter().map(|n| n.id));
     }
     graph = verify_upgrade(&mut store, graph, &root, args, &seeds, json)?;
 
@@ -604,39 +605,30 @@ fn cmd_impact(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Look a symbol up, widening the rule if needed, and say so when the match was
-/// looser than exact.
+/// Look a symbol up, widening the rule if needed, and say so whenever the answer
+/// is about more or other symbols than the caller asked for.
 ///
 /// Exact-only lookup made every Elixir module unfindable by the name a human types:
 /// a module's name *is* its qualified name, so `impact LfgPost` failed and only
 /// `impact FiveNoobs.Lfgs.LfgPost` worked. The note goes to stderr under `--json` so
 /// machine output stays clean.
+///
+/// An *exact* name matching several symbols is the more dangerous case and used to
+/// pass silently: six unrelated `run`s across three languages were seeded as one,
+/// and the union reads exactly like one symbol's blast radius (#37).
 fn lookup_or_bail<'a>(
     graph: &'a InMemoryGraph,
     query: &str,
     json: bool,
+    args: &[String],
 ) -> Result<Vec<&'a ir::Node>> {
     let Some((nodes, how)) = graph.lookup(query) else {
         bail!("no symbol matched: {query}");
     };
-    if how != store::Match::Exact {
-        let rule = match how {
-            store::Match::Exact => unreachable!(),
-            store::Match::QualifiedSuffix => "qualified-name suffix",
-            store::Match::Substring => "substring",
-        };
-        let names: Vec<&str> = nodes.iter().take(5).map(|n| n.name.as_str()).collect();
-        let more = nodes.len().saturating_sub(names.len());
-        let tail = if more > 0 {
-            format!(", … {more} more")
-        } else {
-            String::new()
-        };
-        let note = format!(
-            "no exact match for '{query}'; matched {} symbol(s) by {rule}: {}{tail}",
-            nodes.len(),
-            names.join(", ")
-        );
+    // narrow before saying anything: `--in-file` is the answer to the ambiguity,
+    // so a note about symbols the user already excluded is noise
+    let nodes = narrow_to_file(nodes, query, args)?;
+    if let Some(note) = lookup_note(query, &nodes, how) {
         if json {
             eprintln!("{note}");
         } else {
@@ -644,6 +636,70 @@ fn lookup_or_bail<'a>(
         }
     }
     Ok(nodes)
+}
+
+/// What to say about a lookup whose answer isn't one exactly-named symbol.
+/// `None` when the query pinned a single symbol and there is nothing to warn about.
+fn lookup_note(query: &str, nodes: &[&ir::Node], how: store::Match) -> Option<String> {
+    const SHOWN: usize = 5;
+    match how {
+        store::Match::Exact if nodes.len() > 1 => {
+            let files: HashSet<&str> = nodes.iter().map(|n| n.module_path.as_str()).collect();
+            let shown: Vec<&str> = nodes
+                .iter()
+                .take(SHOWN)
+                .map(|n| n.module_path.as_str())
+                .collect();
+            Some(format!(
+                "'{query}' matches {} symbols in {} files ({}{}); answering about all of them — narrow with --in-file",
+                nodes.len(),
+                files.len(),
+                shown.join(", "),
+                if nodes.len() > shown.len() { ", …" } else { "" },
+            ))
+        }
+        store::Match::Exact => None,
+        store::Match::QualifiedSuffix | store::Match::Substring => {
+            let rule = if how == store::Match::QualifiedSuffix {
+                "qualified-name suffix"
+            } else {
+                "substring"
+            };
+            let names: Vec<&str> = nodes.iter().take(SHOWN).map(|n| n.name.as_str()).collect();
+            let more = nodes.len().saturating_sub(names.len());
+            let tail = if more > 0 {
+                format!(", … {more} more")
+            } else {
+                String::new()
+            };
+            Some(format!(
+                "no exact match for '{query}'; matched {} symbol(s) by {rule}: {}{tail}",
+                nodes.len(),
+                names.join(", ")
+            ))
+        }
+    }
+}
+
+/// `--in-file <substr>`: narrow a name that matched several symbols to the ones in
+/// a matching file. One name is routinely several symbols (`get` is seven
+/// resolvers), and without this the only way to read the right one was `awk`.
+fn narrow_to_file<'a>(
+    matches: Vec<&'a ir::Node>,
+    symbol: &str,
+    args: &[String],
+) -> Result<Vec<&'a ir::Node>> {
+    let Some(want) = flag_value(args, "--in-file") else {
+        return Ok(matches);
+    };
+    let narrowed: Vec<&ir::Node> = matches
+        .into_iter()
+        .filter(|n| n.module_path.contains(want))
+        .collect();
+    if narrowed.is_empty() {
+        bail!("no symbol '{symbol}' in a file matching '{want}'");
+    }
+    Ok(narrowed)
 }
 
 /// `ripple path <from> <to>`: how does one symbol reach another?
@@ -666,8 +722,9 @@ fn cmd_path(args: &[String]) -> Result<()> {
     };
 
     let graph = RedbStore::open(db_path(&root)).load()?;
-    let starts = lookup_or_bail(&graph, from, json)?;
-    let targets = lookup_or_bail(&graph, to, json)?;
+    // no --in-file here: one filter over two endpoints has no unambiguous meaning
+    let starts = lookup_or_bail(&graph, from, json, &[])?;
+    let targets = lookup_or_bail(&graph, to, json, &[])?;
 
     let mut routes: Vec<(String, String, query::Route)> = Vec::new();
     for s in &starts {
@@ -848,11 +905,17 @@ fn clone_hop(h: &store::Hop) -> store::Hop {
 /// A file-level hit (`NodeKind::Module`) has no symbol name of its own — its name
 /// *is* the path, and printing `path (path)` read like a bug. Say what it is instead:
 /// these appear because a call can sit outside every function (issue #18).
+///
+/// Everything else carries its line, because two same-named symbols in one file
+/// otherwise print as byte-identical blocks with different contents (#37).
 fn hit_name(node: &ir::Node) -> String {
     if node.kind == ir::NodeKind::Module {
         format!("[file] {}", node.module_path)
     } else {
-        format!("{} ({})", node.name, node.module_path)
+        format!(
+            "{} ({}:{})",
+            node.name, node.module_path, node.span.start_line
+        )
     }
 }
 
@@ -2012,15 +2075,7 @@ fn cmd_neighbors(args: &[String]) -> Result<()> {
     let store = RedbStore::open(db_path(&root));
     let graph = store.load()?;
 
-    let mut matches = lookup_or_bail(&graph, &symbol, json)?;
-    // one name is routinely several symbols (`get` is seven resolvers), and without a
-    // filter the only way to read the right one was to cut the section out with awk
-    if let Some(want) = flag_value(args, "--in-file") {
-        matches.retain(|n| n.module_path.contains(want));
-        if matches.is_empty() {
-            bail!("no symbol '{symbol}' in a file matching '{want}'");
-        }
-    }
+    let matches = lookup_or_bail(&graph, &symbol, json, args)?;
 
     let arrow = if dir == Dir::In {
         "callers/importers of"
@@ -2231,5 +2286,64 @@ mod tests {
         assert!(root_tag(&store, &dir).is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn named(name: &str, module: &str) -> ir::Node {
+        ir::Node {
+            id: ir::SymbolId::of(module, name),
+            kind: ir::NodeKind::Function,
+            name: name.to_owned(),
+            qualified_name: name.to_owned(),
+            module_path: module.to_owned(),
+            span: ir::Span {
+                start_line: 1,
+                start_col: 1,
+                end_line: 1,
+                end_col: 1,
+            },
+            extra_spans: Vec::new(),
+            is_exported: true,
+            risk: ir::RiskScores::default(),
+        }
+    }
+
+    /// Six unrelated `run`s in three languages used to be seeded as one symbol,
+    /// and the union read exactly like one symbol's blast radius (#37).
+    #[test]
+    fn an_exact_name_matching_several_symbols_says_so() {
+        let (a, b) = (named("run", "verify.rs"), named("run", "b.ts"));
+
+        let note = lookup_note("run", &[&a, &b], store::Match::Exact).expect("ambiguous");
+        assert!(note.contains("matches 2 symbols in 2 files"), "{note}");
+        assert!(note.contains("--in-file"), "{note}");
+
+        assert!(
+            lookup_note("run", &[&a], store::Match::Exact).is_none(),
+            "one exact match is not worth a word"
+        );
+        // a looser rule still says which rule fired
+        let loose = lookup_note("run", &[&a], store::Match::Substring).expect("loose");
+        assert!(loose.contains("substring"), "{loose}");
+    }
+
+    #[test]
+    fn in_file_narrows_an_ambiguous_name() {
+        let (a, b) = (named("run", "crates/cli/verify.rs"), named("run", "b.ts"));
+        let args = v(&["run", "--in-file", "verify.rs"]);
+
+        let narrowed = narrow_to_file(vec![&a, &b], "run", &args).unwrap();
+        assert_eq!(narrowed.len(), 1);
+        assert_eq!(narrowed[0].module_path, "crates/cli/verify.rs");
+
+        // no match is an error naming the filter, not a silent empty answer
+        let miss = v(&["run", "--in-file", "nowhere.ex"]);
+        assert!(narrow_to_file(vec![&a, &b], "run", &miss).is_err());
+        // and without the flag nothing is dropped
+        assert_eq!(
+            narrow_to_file(vec![&a, &b], "run", &v(&["run"]))
+                .unwrap()
+                .len(),
+            2
+        );
     }
 }
