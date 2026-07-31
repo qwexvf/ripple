@@ -540,3 +540,47 @@ regression in cross-service resolution.
 **Implication (fixed).** The two are reported separately.
 
 **Lesson:** a mislabelled number costs more than a missing one.
+
+---
+
+## 2026-07-31 — an A/B test on escaped defects, and what it actually measured
+
+**Asked:** does handing a review agent ripple's output make it find more real defects?
+
+**Said (by the experiment):** the ripple arm found the escaped defect in 1 of 6 cases,
+the control in 0 of 6. That is not evidence. It is one case.
+
+**How the corpus was built,** because the previous attempt at this question was
+worthless: a bug is only ground truth if a human later had to fix it. Mine every
+focused `fix` commit in 5noobs, blame the lines it removed to find the commit that
+wrote them, keep the case when blame converges on one commit and the bug escaped for
+at least a week. Six cases survived. Each one gets a worktree checked out **at the
+introducing commit**, indexed there, with its `.git` pointer removed so no reviewer can
+read forward into the fix. Both arms got the identical prompt; the treatment arm also
+got `ripple review` output and the ability to query the index. A blind grader scored
+the twelve reviews with the arm labels shuffled.
+
+**Was true, and more interesting than the headline:**
+
+- Both arms found *plenty* of real bugs — a schema pointing at table `notificaitons`,
+  a `Repo.insert!` whose `{:ok, _}` branch can never match, a stray `MyAppWeb.Endpoint`.
+  The reviewer is competent. It just does not converge on the one defect that later
+  broke production, with or without ripple.
+- **Ranking does not cause finding.** In C4 ripple ranked the defective symbol
+  `paginate` **first of seventeen**, the agent read it, and still did not notice the
+  missing `order_by`. Putting the right symbol at the top is necessary and nowhere near
+  sufficient.
+- The escaped defects are hard *because* they escaped. A bug that survived human review
+  is selected for being unobvious.
+
+**Implication.** The honest reading is that this harness measures the reviewer more
+than it measures ripple, and six cases cannot separate them. What the same corpus did
+measure cleanly, without any agent in the loop, is ripple's own ordering: the defective
+symbol ranked 1, 3, 4, 4, 13, 21 out of 17, 8, 17, 9, 24, 32 — mean normalized rank
+0.385 against 0.5 for chance. Compare `eval --risk` on the same repo, which scores
+fanout at 2.68x lift. Ripple is good at *which files are risky* and weak at *which
+symbol in this change is the dangerous one*. Filed as #55; the two worst ranks have a
+single diagnosed cause, filed as #54.
+
+**Lesson:** an A/B test whose control also fails tells you about the metric, not the
+treatment. Measure the component you control before measuring the pipeline it sits in.
