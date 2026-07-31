@@ -227,6 +227,7 @@ fn index_project(roots: &[PathBuf], lsp_calls: Option<std::time::Duration>) -> R
     let mut cross = resolve::link_cross_service(&indexed.files, &nodes);
     let (graphql, db, imported) = (cross.graphql, cross.db, cross.imported);
     let (unmatched, unused) = (cross.unmatched_consumers, cross.unused_providers);
+    let endpoints = cross.endpoints;
     let file_granular = cross.file_granular;
     edges.append(&mut cross.edges);
 
@@ -281,10 +282,10 @@ fn index_project(roots: &[PathBuf], lsp_calls: Option<std::time::Duration>) -> R
 
     let s = indexed.stats;
     let mut summary = format!(
-        "indexed {} files across {} root(s) ({} added, {} changed, {} unchanged, {} removed) → {} nodes, {} edges ({} co-change, {} graphql, {} db, {} imported, {} tests, {} file-granular, {} repeated, {} with dependents) ({})",
+        "indexed {} files across {} root(s) ({} added, {} changed, {} unchanged, {} removed) → {} nodes, {} edges ({} co-change, {} graphql, {} db, {} imported, {} endpoint, {} tests, {} file-granular, {} repeated, {} with dependents) ({})",
         indexed.result.files_indexed, indexed.roots.len(),
         s.added, s.changed, s.unchanged, s.removed,
-        nodes.len(), edge_count, cochange_applied, graphql, db, imported, tests, file_granular, repeated, with_dependents,
+        nodes.len(), edge_count, cochange_applied, graphql, db, imported, endpoints, tests, file_granular, repeated, with_dependents,
         own_db_path(&roots[0]).display()
     );
     // the cross-service diagnostics: a boundary convention nobody taught a detector

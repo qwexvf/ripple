@@ -7,7 +7,7 @@
 
 use super::macros::{FunRef, MacroCall, Scan};
 use crate::cross::{
-    camelize, graphql_field_key, CrossFacts, HandlerRef, Provides, GQL_ROOT_SCOPES,
+    camelize, graphql_field_key, http_key, CrossFacts, HandlerRef, Provides, GQL_ROOT_SCOPES,
 };
 use std::collections::HashMap;
 
@@ -43,6 +43,20 @@ struct DataDsl {
     queries: &'static [&'static str],
 }
 
+/// A router DSL: verb macros declaring a path, a controller and an action, nested
+/// in blocks that prefix the path.
+struct RouterDsl {
+    /// macros opening a block whose string argument prefixes the paths inside it
+    prefix_blocks: &'static [&'static str],
+    /// verb macros, spelled as the method they declare
+    verbs: &'static [&'static str],
+}
+
+const PHOENIX: RouterDsl = RouterDsl {
+    prefix_blocks: &["scope"],
+    verbs: &["get", "post", "put", "patch", "delete", "head", "options"],
+};
+
 const ECTO: DataDsl = DataDsl {
     entity: "schema",
     repo: "Repo",
@@ -54,6 +68,7 @@ const ECTO: DataDsl = DataDsl {
 pub fn cross_facts(scan: &Scan) -> CrossFacts {
     let mut f = CrossFacts::default();
     schema_facts(scan, &ABSINTHE, &mut f);
+    router_facts(scan, &PHOENIX, &mut f);
     data_facts(scan, &ECTO, &mut f);
     f.star_imports = scan
         .calls
@@ -181,6 +196,55 @@ fn type_scope(atom: &str) -> String {
     crate::cross::operation_key(&camelize(atom))
 }
 
+/// Routes a router file declares: `get "/users/:id", UserController, :show`,
+/// with every enclosing `scope "/api"` prefixed onto the path.
+///
+/// Under-link rather than guess: a route whose controller or action is computed
+/// rather than written produces nothing, and `resources` — which expands into
+/// seven routes by convention rather than by syntax — is deliberately not read.
+/// Both show up in the unmatched-provider count instead of as invented edges.
+fn router_facts(scan: &Scan, dsl: &RouterDsl, out: &mut CrossFacts) {
+    for call in &scan.calls {
+        if !dsl.verbs.contains(&&*call.name) {
+            continue;
+        }
+        let (Some(path), Some(controller), Some(action)) = (
+            call.strings.first(),
+            call.modules.first(),
+            call.atoms.first(),
+        ) else {
+            continue;
+        };
+        let full = format!("{}/{}", prefix_of(&call.scope, dsl), unquote(path));
+        out.provides.push(Provides {
+            key: http_key(&call.name, &full),
+            handler: HandlerRef::Function {
+                module: controller.clone(),
+                name: action.clone(),
+            },
+            returns: None,
+        });
+    }
+}
+
+/// The path every enclosing prefix block contributes, outermost first.
+fn prefix_of(scope: &[String], dsl: &RouterDsl) -> String {
+    scope
+        .iter()
+        .filter_map(|entry| {
+            let (macro_name, arg) = entry.split_once(':')?;
+            dsl.prefix_blocks
+                .contains(&macro_name)
+                .then(|| unquote(arg).to_owned())
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn unquote(s: &str) -> &str {
+    s.trim_matches('"')
+}
+
 fn data_facts(scan: &Scan, dsl: &DataDsl, out: &mut CrossFacts) {
     out.entity_def = scan
         .calls
@@ -253,6 +317,62 @@ mod tests {
             f.is_empty(),
             "ambiguous resolver must under-link, got {f:?}"
         );
+    }
+
+    fn routes(src: &str) -> Vec<(Option<String>, Vec<ir::Segment>, HandlerRef)> {
+        let mut p = tree_sitter::Parser::new();
+        p.set_language(&crate::elixir::Adapter::new().grammar())
+            .expect("elixir grammar");
+        let tree = p.parse(src, None).expect("parse");
+        let scan = super::super::macros::scan(tree.root_node(), src.as_bytes());
+        cross_facts(&scan)
+            .provides
+            .into_iter()
+            .filter(|p| p.key.transport == ir::Transport::Http)
+            .map(|p| (p.key.method, p.key.path, p.handler))
+            .collect()
+    }
+
+    /// A router's scope prefixes compose, `:id` is a parameter, and the action is
+    /// the handler — the shape every HTTP consumer has to match against.
+    #[test]
+    fn a_scoped_route_carries_its_prefix_and_its_parameter() {
+        let r = routes(
+            "defmodule Router do\n  scope \"/api\", AppWeb do\n    scope \"/v1\" do\n      get \"/users/:id\", UserController, :show\n      post \"/users\", UserController, :create\n    end\n  end\nend\n",
+        );
+        use ir::Segment::{Literal, Param};
+        let lit = |s: &str| Literal(s.to_owned());
+        assert_eq!(
+            r,
+            vec![
+                (
+                    Some("GET".into()),
+                    vec![lit("api"), lit("v1"), lit("users"), Param],
+                    HandlerRef::Function {
+                        module: "UserController".into(),
+                        name: "show".into()
+                    }
+                ),
+                (
+                    Some("POST".into()),
+                    vec![lit("api"), lit("v1"), lit("users")],
+                    HandlerRef::Function {
+                        module: "UserController".into(),
+                        name: "create".into()
+                    }
+                ),
+            ]
+        );
+    }
+
+    /// `resources` expands by convention, not by syntax. Reading it would mean
+    /// inventing seven routes nobody wrote; it is left to the unmatched counter.
+    #[test]
+    fn a_conventional_route_macro_is_not_guessed_at() {
+        assert!(routes(
+            "defmodule Router do\n  scope \"/api\" do\n    resources \"/users\", UserController\n  end\nend\n"
+        )
+        .is_empty());
     }
 
     #[test]

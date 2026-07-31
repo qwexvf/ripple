@@ -1006,3 +1006,57 @@ fn a_module_defined_in_two_roots_becomes_candidates_not_a_coin_flip() {
         );
     }
 }
+
+/// The seam's proof: an HTTP boundary links with no framework knowledge in the
+/// linker. A Phoenix router declares the routes, a TypeScript client calls them,
+/// and both sides reduced to the same RouteKey before anything matched (#32 ph3).
+#[test]
+fn a_typescript_fetch_reaches_the_route_it_calls() {
+    let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/http");
+    let roots = vec![base.join("web"), base.join("api")];
+    let indexed = resolve::build_incremental(&roots, &std::collections::HashMap::new()).unwrap();
+    let r = resolve::link_cross_service(&indexed.files, &indexed.result.nodes);
+
+    let load = SymbolId::of("web/src/client.ts", "loadUser");
+    let create = SymbolId::of("web/src/client.ts", "createUser");
+    let show = SymbolId::of("api/lib/user_controller.ex", "show");
+    let create_action = SymbolId::of("api/lib/user_controller.ex", "create");
+
+    let http: Vec<(SymbolId, SymbolId, f32)> = r
+        .edges
+        .iter()
+        .filter(|e| e.kind == EdgeKind::HttpCall)
+        .map(|e| (e.src, e.dst, e.confidence))
+        .collect();
+
+    // `${id}` on one side, `:id` on the other — normalized to the same Param
+    assert!(
+        http.iter().any(|(s, d, _)| *s == load && *d == show),
+        "interpolated path should reach the parameterized route: {http:?}"
+    );
+    // the method is read from the options object, not assumed
+    assert!(
+        http.iter()
+            .any(|(s, d, _)| *s == create && *d == create_action),
+        "POST should reach the POST route: {http:?}"
+    );
+    // and a GET must not reach the POST route declared on the same path
+    assert!(!http
+        .iter()
+        .any(|(s, d, _)| *s == load && *d == create_action));
+
+    // a call nothing declares is counted, not invented
+    assert!(
+        r.unmatched_consumers >= 1,
+        "the undeclared path should be reported"
+    );
+
+    // an interpolated path pins less than a fully spelled one
+    let conf = |src: SymbolId| http.iter().find(|(s, _, _)| *s == src).map(|(_, _, c)| *c);
+    assert!(
+        conf(load) < conf(create),
+        "a template with a parameter is weaker evidence: {:?} vs {:?}",
+        conf(load),
+        conf(create)
+    );
+}

@@ -43,10 +43,15 @@ pub struct MacroCall {
 
 impl MacroCall {
     /// The scope entry this call opens, whether or not it has a block.
+    ///
+    /// An atom names most blocks (`object :player`), but a router names its scope
+    /// with a string (`scope "/api"`), and a nested route's path is the
+    /// concatenation of those — so the string has to survive into the chain.
     fn scope_entry(&self) -> String {
-        match self.atoms.first() {
-            Some(atom) => format!("{}:{atom}", self.name),
-            None => self.name.clone(),
+        match (self.atoms.first(), self.strings.first()) {
+            (Some(atom), _) => format!("{}:{atom}", self.name),
+            (None, Some(string)) => format!("{}:{string}", self.name),
+            (None, None) => self.name.clone(),
         }
     }
 

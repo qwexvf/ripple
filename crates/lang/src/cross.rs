@@ -124,6 +124,34 @@ pub fn operation_key(name: &str) -> String {
     }
 }
 
+/// Split a URL path into wire segments: `/users/:id/posts` → `users`, `Param`,
+/// `posts`. Both `:id` (Phoenix, Rails) and `{id}` (OpenAPI) are parameters, and
+/// `*rest` is a catch-all — a detector normalizes its own framework's spelling
+/// here rather than teaching the matcher three of them.
+pub fn http_path(path: &str) -> Vec<Segment> {
+    path.split('/')
+        .filter(|s| !s.is_empty())
+        .map(|seg| {
+            if seg.starts_with(':') || (seg.starts_with('{') && seg.ends_with('}')) {
+                Segment::Param
+            } else if seg.starts_with('*') {
+                Segment::Wildcard
+            } else {
+                Segment::Literal(seg.to_owned())
+            }
+        })
+        .collect()
+}
+
+/// An HTTP endpoint key. The method is upper-cased so `get` and `GET` are one axis.
+pub fn http_key(method: &str, path: &str) -> RouteKey {
+    RouteKey {
+        transport: Transport::Http,
+        method: Some(method.to_uppercase()),
+        path: http_path(path),
+    }
+}
+
 /// The key a GraphQL field is served and requested under: its scope, then its
 /// name. One function so the producer and the consumer cannot spell it differently
 /// — they used to be two tuple literals in two crates.
@@ -204,6 +232,7 @@ fn text<'a>(n: TsNode, src: &'a [u8]) -> &'a str {
 // ── TypeScript: <Name>Document usages ──
 pub fn typescript(root: TsNode, src: &[u8]) -> CrossFacts {
     let mut docs = std::collections::HashSet::new();
+    let mut consumes = Vec::new();
     let mut stack = vec![root];
     while let Some(n) = stack.pop() {
         if n.kind() == "identifier" {
@@ -213,6 +242,11 @@ pub fn typescript(root: TsNode, src: &[u8]) -> CrossFacts {
                 }
             }
         }
+        if n.kind() == "call_expression" {
+            if let Some(call) = http_call(n, src) {
+                consumes.push(call);
+            }
+        }
         let mut c = n.walk();
         for ch in n.children(&mut c) {
             stack.push(ch);
@@ -220,12 +254,123 @@ pub fn typescript(root: TsNode, src: &[u8]) -> CrossFacts {
     }
     let mut op_refs: Vec<String> = docs.into_iter().collect();
     op_refs.sort();
+    consumes.sort_by_key(|c: &Consumes| c.line);
     CrossFacts {
+        consumes,
         graphql: GraphqlFacts {
             op_refs,
             ..Default::default()
         },
         ..Default::default()
+    }
+}
+
+/// `fetch("/api/users")`, `axios.get(`/api/users/${id}`)` — the consumer side of an
+/// HTTP boundary.
+///
+/// The method is read, never guessed: `axios.<verb>` spells it, and a bare `fetch`
+/// is GET by specification. A `fetch` whose options name a method ripple cannot
+/// read statically produces nothing rather than a wrong verb.
+fn http_call(call: TsNode, src: &[u8]) -> Option<Consumes> {
+    let callee = call.child_by_field_name("function")?;
+    let args = call.child_by_field_name("arguments")?;
+    let mut cursor = args.walk();
+    let mut arg_list = args.named_children(&mut cursor);
+    let first = arg_list.next()?;
+    let (path, literal_ratio) = url_of(first, src)?;
+
+    let method = match callee.kind() {
+        "identifier" if text(callee, src) == "fetch" => fetch_method(arg_list.next(), src)?,
+        "member_expression" => {
+            let verb = text(callee.child_by_field_name("property")?, src);
+            let object = text(callee.child_by_field_name("object")?, src);
+            // `axios.get(...)` and a client named after it; anything else is some
+            // other library whose shape we have not been taught
+            if !object.ends_with("axios") && object != "http" {
+                return None;
+            }
+            if !HTTP_VERBS.contains(&verb) {
+                return None;
+            }
+            verb.to_owned()
+        }
+        _ => return None,
+    };
+
+    Some(Consumes {
+        key: http_key(&method, &path),
+        line: call.start_position().row as u32 + 1,
+        confidence_hint: literal_ratio,
+    })
+}
+
+const HTTP_VERBS: [&str; 7] = ["get", "post", "put", "patch", "delete", "head", "options"];
+
+/// A `fetch`'s method: GET unless its options object says otherwise in a literal.
+/// `None` means the options were dynamic — under-link rather than assume GET.
+fn fetch_method(options: Option<TsNode>, src: &[u8]) -> Option<String> {
+    let Some(options) = options else {
+        return Some("GET".to_owned()); // one argument: GET, per the fetch spec
+    };
+    if options.kind() != "object" {
+        return None;
+    }
+    let mut cursor = options.walk();
+    for pair in options.named_children(&mut cursor) {
+        let (Some(key), Some(value)) = (
+            pair.child_by_field_name("key"),
+            pair.child_by_field_name("value"),
+        ) else {
+            continue;
+        };
+        if text(key, src).trim_matches(['"', '\'']) != "method" {
+            continue;
+        }
+        return match value.kind() {
+            "string" => Some(text(value, src).trim_matches(['"', '\'', '`']).to_owned()),
+            _ => None, // a computed method is not a method we know
+        };
+    }
+    Some("GET".to_owned()) // options that say nothing about the method
+}
+
+/// The URL a call's first argument names, plus how much of it was literal.
+///
+/// A template literal keeps its literal segments and turns each interpolation into
+/// a `${}` placeholder, which `http_path` normalizes to `Param` — the same shape a
+/// route declares with `:id`.
+fn url_of(arg: TsNode, src: &[u8]) -> Option<(String, f32)> {
+    match arg.kind() {
+        "string" => {
+            let path = text(arg, src).trim_matches(['"', '\'']).to_owned();
+            path.starts_with('/').then_some((path, 1.0))
+        }
+        "template_string" => {
+            let mut path = String::new();
+            let mut literal = 0usize;
+            let mut total = 0usize;
+            let mut cursor = arg.walk();
+            for part in arg.children(&mut cursor) {
+                match part.kind() {
+                    "string_fragment" => {
+                        path.push_str(text(part, src));
+                        literal += 1;
+                        total += 1;
+                    }
+                    "template_substitution" => {
+                        path.push_str("/:param/");
+                        total += 1;
+                    }
+                    _ => {}
+                }
+            }
+            let path = path.replace("//", "/");
+            if !path.starts_with('/') || total == 0 {
+                return None;
+            }
+            Some((path, literal as f32 / total as f32))
+        }
+        _ => None,
     }
 }
 
@@ -611,6 +756,47 @@ mod tests {
                 ("mutation", "id", vec!["followPlayer", "id"]),
             ]
         );
+    }
+
+    fn ts_consumes(src: &str) -> Vec<(Option<String>, Vec<Segment>, f32)> {
+        let t = parse(crate::typescript::Adapter::new().grammar(), src);
+        typescript(t.root_node(), src.as_bytes())
+            .consumes
+            .into_iter()
+            .map(|c| (c.key.method, c.key.path, c.confidence_hint))
+            .collect()
+    }
+
+    /// The consumer side of an HTTP boundary: the method is read rather than
+    /// guessed, and an interpolation normalizes to the same `Param` a route
+    /// declares with `:id`.
+    #[test]
+    fn a_fetch_and_an_axios_call_become_route_keys() {
+        let lit = |s: &str| Segment::Literal(s.to_owned());
+
+        assert_eq!(
+            ts_consumes("fetch(\"/api/users\");"),
+            vec![(Some("GET".into()), vec![lit("api"), lit("users")], 1.0)]
+        );
+        assert_eq!(
+            ts_consumes("fetch(\"/api/users\", { method: \"POST\" });"),
+            vec![(Some("POST".into()), vec![lit("api"), lit("users")], 1.0)]
+        );
+        assert_eq!(
+            ts_consumes("axios.get(`/api/users/${id}`);"),
+            vec![(
+                Some("GET".into()),
+                vec![lit("api"), lit("users"), Segment::Param],
+                0.5
+            )]
+        );
+
+        // a method ripple cannot read is not a method it invents
+        assert!(ts_consumes("fetch(url, { method: verb });").is_empty());
+        // and neither is a library it has not been taught
+        assert!(ts_consumes("superagent.get(\"/api/users\");").is_empty());
+        // a relative URL names no route the router declares
+        assert!(ts_consumes("fetch(\"users\");").is_empty());
     }
 
     #[test]

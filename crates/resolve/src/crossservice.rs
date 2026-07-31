@@ -20,6 +20,10 @@ const CONF_GRAPHQL_CONTEXT: f32 = 0.5;
 const CONF_QUALIFIED_CALL: f32 = 0.9;
 const CONF_DB_QUERY: f32 = 0.85; // function → Ecto schema reference
 const CONF_IMPORTED_CALL: f32 = 0.9; // bare call resolved through an explicit `import`
+/// A consumer key matching a declared endpoint, before the match quality and how
+/// much of the path was literal are applied. Same band as a matched GraphQL
+/// operation: both sides wrote the route down, and the two spellings agree.
+const CONF_ENDPOINT: f32 = 0.9;
 
 pub struct CrossEdges {
     pub edges: Vec<Edge>,
@@ -39,6 +43,8 @@ pub struct CrossEdges {
     /// distinct producer keys no consumer ever reached — a schema field, route or
     /// topic that nothing calls, or one whose callers ripple cannot see yet
     pub unused_providers: usize,
+    /// consumer→handler edges across a non-GraphQL boundary (HTTP today)
+    pub endpoints: usize,
 }
 
 /// Link cross-service edges from the per-file facts already on each `CachedFile`.
@@ -435,7 +441,69 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
         }
     }
 
-    let declared: HashSet<&ir::RouteKey> = producer.keys().chain(context_producer.keys()).collect();
+    // ── every other transport: one pass, no framework ──
+    //
+    // A detector emitted `Provides` and `Consumes` keyed the same way; all that is
+    // left is a lookup. Adding Express or FastAPI adds a detector, not a branch
+    // here — that is what phases 1 and 2 were for.
+    let mut endpoints_idx: RouteIndex<SymbolId> = RouteIndex::default();
+    for f in files {
+        for p in &f.extract.cross.provides {
+            if p.key.transport == ir::Transport::Graphql {
+                continue; // its own protocol pass above, with scope expansion
+            }
+            let handler = match &p.handler {
+                cross::HandlerRef::Function { module, name } => fqn_to_module
+                    .get(module.as_str())
+                    .into_iter()
+                    .flatten()
+                    .find_map(|file| fn_by_loc.get(&(*file, name.as_str())).copied()),
+                cross::HandlerRef::Module(module) => fqn_to_module
+                    .get(module.as_str())
+                    .and_then(|files| files.first())
+                    .map(|file| SymbolId::module(file)),
+            };
+            if let Some(handler) = handler {
+                endpoints_idx.insert(p.key.clone(), handler);
+            }
+        }
+    }
+
+    let mut endpoints = 0;
+    for f in files {
+        let empty = Vec::new();
+        let spans = fn_spans.get(f.module_path.as_str()).unwrap_or(&empty);
+        for c in &f.extract.cross.consumes {
+            let hits = endpoints_idx.matches(&c.key);
+            if hits.is_empty() {
+                unmatched_consumers += 1;
+                continue;
+            }
+            matched.insert(c.key.clone());
+            let (caller, grain) = caller_at(spans, &f.module_path, c.line);
+            let kind = match c.key.transport {
+                ir::Transport::PubSub => EdgeKind::AsyncCall,
+                ir::Transport::Db => EdgeKind::DbQuery,
+                _ => EdgeKind::HttpCall,
+            };
+            let n = hits.len() as f32;
+            for (target, quality) in hits {
+                // how well the key matched, then how much of the path the consumer
+                // actually spelled: `/api/${a}/${b}` pins less than `/api/users`
+                let conf = quality.confidence(CONF_ENDPOINT) * (0.5 + 0.5 * c.confidence_hint) / n;
+                if emit(&mut edges, caller, *target, kind, conf, c.line) {
+                    endpoints += 1;
+                    file_granular += usize::from(grain == Granularity::File);
+                }
+            }
+        }
+    }
+
+    let declared: HashSet<&ir::RouteKey> = producer
+        .keys()
+        .chain(context_producer.keys())
+        .chain(endpoints_idx.keys())
+        .collect();
     let unused_providers = declared.iter().filter(|k| !matched.contains(**k)).count();
 
     CrossEdges {
@@ -447,6 +515,7 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
         imported,
         unmatched_consumers,
         unused_providers,
+        endpoints,
     }
 }
 
