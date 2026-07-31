@@ -34,6 +34,10 @@ Flags shared by nearly every command:
 Builds the graph and writes it to `<root>/.ripple/graph.redb`. Defaults to `.` when no
 path is given.
 
+Languages: TypeScript, TSX, Python, Rust, Elixir, Go, Gleam, GraphQL. Go and Gleam
+need `--calls lsp` for their call graph; the rest resolve calls from the source.
+OpenAPI and Swagger documents are read too — as endpoint declarations, not as code.
+
 Pass **several paths** to index separate repositories as one graph — this is how
 cross-repo tracing works, and it is the only way to get it, since git co-change cannot
 bridge two histories. Module paths are namespaced per root so identical relative paths in

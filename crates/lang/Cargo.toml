@@ -15,6 +15,7 @@ tree-sitter-graphql = { workspace = true }
 tree-sitter-rust = { workspace = true }
 tree-sitter-go = { workspace = true }
 tree-sitter-gleam = { workspace = true }
+tree-sitter-python = { workspace = true }
 
 [dev-dependencies]
 streaming-iterator = "0.1"

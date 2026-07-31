@@ -1070,3 +1070,48 @@ fn a_typescript_fetch_reaches_the_route_it_calls() {
         conf(create)
     );
 }
+
+/// Python, Tier 0–2: a dotted import resolves to a file in the repository, an
+/// alias binds the local name, a relative import walks from the importer, and a
+/// method is qualified by its class so two `send`s stay apart.
+#[test]
+fn python_imports_and_methods_resolve() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/python");
+    let r = resolve::build(&root).unwrap();
+
+    let helper = SymbolId::of("pkg/util.py", "helper");
+    let run = SymbolId::of("app.py", "run");
+    let wrapper = SymbolId::of("sibling.py", "wrapper");
+    let client_send = SymbolId::of("pkg/util.py", "Client.send");
+    let server_send = SymbolId::of("pkg/util.py", "Server.send");
+
+    assert_ne!(
+        client_send, server_send,
+        "a method is qualified by its class"
+    );
+    assert!(
+        r.edges
+            .iter()
+            .any(|e| e.src == run && e.dst == helper && e.kind == EdgeKind::Calls),
+        "`from pkg.util import helper` should resolve across files"
+    );
+    assert!(
+        r.edges
+            .iter()
+            .any(|e| e.src == wrapper && e.dst == run && e.kind == EdgeKind::Calls),
+        "`from .app import run` should resolve relative to the importer"
+    );
+    // `Client as Api` binds the alias; the import edge still points at the class
+    let class = SymbolId::of("pkg/util.py", "Client");
+    assert!(
+        r.edges
+            .iter()
+            .any(|e| e.dst == class && e.kind == EdgeKind::Imports),
+        "an aliased import still imports the symbol it renames"
+    );
+    // a call inside a method reaches a module-level function in the same file
+    assert!(r
+        .edges
+        .iter()
+        .any(|e| e.src == client_send && e.dst == helper && e.kind == EdgeKind::Calls));
+}
