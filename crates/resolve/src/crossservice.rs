@@ -5,6 +5,7 @@
 //! `lang::cross`. See docs/10-cross-service-resolution.md.
 
 use ir::{Edge, EdgeKind, EdgeSource, Node, NodeKind, Span, SymbolId};
+use lang::cross;
 use parse::CachedFile;
 use std::collections::{HashMap, HashSet};
 
@@ -14,14 +15,16 @@ const CONF_GRAPHQL: f32 = 0.9; // TS operation ↔ Absinthe resolver, name-match
 /// than a named resolver because it is one level coarser: the field is served by that
 /// module, but which function serves it is not written anywhere.
 const CONF_GRAPHQL_CONTEXT: f32 = 0.5;
-const CONF_ELIXIR_CALL: f32 = 0.9; // resolved remote call (alias → module → fn)
+/// A call that names its target module, resolved through that module's FQN.
+const CONF_QUALIFIED_CALL: f32 = 0.9;
 const CONF_DB_QUERY: f32 = 0.85; // function → Ecto schema reference
 const CONF_IMPORTED_CALL: f32 = 0.9; // bare call resolved through an explicit `import`
 
 pub struct CrossEdges {
     pub edges: Vec<Edge>,
     pub graphql: usize,
-    pub elixir_calls: usize,
+    /// calls resolved through an explicit module FQN
+    pub qualified_calls: usize,
     pub db: usize,
     /// bare calls resolved through an `import`
     pub imported: usize,
@@ -84,7 +87,7 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
     // schema module FQNs (files that declared `schema "table"`)
     let mut schema_fqns: HashSet<&str> = HashSet::new();
     for f in files {
-        if f.extract.cross.elixir.as_ref().is_some_and(|e| e.is_schema) {
+        if f.extract.cross.entity_def {
             if let Some(fqns) = fqns_in_file.get(f.module_path.as_str()) {
                 schema_fqns.extend(fqns);
             }
@@ -95,9 +98,9 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
     // aggregated across all .gql files
     let mut op_fields: HashMap<String, Vec<(&str, &[String])>> = HashMap::new();
     for f in files {
-        for op in &f.extract.cross.gql_ops {
+        for op in &f.extract.cross.graphql.operations {
             op_fields
-                .entry(document_key(&op.name))
+                .entry(op.name.clone())
                 .or_default()
                 .push((op.scope.as_str(), op.path.as_slice()));
         }
@@ -106,7 +109,7 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
     // fragment name → its definition, so a spread can be expanded at link time
     let mut fragments: HashMap<&str, &lang::cross::GqlFragment> = HashMap::new();
     for f in files {
-        for fragment in &f.extract.cross.gql_fragments {
+        for fragment in &f.extract.cross.graphql.fragments {
             fragments.insert(fragment.name.as_str(), fragment);
         }
     }
@@ -115,9 +118,9 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
     // walk (363 spreads across 24 definitions on one real app).
     let mut op_spreads: HashMap<String, Vec<&lang::cross::GqlSpread>> = HashMap::new();
     for f in files {
-        for spread in &f.extract.cross.gql_spreads {
+        for spread in &f.extract.cross.graphql.spreads {
             op_spreads
-                .entry(document_key(&spread.op))
+                .entry(spread.op.clone())
                 .or_default()
                 .push(spread);
         }
@@ -126,10 +129,7 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
     // scope → scopes whose fields it includes (Absinthe `import_fields`)
     let mut includes: HashMap<&str, Vec<&str>> = HashMap::new();
     for f in files {
-        let Some(ex) = &f.extract.cross.elixir else {
-            continue;
-        };
-        for (scope, included) in &ex.scope_includes {
+        for (scope, included) in &f.extract.cross.graphql.scope_includes {
             includes
                 .entry(scope.as_str())
                 .or_default()
@@ -152,59 +152,55 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
     // fields whose resolver names a module, not a function: the edge is file-granular
     let mut context_producer: HashMap<(&str, &str), Vec<SymbolId>> = HashMap::new();
     for f in files {
-        let Some(ex) = &f.extract.cross.elixir else {
-            continue;
-        };
-        for field in &ex.fields {
+        for p in &f.extract.cross.provides {
+            let Some((declared, field)) = cross::graphql_scope_field(&p.key) else {
+                continue; // another transport; this linker only speaks GraphQL so far
+            };
             // a field is reachable under its own scope *and* under every root scope
-            // that pulls that scope in via `import_fields`
-            let mut scopes: Vec<&str> = vec![field.scope.as_str()];
-            if let Some(roots) = roots_by_scope.get(field.scope.as_str()) {
+            // that pulls that scope in via an include
+            let mut scopes: Vec<&str> = vec![declared];
+            if let Some(roots) = roots_by_scope.get(declared) {
                 scopes.extend(roots.iter().copied());
             }
-            if let Some(returns) = &field.returns {
+            if let Some(returns) = &p.returns {
                 for scope in &scopes {
-                    // the same spelling the extractor uses for a type block's scope
-                    field_type.insert((scope, field.field.as_str()), format!("object:{returns}"));
+                    // the same spelling the detector uses for a type block's scope
+                    field_type.insert((scope, field), format!("object:{returns}"));
                 }
             }
-            // `field.module` is already resolved (alias→FQN) at extraction time
-            let Some(files) = fqn_to_module.get(field.module.as_str()) else {
-                continue;
-            };
-            let ids: Vec<SymbolId> = files
-                .iter()
-                .filter_map(|file| fn_by_loc.get(&(*file, field.func.as_str())).copied())
-                .collect();
-            for scope in scopes {
-                producer
-                    .entry((scope, field.field.as_str()))
-                    .or_default()
-                    .extend(ids.iter().copied());
-            }
-        }
-        // context-module fields: no function is named, so the module node is the target
-        for field in &ex.context_fields {
-            let mut scopes: Vec<&str> = vec![field.scope.as_str()];
-            if let Some(roots) = roots_by_scope.get(field.scope.as_str()) {
-                scopes.extend(roots.iter().copied());
-            }
-            if let Some(returns) = &field.returns {
-                for scope in &scopes {
-                    field_type.insert((scope, field.field.as_str()), format!("object:{returns}"));
+            match &p.handler {
+                // the module FQN is already resolved (alias→FQN) by the detector
+                cross::HandlerRef::Function { module, name } => {
+                    let Some(hosts) = fqn_to_module.get(module.as_str()) else {
+                        continue;
+                    };
+                    let ids: Vec<SymbolId> = hosts
+                        .iter()
+                        .filter_map(|file| fn_by_loc.get(&(*file, name.as_str())).copied())
+                        .collect();
+                    for scope in scopes {
+                        producer
+                            .entry((scope, field))
+                            .or_default()
+                            .extend(ids.iter().copied());
+                    }
                 }
-            }
-            let Some(files) = fqn_to_module.get(field.module.as_str()) else {
-                continue;
-            };
-            for scope in scopes {
-                context_producer
-                    .entry((scope, field.field.as_str()))
-                    .or_default()
-                    .extend(files.iter().map(|f| SymbolId::module(f)));
+                // no function is named, so the module node is the honest target
+                cross::HandlerRef::Module(module) => {
+                    let Some(hosts) = fqn_to_module.get(module.as_str()) else {
+                        continue;
+                    };
+                    for scope in scopes {
+                        context_producer
+                            .entry((scope, field))
+                            .or_default()
+                            .extend(hosts.iter().map(|f| SymbolId::module(f)));
+                    }
+                }
             }
         }
     }
+
     for ids in context_producer.values_mut() {
         ids.sort_unstable();
         ids.dedup();
@@ -246,12 +242,12 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
     // GraphqlCall: consumer TS module → resolver
     let mut graphql = 0;
     for f in files {
-        if f.extract.cross.ts_docs.is_empty() {
+        if f.extract.cross.graphql.op_refs.is_empty() {
             continue;
         }
         let src_id = SymbolId::module(&f.module_path);
-        for op in &f.extract.cross.ts_docs {
-            let Some(fields) = op_fields.get(&document_key(op)) else {
+        for op in &f.extract.cross.graphql.op_refs {
+            let Some(fields) = op_fields.get(op.as_str()) else {
                 continue;
             };
             for (scope, path) in fields {
@@ -277,7 +273,7 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
             }
             // `...LfgPostFields` — the fragment's own type condition names the scope its
             // fields live in, so an expanded spread needs no descent
-            for spread in op_spreads.get(&document_key(op)).into_iter().flatten() {
+            for spread in op_spreads.get(op.as_str()).into_iter().flatten() {
                 expand_spread(
                     spread.fragment.as_str(),
                     &fragments,
@@ -324,10 +320,7 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
     let mut imported = 0;
     let mut file_granular = 0;
     for f in files {
-        let Some(ex) = &f.extract.cross.elixir else {
-            continue;
-        };
-        if ex.imports.is_empty() {
+        if f.extract.cross.star_imports.is_empty() {
             continue;
         }
         let empty_names = HashSet::new();
@@ -341,8 +334,10 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
             if r.kind != parse::RefKind::Call || local_names.contains(r.name.as_str()) {
                 continue; // a local definition wins; that edge already exists
             }
-            let mut targets: Vec<SymbolId> = ex
-                .imports
+            let mut targets: Vec<SymbolId> = f
+                .extract
+                .cross
+                .star_imports
                 .iter()
                 .filter_map(|fqn| fqn_to_module.get(fqn.as_str()))
                 .flatten()
@@ -369,16 +364,13 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
     }
 
     // Calls (resolver → context) + DbQuery (function → schema)
-    let mut elixir_calls = 0;
+    let mut qualified_calls = 0;
     let mut db = 0;
     for f in files {
-        let Some(ex) = &f.extract.cross.elixir else {
-            continue;
-        };
         let empty = Vec::new();
         let spans = fn_spans.get(f.module_path.as_str()).unwrap_or(&empty);
 
-        for (fqn, func, line) in &ex.remote_calls {
+        for (fqn, func, line) in &f.extract.cross.qualified_calls {
             let Some(files) = fqn_to_module.get(fqn.as_str()) else {
                 continue;
             };
@@ -389,15 +381,15 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
             targets.sort_unstable();
             targets.dedup();
             let (caller, grain) = caller_at(spans, &f.module_path, *line);
-            let conf = CONF_ELIXIR_CALL / targets.len().max(1) as f32;
+            let conf = CONF_QUALIFIED_CALL / targets.len().max(1) as f32;
             for target in targets {
                 if emit(&mut edges, caller, target, EdgeKind::Calls, conf, *line) {
-                    elixir_calls += 1;
+                    qualified_calls += 1;
                     file_granular += usize::from(grain == Granularity::File);
                 }
             }
         }
-        for (fqn, line) in &ex.schema_refs {
+        for (fqn, line) in &f.extract.cross.entity_refs {
             if !schema_fqns.contains(fqn.as_str()) {
                 continue;
             }
@@ -425,7 +417,7 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
     CrossEdges {
         edges,
         graphql,
-        elixir_calls,
+        qualified_calls,
         db,
         file_granular,
         imported,
@@ -455,20 +447,6 @@ fn roots_by_scope<'a>(includes: &HashMap<&'a str, Vec<&'a str>>) -> HashMap<&'a 
         roots.sort_unstable();
     }
     out
-}
-
-/// Join key for a GraphQL operation, from either side of the codegen boundary.
-///
-/// A document may name its operation `updateLfgRequest`; codegen emits
-/// `UpdateLfgRequestDocument`, which is what the TypeScript side references. Keying on
-/// the raw name silently lost every edge from such an operation — 11 of 242 operations
-/// on one real frontend are written lowercase-first.
-fn document_key(name: &str) -> String {
-    let mut chars = name.chars();
-    match chars.next() {
-        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-        None => String::new(),
-    }
 }
 
 /// How deep a chain of fragments spreading fragments is followed. They nest (a page

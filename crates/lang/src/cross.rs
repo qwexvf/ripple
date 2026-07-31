@@ -2,39 +2,157 @@
 //! no regex). Stored on `FileExtract` so the index parses each file once; the
 //! `resolve` layer only matches/links these facts. See docs/10-cross-service-resolution.md.
 
+use ir::{RouteKey, Segment, Transport};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use tree_sitter::Node as TsNode;
 
-/// Per-file cross-service facts. Each language fills the parts it produces.
+/// Per-file cross-service facts, in the vocabulary every detector maps onto.
+///
+/// Nothing here names a framework. A detector reads its own framework's shapes and
+/// emits `Provides`/`Consumes` keyed by `RouteKey`; the linker matches keys and
+/// never learns what produced them. That is the whole point of #32 — Absinthe used
+/// to be spelled out in `resolve`, which made adding a second framework a core
+/// change rather than a file.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct CrossFacts {
-    pub elixir: Option<ElixirFacts>,
-    /// GraphQL root fields requested by the operations in a `.gql` file.
-    pub gql_ops: Vec<GqlOp>,
-    /// TypeScript `<Name>Document` operation names referenced in the file.
-    pub ts_docs: Vec<String>,
-    /// Fragment definitions in a `.gql` file.
-    pub gql_fragments: Vec<GqlFragment>,
-    /// Fragment spreads inside operations. Most nested selections in a codegen-based
-    /// app are written in fragments, so an unexpanded spread hides them all.
-    pub gql_spreads: Vec<GqlSpread>,
+    /// Boundary endpoints this file serves: a resolver, a route handler, a topic
+    /// subscriber.
+    pub provides: Vec<Provides>,
+    /// Boundary endpoints this file calls. Empty until an HTTP/RPC consumer
+    /// detector lands (#32 phase 3) — GraphQL consumers travel as `graphql`
+    /// because a document is a protocol object, not a single key.
+    pub consumes: Vec<Consumes>,
+    /// GraphQL protocol facts: documents, fragments, scope includes, references.
+    pub graphql: GraphqlFacts,
+    /// Modules whose functions this file may call *unqualified* (Elixir's
+    /// `import`). Generic because the shape is: "names from over there are in
+    /// scope here".
+    pub star_imports: Vec<String>,
+    /// Calls that name their target module: (module FQN, function, line).
+    pub qualified_calls: Vec<(String, String, u32)>,
+    /// References to a persisted entity: (entity module FQN, line).
+    pub entity_refs: Vec<(String, u32)>,
+    /// This file declares a persisted entity (an Ecto `schema`, an ORM model).
+    pub entity_def: bool,
 }
 
 impl CrossFacts {
     pub fn is_empty(&self) -> bool {
-        self.elixir.is_none()
-            && self.gql_ops.is_empty()
-            && self.ts_docs.is_empty()
-            && self.gql_fragments.is_empty()
+        self.provides.is_empty()
+            && self.consumes.is_empty()
+            && self.graphql.is_empty()
+            && self.star_imports.is_empty()
+            && self.qualified_calls.is_empty()
+            && self.entity_refs.is_empty()
+            && !self.entity_def
+    }
+}
+
+/// What serves a boundary key: a named function, or — when the framework names no
+/// single function — the module that answers for it. Module granularity is worth
+/// less than a function and is priced that way, but it is not nothing: 138 of 142
+/// dataloader resolvers on one real schema name only a module.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HandlerRef {
+    Function { module: String, name: String },
+    Module(String),
+}
+
+/// One endpoint this file serves.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Provides {
+    pub key: RouteKey,
+    pub handler: HandlerRef,
+    /// For transports with a type graph (GraphQL): what this field returns, as the
+    /// schema spells it, so a nested selection can be descended. `None` elsewhere.
+    pub returns: Option<String>,
+}
+
+/// One endpoint this file calls.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Consumes {
+    pub key: RouteKey,
+    pub line: u32,
+    /// How much of the key was literal. A `fetch(`/api/${id}`)` pins less than a
+    /// fully spelled path, and the linker prices the edge accordingly.
+    pub confidence_hint: f32,
+}
+
+/// GraphQL travels as a protocol rather than as bare keys: a document names
+/// operations, operations spread fragments, and a schema pulls fields between
+/// scopes. All of it is wire-format — no framework names.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct GraphqlFacts {
+    /// Root fields requested by the operations in a document.
+    pub operations: Vec<GqlOp>,
+    /// Fragment definitions.
+    pub fragments: Vec<GqlFragment>,
+    /// Fragment spreads inside operations. Most nested selections in a
+    /// codegen-based app are written in fragments, so an unexpanded spread hides
+    /// them all.
+    pub spreads: Vec<GqlSpread>,
+    /// `(importing scope, included scope)` — a schema declaring root fields in one
+    /// block and pulling them into another. Resolved at link time because the
+    /// included block usually lives in another file.
+    pub scope_includes: Vec<(String, String)>,
+    /// Operation names referenced from code (codegen's `<Name>Document`).
+    pub op_refs: Vec<String>,
+}
+
+impl GraphqlFacts {
+    pub fn is_empty(&self) -> bool {
+        self.operations.is_empty()
+            && self.fragments.is_empty()
+            && self.spreads.is_empty()
+            && self.scope_includes.is_empty()
+            && self.op_refs.is_empty()
+    }
+}
+
+/// The wire spelling of an operation name.
+///
+/// Codegen writes `query currentPlayer` as `CurrentPlayerDocument`, so the document
+/// and the code that references it disagree on the first letter. Both sides
+/// normalize here, at extraction — the linker compares wire names and never learns
+/// that a casing convention exists (#32). Keying on the raw name lost 11 of 242
+/// operations on one real frontend.
+pub fn operation_key(name: &str) -> String {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+/// The key a GraphQL field is served and requested under: its scope, then its
+/// name. One function so the producer and the consumer cannot spell it differently
+/// — they used to be two tuple literals in two crates.
+pub fn graphql_field_key(scope: &str, field: &str) -> RouteKey {
+    RouteKey {
+        transport: Transport::Graphql,
+        method: None,
+        path: vec![
+            Segment::Literal(scope.to_owned()),
+            Segment::Literal(field.to_owned()),
+        ],
+    }
+}
+
+/// Read a GraphQL key back as `(scope, field)`. `None` for any other shape.
+pub fn graphql_scope_field(key: &RouteKey) -> Option<(&str, &str)> {
+    match (key.transport, key.path.as_slice()) {
+        (Transport::Graphql, [Segment::Literal(scope), Segment::Literal(field)]) => {
+            Some((scope, field))
+        }
+        _ => None,
     }
 }
 
 /// One root field of one GraphQL operation — the consumer side of the join.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GqlOp {
-    /// Operation name (`query GetPlayer` → `GetPlayer`); codegen turns this into
-    /// `GetPlayerDocument`, which is what `ts_docs` sees.
+    /// Operation name in wire spelling (`operation_key`), so it matches the name
+    /// the consuming code references however the document spelled it.
     pub name: String,
     /// Root scope the field is selected on: `query` | `mutation` | `subscription`.
     /// Part of the join key — a `player` mutation must not match a `player` query.
@@ -75,67 +193,9 @@ pub struct GqlSpread {
     pub fragment: String,
 }
 
-/// A field served by a *context module* rather than a named function —
-/// `resolve: dataloader(App.Teams)`. 138 of 142 dataloader resolvers on one real
-/// schema, so leaving them out left most type-level fields unreachable; but no single
-/// function is named, so the honest target is the module.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AbsintheContextField {
-    pub scope: String,
-    pub field: String,
-    /// Context module FQN — alias-resolved at extraction.
-    pub module: String,
-    pub returns: Option<String>,
-}
-
-/// An Absinthe `field` with a resolver — the producer side of the join.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AbsintheField {
-    /// Enclosing block: `query`/`mutation`/`subscription` for a root operation
-    /// field, `object:<name>` for a field on a named type. Field names are only
-    /// unique *within* a type, so the scope must be part of the join key —
-    /// keying on the field name alone lets `Player.name` and `Team.name` collide.
-    pub scope: String,
-    /// camelCase field name (Absinthe `LanguageConventions` default).
-    pub field: String,
-    /// Resolver module FQN — alias-resolved at extraction.
-    pub module: String,
-    pub func: String,
-    /// The type this field returns, as the schema names it (`:player`,
-    /// `list_of(:lfg_post)` → `lfg_post`). What makes descending a nested selection
-    /// possible: the parent field's type is the scope its children are declared in.
-    /// `None` when the type isn't a plain atom — under-link rather than guess.
-    pub returns: Option<String>,
-}
-
-/// Absinthe root scopes. A GraphQL document's root field can only name a field
+/// Root scopes a GraphQL document's operation can name. A root field must be
 /// declared in (or imported into) one of these.
 pub const GQL_ROOT_SCOPES: [&str; 3] = ["query", "mutation", "subscription"];
-
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub struct ElixirFacts {
-    /// local alias name → module FQN
-    pub aliases: HashMap<String, String>,
-    /// the file declares a DB entity (`schema "table"`)
-    pub is_schema: bool,
-    /// Absinthe fields that declare a resolver.
-    pub fields: Vec<AbsintheField>,
-    /// Absinthe fields served by a context module (`resolve: dataloader(Mod)`).
-    pub context_fields: Vec<AbsintheContextField>,
-    /// `import_fields(:other)` — (importing scope, included scope). Absinthe
-    /// schemas normally declare root fields in `object :x_queries` blocks and
-    /// pull them into `query do` this way, so the includes must be followed to
-    /// know which fields are root fields. Resolved at link time because the
-    /// included object usually lives in another file.
-    pub scope_includes: Vec<(String, String)>,
-    /// `import Mod` — module FQNs whose functions this file may call *unqualified*.
-    /// Elixir's `import` is why a bare call can cross a module boundary at all.
-    pub imports: Vec<String>,
-    /// remote calls (target module **FQN**, func, line)
-    pub remote_calls: Vec<(String, String, u32)>,
-    /// DB entity references (entity module **FQN**, line)
-    pub schema_refs: Vec<(String, u32)>,
-}
 
 fn text<'a>(n: TsNode, src: &'a [u8]) -> &'a str {
     n.utf8_text(src).unwrap_or("")
@@ -149,7 +209,7 @@ pub fn typescript(root: TsNode, src: &[u8]) -> CrossFacts {
         if n.kind() == "identifier" {
             if let Some(op) = text(n, src).strip_suffix("Document") {
                 if !op.is_empty() {
-                    docs.insert(op.to_owned());
+                    docs.insert(operation_key(op));
                 }
             }
         }
@@ -158,10 +218,13 @@ pub fn typescript(root: TsNode, src: &[u8]) -> CrossFacts {
             stack.push(ch);
         }
     }
-    let mut ts_docs: Vec<String> = docs.into_iter().collect();
-    ts_docs.sort();
+    let mut op_refs: Vec<String> = docs.into_iter().collect();
+    op_refs.sort();
     CrossFacts {
-        ts_docs,
+        graphql: GraphqlFacts {
+            op_refs,
+            ..Default::default()
+        },
         ..Default::default()
     }
 }
@@ -192,7 +255,7 @@ impl Sink<'_> {
     fn field(&mut self, path: &[String], name: &str) {
         match self {
             Sink::Operation { op, scope, ops, .. } => ops.push(GqlOp {
-                name: (*op).to_owned(),
+                name: operation_key(op),
                 scope: (*scope).to_owned(),
                 field: name.to_owned(),
                 path: path.to_vec(),
@@ -206,7 +269,7 @@ impl Sink<'_> {
             Sink::Operation {
                 op, scope, spreads, ..
             } => spreads.push(GqlSpread {
-                op: (*op).to_owned(),
+                op: operation_key(op),
                 scope: (*scope).to_owned(),
                 at: path.to_vec(),
                 fragment: fragment.to_owned(),
@@ -294,7 +357,7 @@ fn collect_gql(node: TsNode, src: &[u8], out: &mut CrossFacts) {
                 spreads: &mut fragment.spreads,
             };
             collect_selections(*set, src, &mut Vec::new(), &mut sink);
-            out.gql_fragments.push(fragment);
+            out.graphql.fragments.push(fragment);
         }
     }
     if node.kind() == "operation_definition" {
@@ -315,8 +378,8 @@ fn collect_gql(node: TsNode, src: &[u8], out: &mut CrossFacts) {
             let mut sink = Sink::Operation {
                 op: &op,
                 scope,
-                ops: &mut out.gql_ops,
-                spreads: &mut out.gql_spreads,
+                ops: &mut out.graphql.operations,
+                spreads: &mut out.graphql.spreads,
             };
             collect_selections(set, src, &mut Vec::new(), &mut sink);
         }
@@ -390,9 +453,27 @@ mod tests {
         assert_eq!(camelize("player"), "player");
     }
 
-    fn elixir_facts_of(src: &str) -> ElixirFacts {
+    fn elixir_facts_of(src: &str) -> CrossFacts {
         let t = parse(crate::elixir::Adapter::new().grammar(), src);
-        elixir(t.root_node(), src.as_bytes()).elixir.unwrap()
+        elixir(t.root_node(), src.as_bytes())
+    }
+
+    /// `(scope, field, handler)` for every GraphQL field a file provides.
+    fn provided(f: &CrossFacts) -> Vec<(&str, &str, &HandlerRef)> {
+        f.provides
+            .iter()
+            .filter_map(|p| {
+                let (scope, field) = graphql_scope_field(&p.key)?;
+                Some((scope, field, &p.handler))
+            })
+            .collect()
+    }
+
+    fn function(module: &str, name: &str) -> HandlerRef {
+        HandlerRef::Function {
+            module: module.into(),
+            name: name.into(),
+        }
     }
 
     /// Every entity argument counts as a reference, not just the first: a joined
@@ -402,7 +483,7 @@ mod tests {
     #[test]
     fn data_refs_cover_every_entity_argument() {
         let f = elixir_facts_of("defmodule S do\n  def q(id) do\n    from p in Player, join: t in Team, where: p.id == ^id\n    Repo.preload(p, Game)\n    Repo.get(Player, id)\n  end\nend\n");
-        let refs: Vec<&str> = f.schema_refs.iter().map(|(m, _)| m.as_str()).collect();
+        let refs: Vec<&str> = f.entity_refs.iter().map(|(m, _)| m.as_str()).collect();
         for entity in ["Player", "Team", "Game"] {
             assert!(refs.contains(&entity), "missing {entity} in {refs:?}");
         }
@@ -411,22 +492,21 @@ mod tests {
     #[test]
     fn elixir_facts() {
         let f = elixir_facts_of("defmodule S do\n  alias App.Resolvers.PlayerResolver\n  query do\n    field :current_player, :player do\n      resolve(&PlayerResolver.me/3)\n    end\n  end\n  def show(a) do\n    Players.get_player(a)\n    Repo.get(Player, a)\n    from p in Team\n    %Role{}\n  end\nend\n");
-        // fields carry the RESOLVED FQN (alias expanded at extraction), not the alias
+        // a provider carries the RESOLVED FQN (alias expanded at extraction)
         assert_eq!(
-            f.fields,
-            vec![AbsintheField {
-                scope: "query".into(),
-                field: "currentPlayer".into(),
-                module: "App.Resolvers.PlayerResolver".into(),
-                func: "me".into(),
-                returns: Some("player".into()),
-            }]
+            provided(&f),
+            vec![(
+                "query",
+                "currentPlayer",
+                &function("App.Resolvers.PlayerResolver", "me")
+            )]
         );
+        assert_eq!(f.provides[0].returns.as_deref(), Some("player"));
         assert!(f
-            .remote_calls
+            .qualified_calls
             .iter()
             .any(|(m, fu, _)| m == "Players" && fu == "get_player"));
-        let schemas: Vec<&str> = f.schema_refs.iter().map(|(m, _)| m.as_str()).collect();
+        let schemas: Vec<&str> = f.entity_refs.iter().map(|(m, _)| m.as_str()).collect();
         assert!(
             schemas.contains(&"Player") && schemas.contains(&"Team") && schemas.contains(&"Role")
         );
@@ -437,14 +517,12 @@ mod tests {
     fn absinthe_keyword_form_resolve() {
         let f = elixir_facts_of("defmodule S do\n  mutation do\n    field :follow_player, :player, resolve: &PlayerResolver.follow/3\n  end\nend\n");
         assert_eq!(
-            f.fields,
-            vec![AbsintheField {
-                scope: "mutation".into(),
-                field: "followPlayer".into(),
-                module: "PlayerResolver".into(),
-                func: "follow".into(),
-                returns: Some("player".into()),
-            }]
+            provided(&f),
+            vec![(
+                "mutation",
+                "followPlayer",
+                &function("PlayerResolver", "follow")
+            )]
         );
     }
 
@@ -452,19 +530,24 @@ mod tests {
     #[test]
     fn absinthe_scope_separates_same_named_fields() {
         let f = elixir_facts_of("defmodule S do\n  query do\n    field :name, :string, resolve: &Root.name/3\n  end\n  object :player do\n    field :name, :string, resolve: &Player.name/3\n  end\nend\n");
-        let scopes: Vec<(&str, &str)> = f
-            .fields
-            .iter()
-            .map(|a| (a.scope.as_str(), a.module.as_str()))
+        let scopes: Vec<(&str, &HandlerRef)> = provided(&f)
+            .into_iter()
+            .map(|(scope, _, handler)| (scope, handler))
             .collect();
-        assert_eq!(scopes, vec![("query", "Root"), ("object:player", "Player")]);
+        assert_eq!(
+            scopes,
+            vec![
+                ("query", &function("Root", "name")),
+                ("object:player", &function("Player", "name")),
+            ]
+        );
     }
 
     #[test]
     fn absinthe_import_fields() {
         let f = elixir_facts_of("defmodule S do\n  query do\n    import_fields(:player_queries)\n  end\n  mutation do\n    import_fields :player_mutations\n  end\nend\n");
         assert_eq!(
-            f.scope_includes,
+            f.graphql.scope_includes,
             vec![
                 ("query".into(), "object:player_queries".into()),
                 ("mutation".into(), "object:player_mutations".into()),
@@ -477,10 +560,23 @@ mod tests {
     #[test]
     fn absinthe_non_function_resolvers_are_dropped() {
         let f = elixir_facts_of("defmodule S do\n  object :player do\n    field :team, :team, resolve: dataloader(App.Teams)\n    field :rank, :integer, resolve: fn p, _, _ -> Stats.rank(p) end\n  end\n  schema \"players\" do\n    field :name, :string\n  end\nend\n");
-        assert!(f.fields.is_empty(), "unexpected fields: {:?}", f.fields);
-        // the inline fn's body is still visible as a remote call
+        let named: Vec<_> = provided(&f)
+            .into_iter()
+            .filter(|(_, _, h)| matches!(h, HandlerRef::Function { .. }))
+            .collect();
+        assert!(named.is_empty(), "unexpected named resolvers: {named:?}");
+        // the dataloader field is still served, one level coarser
+        assert_eq!(
+            provided(&f),
+            vec![(
+                "object:player",
+                "team",
+                &HandlerRef::Module("App.Teams".into())
+            )]
+        );
+        // the inline fn's body is still visible as a qualified call
         assert!(f
-            .remote_calls
+            .qualified_calls
             .iter()
             .any(|(m, fu, _)| m == "Stats" && fu == "rank"));
     }
@@ -489,19 +585,14 @@ mod tests {
     fn elixir_schema_decl() {
         let src = "defmodule Player do\n  use Ecto.Schema\n  schema \"players\" do\n  end\nend\n";
         let t = parse(crate::elixir::Adapter::new().grammar(), src);
-        assert!(
-            elixir(t.root_node(), src.as_bytes())
-                .elixir
-                .unwrap()
-                .is_schema
-        );
+        assert!(elixir(t.root_node(), src.as_bytes()).entity_def);
     }
 
     #[test]
     fn gql_facts() {
         let src = "query Player($id: ID) { player(playerId: $id) { name } }\nmutation Follow { followPlayer { id } }\n";
         let t = parse(crate::graphql_language(), src);
-        let ops = graphql(t.root_node(), src.as_bytes()).gql_ops;
+        let ops = graphql(t.root_node(), src.as_bytes()).graphql.operations;
         // a nested selection is a field on another type with a resolver of its own, so
         // it is reported with the path that reaches it (issue #22)
         let seen: Vec<(&str, &str, Vec<&str>)> = ops
@@ -529,7 +620,7 @@ mod tests {
     fn ts_facts() {
         let src = "import { PlayerDocument, TeamDocument } from \"@/g\";\nuseQuery({query: PlayerDocument});\n";
         let t = parse(crate::typescript::Adapter::new().grammar(), src);
-        let docs = typescript(t.root_node(), src.as_bytes()).ts_docs;
+        let docs = typescript(t.root_node(), src.as_bytes()).graphql.op_refs;
         assert!(docs.contains(&"Player".to_string()) && docs.contains(&"Team".to_string()));
     }
 }

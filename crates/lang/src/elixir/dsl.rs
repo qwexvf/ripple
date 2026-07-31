@@ -7,7 +7,7 @@
 
 use super::macros::{FunRef, MacroCall, Scan};
 use crate::cross::{
-    camelize, AbsintheContextField, AbsintheField, CrossFacts, ElixirFacts, GQL_ROOT_SCOPES,
+    camelize, graphql_field_key, CrossFacts, HandlerRef, Provides, GQL_ROOT_SCOPES,
 };
 use std::collections::HashMap;
 
@@ -52,30 +52,24 @@ const ECTO: DataDsl = DataDsl {
 /// Project a generic macro scan onto the cross-service facts the resolve layer
 /// joins on.
 pub fn cross_facts(scan: &Scan) -> CrossFacts {
-    let mut f = ElixirFacts {
-        aliases: scan.aliases.clone(),
-        ..Default::default()
-    };
+    let mut f = CrossFacts::default();
     schema_facts(scan, &ABSINTHE, &mut f);
     data_facts(scan, &ECTO, &mut f);
-    f.imports = scan
+    f.star_imports = scan
         .calls
         .iter()
         .filter(|c| c.name == "import")
         .flat_map(|c| c.modules.iter().cloned())
         .collect();
-    f.remote_calls = scan
+    f.qualified_calls = scan
         .remote_calls
         .iter()
         .map(|rc| (rc.module.clone(), rc.func.clone(), rc.line))
         .collect();
-    CrossFacts {
-        elixir: Some(f),
-        ..Default::default()
-    }
+    f
 }
 
-fn schema_facts(scan: &Scan, dsl: &SchemaDsl, out: &mut ElixirFacts) {
+fn schema_facts(scan: &Scan, dsl: &SchemaDsl, out: &mut CrossFacts) {
     // block-form resolvers are their own macro call inside the member's block, so
     // index them by the scope chain they sit in. A scope can hold more than one
     // (two `resolve` calls in one field): keep them all, because last-write-wins
@@ -96,7 +90,7 @@ fn schema_facts(scan: &Scan, dsl: &SchemaDsl, out: &mut ElixirFacts) {
         };
         if call.name == dsl.include {
             if let Some(atom) = call.atoms.first() {
-                out.scope_includes.push((scope, type_scope(atom)));
+                out.graphql.scope_includes.push((scope, type_scope(atom)));
             }
             continue;
         }
@@ -115,20 +109,17 @@ fn schema_facts(scan: &Scan, dsl: &SchemaDsl, out: &mut ElixirFacts) {
             // no named function, but a context module is still an answer: a
             // `dataloader(Mod)` field is served by Mod, one level coarser
             if let Some(module) = context_of(call, dsl) {
-                out.context_fields.push(AbsintheContextField {
-                    scope,
-                    field: camelize(atom),
-                    module,
+                out.provides.push(Provides {
+                    key: graphql_field_key(&scope, &camelize(atom)),
+                    handler: HandlerRef::Module(module),
                     returns,
                 });
             }
             continue;
         };
-        out.fields.push(AbsintheField {
-            scope,
-            field: camelize(atom),
-            module,
-            func,
+        out.provides.push(Provides {
+            key: graphql_field_key(&scope, &camelize(atom)),
+            handler: HandlerRef::Function { module, name: func },
             // `field :author, :player` → the second atom; `list_of(:lfg_post)` puts it
             // one level in. Anything else stays None rather than being guessed at.
             returns,
@@ -183,24 +174,24 @@ fn type_scope(atom: &str) -> String {
     format!("object:{atom}")
 }
 
-fn data_facts(scan: &Scan, dsl: &DataDsl, out: &mut ElixirFacts) {
-    out.is_schema = scan
+fn data_facts(scan: &Scan, dsl: &DataDsl, out: &mut CrossFacts) {
+    out.entity_def = scan
         .calls
         .iter()
         .any(|c| c.name == dsl.entity && !c.strings.is_empty());
 
-    out.schema_refs = scan.struct_refs.clone();
+    out.entity_refs = scan.struct_refs.clone();
     for call in scan
         .calls
         .iter()
         .filter(|c| dsl.queries.contains(&&*c.name))
     {
-        out.schema_refs
+        out.entity_refs
             .extend(call.modules.iter().map(|m| (m.clone(), call.line)));
     }
     for rc in &scan.remote_calls {
         if rc.module.rsplit('.').next() == Some(dsl.repo) {
-            out.schema_refs
+            out.entity_refs
                 .extend(rc.modules.iter().map(|m| (m.clone(), rc.line)));
         }
     }
@@ -211,13 +202,26 @@ mod tests {
     use super::*;
     use crate::LanguageAdapter;
 
-    fn fields(src: &str) -> Vec<AbsintheField> {
+    /// `(field name, module, function)` for every field a named resolver serves.
+    fn fields(src: &str) -> Vec<(String, String, String)> {
         let mut p = tree_sitter::Parser::new();
         p.set_language(&crate::elixir::Adapter::new().grammar())
             .expect("elixir grammar");
         let tree = p.parse(src, None).expect("parse");
         let scan = super::super::macros::scan(tree.root_node(), src.as_bytes());
-        cross_facts(&scan).elixir.expect("elixir facts").fields
+        cross_facts(&scan)
+            .provides
+            .iter()
+            .filter_map(|p| {
+                let (_, field) = crate::cross::graphql_scope_field(&p.key)?;
+                match &p.handler {
+                    HandlerRef::Function { module, name } => {
+                        Some((field.to_owned(), module.clone(), name.clone()))
+                    }
+                    HandlerRef::Module(_) => None,
+                }
+            })
+            .collect()
     }
 
     #[test]
@@ -226,9 +230,9 @@ mod tests {
             "defmodule S do\n  alias App.PlayerResolver\n  query do\n    field :current_player, :player do\n      resolve(&PlayerResolver.current/3)\n    end\n  end\nend\n",
         );
         assert_eq!(f.len(), 1);
-        assert_eq!(f[0].field, "currentPlayer");
-        assert_eq!(f[0].module, "App.PlayerResolver");
-        assert_eq!(f[0].func, "current");
+        assert_eq!(f[0].0, "currentPlayer");
+        assert_eq!(f[0].1, "App.PlayerResolver");
+        assert_eq!(f[0].2, "current");
     }
 
     #[test]
@@ -250,6 +254,6 @@ mod tests {
             "defmodule S do\n  alias App.PlayerResolver\n  query do\n    field :current_player, :player do\n      resolve(&PlayerResolver.current/3)\n      resolve(&PlayerResolver.current/3)\n    end\n  end\nend\n",
         );
         assert_eq!(f.len(), 1, "one distinct target is still one answer");
-        assert_eq!(f[0].func, "current");
+        assert_eq!(f[0].2, "current");
     }
 }
