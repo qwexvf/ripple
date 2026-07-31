@@ -50,6 +50,14 @@ The `parse` layer reads the capture prefix (`def.function` → `NodeKind::Functi
 | `ref.call` / `ref.use` (in `refs.scm`) | `Calls` / `References` edge (resolved via scoping) |
 | `@name` | the symbol name within a `@def.*` |
 
+Predicates: `#eq?`, `#not-eq?`, `#any-of?`, `#not-any-of?`, `#match?` and
+`#not-match?` are evaluated. Anything else is **rejected when the query is
+compiled** rather than ignored at match time — an unevaluated predicate passes,
+so a query that filters on one silently matches everything. That is not
+hypothetical: the JSX capitalisation filter spent months matching every `<div>`,
+and the edges it invented only showed up when a codebase had a function named
+`main`.
+
 Test convention is the other piece of language knowledge here, and it comes in two
 shapes because one doesn't cover the other. By path — `*.test.ts`, `*_test.go`,
 `test/**` — it is `LanguageAdapter::is_test_path`, a string predicate. Inside the

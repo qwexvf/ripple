@@ -302,6 +302,7 @@ dependencies = [
  "blake3",
  "ir",
  "lang",
+ "regex",
  "serde",
  "streaming-iterator",
  "tree-sitter",

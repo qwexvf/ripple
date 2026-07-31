@@ -132,19 +132,102 @@ pub struct FileExtract {
 /// query dominated indexing before this. `Query` is `Sync`, so a shared `&Queries`
 /// is safe across rayon threads.
 pub struct Queries {
-    tags: Query,
-    imports: Option<Query>,
-    refs: Option<Query>,
-    bindings: Option<Query>,
+    tags: Matcher,
+    imports: Option<Matcher>,
+    refs: Option<Matcher>,
+    bindings: Option<Matcher>,
+}
+
+/// Predicates this engine actually evaluates. Anything else is refused at compile
+/// time rather than ignored at match time: `predicates_hold` treats an unknown
+/// operator as *passing*, so a query that filters on one silently matches
+/// everything. That is how a `#match?` guarding JSX element names spent months
+/// filtering nothing (#51), and how a `#match?` on `#[cfg(test)]` would have
+/// marked every module in a repository as tests.
+const SUPPORTED_PREDICATES: [&str; 6] = [
+    "eq?",
+    "not-eq?",
+    "any-of?",
+    "not-any-of?",
+    "match?",
+    "not-match?",
+];
+
+/// A `#match?` compiled once, at query-compile time.
+///
+/// Compiling the regex per match would put it in the hot loop; a query is compiled
+/// once per language per index, so this is where it belongs.
+struct RegexPred {
+    pattern_index: usize,
+    capture: u32,
+    negated: bool,
+    regex: regex::Regex,
+}
+
+/// A query plus the regex predicates the engine has to evaluate itself.
+struct Matcher {
+    query: Query,
+    regexes: Vec<RegexPred>,
+}
+
+impl Matcher {
+    fn compile(src: &str, lang: &tree_sitter::Language, what: &str, id: &str) -> Result<Matcher> {
+        let query =
+            Query::new(lang, src).with_context(|| format!("invalid {what} query for {id}"))?;
+        let mut regexes = Vec::new();
+        for pattern_index in 0..query.pattern_count() {
+            for pred in query.general_predicates(pattern_index) {
+                let op = &*pred.operator;
+                if !SUPPORTED_PREDICATES.contains(&op) {
+                    anyhow::bail!(
+                        "{what} for {id} uses #{op}, which this engine does not evaluate — \
+                         it would match everything. Supported: {}",
+                        SUPPORTED_PREDICATES.join(", ")
+                    );
+                }
+                if op != "match?" && op != "not-match?" {
+                    continue;
+                }
+                let [QueryPredicateArg::Capture(capture), QueryPredicateArg::String(pattern)] =
+                    &pred.args[..]
+                else {
+                    anyhow::bail!("{what} for {id}: #{op} wants a capture and a pattern");
+                };
+                regexes.push(RegexPred {
+                    pattern_index,
+                    capture: *capture,
+                    negated: op == "not-match?",
+                    regex: regex::Regex::new(pattern)
+                        .with_context(|| format!("{what} for {id}: bad regex {pattern}"))?,
+                });
+            }
+        }
+        Ok(Matcher { query, regexes })
+    }
+
+    /// Does every regex predicate on this match's pattern hold?
+    fn regexes_hold(&self, m: &QueryMatch, src: &[u8]) -> bool {
+        self.regexes
+            .iter()
+            .filter(|r| r.pattern_index == m.pattern_index)
+            .all(|r| {
+                let text = m
+                    .captures
+                    .iter()
+                    .find(|c| c.index == r.capture)
+                    .and_then(|c| c.node.utf8_text(src).ok());
+                match text {
+                    Some(text) => r.regex.is_match(text) != r.negated,
+                    None => true, // the capture is not in this match; nothing to judge
+                }
+            })
+    }
 }
 
 impl Queries {
     pub fn compile(adapter: &dyn LanguageAdapter) -> Result<Queries> {
         let lang = adapter.grammar();
-        let compile = |src: &str, what: &str| {
-            Query::new(&lang, src)
-                .with_context(|| format!("invalid {what} query for {}", adapter.id()))
-        };
+        let compile = |src: &str, what: &str| Matcher::compile(src, &lang, what, adapter.id());
         Ok(Queries {
             tags: compile(adapter.tags_query(), "tags.scm")?,
             imports: adapter
@@ -225,18 +308,19 @@ pub fn extract(source: &str, adapter: &dyn LanguageAdapter) -> Result<Vec<Node>>
 
 fn extract_defs(
     tree: &Tree,
-    query: &Query,
+    matcher: &Matcher,
     src: &[u8],
     module_path: &str,
     adapter: &dyn LanguageAdapter,
 ) -> Result<Vec<Node>> {
+    let query = &matcher.query;
     let names = query.capture_names();
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(query, tree.root_node(), src);
 
     let mut nodes = Vec::new();
     while let Some(m) = matches.next() {
-        if !predicates_hold(query, m, src) {
+        if !predicates_hold(query, m, src) || !matcher.regexes_hold(m, src) {
             continue;
         }
         let mut kind = None;
@@ -271,14 +355,15 @@ fn extract_defs(
 }
 
 /// Re-export statements, from the same query as imports (`reexport.*` captures).
-fn extract_reexports(tree: &Tree, query: &Query, src: &[u8]) -> Result<Vec<ReexportRec>> {
+fn extract_reexports(tree: &Tree, matcher: &Matcher, src: &[u8]) -> Result<Vec<ReexportRec>> {
+    let query = &matcher.query;
     let names = query.capture_names();
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(query, tree.root_node(), src);
 
     let mut out = Vec::new();
     while let Some(m) = matches.next() {
-        if !predicates_hold(query, m, src) {
+        if !predicates_hold(query, m, src) || !matcher.regexes_hold(m, src) {
             continue;
         }
         let mut specifier = None;
@@ -316,14 +401,15 @@ fn extract_reexports(tree: &Tree, query: &Query, src: &[u8]) -> Result<Vec<Reexp
     Ok(out)
 }
 
-fn extract_imports(tree: &Tree, query: &Query, src: &[u8]) -> Result<Vec<ImportRec>> {
+fn extract_imports(tree: &Tree, matcher: &Matcher, src: &[u8]) -> Result<Vec<ImportRec>> {
+    let query = &matcher.query;
     let names = query.capture_names();
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(query, tree.root_node(), src);
 
     let mut out = Vec::new();
     while let Some(m) = matches.next() {
-        if !predicates_hold(query, m, src) {
+        if !predicates_hold(query, m, src) || !matcher.regexes_hold(m, src) {
             continue;
         }
         let mut specifier = None;
@@ -380,7 +466,8 @@ fn extract_imports(tree: &Tree, query: &Query, src: &[u8]) -> Result<Vec<ImportR
 /// narrowed by a more specific one — an adapter marks the exceptions instead
 /// (Elixir: everything inside `@spec get(id :: String.t()) :: t()` parses as
 /// calls, but names types).
-fn extract_refs(tree: &Tree, query: &Query, src: &[u8]) -> Result<Vec<RefRec>> {
+fn extract_refs(tree: &Tree, matcher: &Matcher, src: &[u8]) -> Result<Vec<RefRec>> {
+    let query = &matcher.query;
     let names = query.capture_names();
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(query, tree.root_node(), src);
@@ -388,7 +475,7 @@ fn extract_refs(tree: &Tree, query: &Query, src: &[u8]) -> Result<Vec<RefRec>> {
     let mut out = Vec::new();
     let mut ignored: Vec<Region> = Vec::new();
     while let Some(m) = matches.next() {
-        if !predicates_hold(query, m, src) {
+        if !predicates_hold(query, m, src) || !matcher.regexes_hold(m, src) {
             continue;
         }
         let mut call: Option<TsNode> = None;
@@ -467,14 +554,15 @@ fn is_ignored_at(regions: &[Region], at: (u32, u32)) -> bool {
     after > 0 && at <= regions[after - 1].1
 }
 
-fn extract_bindings(tree: &Tree, query: &Query, src: &[u8]) -> Result<Vec<BindRec>> {
+fn extract_bindings(tree: &Tree, matcher: &Matcher, src: &[u8]) -> Result<Vec<BindRec>> {
+    let query = &matcher.query;
     let names = query.capture_names();
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(query, tree.root_node(), src);
 
     let mut out = Vec::new();
     while let Some(m) = matches.next() {
-        if !predicates_hold(query, m, src) {
+        if !predicates_hold(query, m, src) || !matcher.regexes_hold(m, src) {
             continue;
         }
         let mut name = None;

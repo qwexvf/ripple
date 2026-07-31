@@ -1115,3 +1115,28 @@ fn python_imports_and_methods_resolve() {
         .iter()
         .any(|e| e.src == client_send && e.dst == helper && e.kind == EdgeKind::Calls));
 }
+
+/// Rendering a component is a call; rendering `<main>` is not — even in a file
+/// that also defines a function called `main`. The capitalisation filter used to
+/// be a `#match?` the engine ignored, so those elements resolved to whatever
+/// shared their name: 15 invented edges on one real app (#51).
+#[test]
+fn an_intrinsic_element_is_not_a_call_even_when_a_symbol_shares_its_name() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/jsx");
+    let r = resolve::build(&root).unwrap();
+
+    let page = SymbolId::of("intrinsic.tsx", "Page");
+    let widget = SymbolId::of("intrinsic.tsx", "Widget");
+    let main = SymbolId::of("intrinsic.tsx", "main");
+
+    assert!(
+        r.edges
+            .iter()
+            .any(|e| e.src == page && e.dst == widget && e.kind == EdgeKind::Calls),
+        "rendering a component is a call"
+    );
+    assert!(
+        !r.edges.iter().any(|e| e.src == page && e.dst == main),
+        "<main> is an element, not the function named main"
+    );
+}

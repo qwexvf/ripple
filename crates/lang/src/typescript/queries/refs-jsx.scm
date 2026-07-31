@@ -4,8 +4,10 @@
 ; radius stops at the import edge, which says the file imported the component, not
 ; that anything renders it (issue #26).
 ;
-; Only capitalised names: `<div>` and friends are intrinsic elements that resolve to
-; nothing, and emitting refs for them would be noise the resolver has to reject.
+; Only capitalised names. `<div>` and friends are intrinsic elements that define no
+; symbol — but a codebase does contain functions called `main`, `label` or `title`,
+; and without this filter those elements resolve to them and invent 15 edges on one
+; real app. The predicate is evaluated now; it used to pass silently (#51).
 ((jsx_opening_element
   name: (identifier) @ref.call)
  (#match? @ref.call "^[A-Z]"))
