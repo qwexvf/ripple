@@ -467,6 +467,13 @@ fn index_defs(files: &[CachedFile], file_root: &[usize]) -> (DefIndex, Vec<Node>
                     if !node.definition_spans().any(|s| s == d.span) {
                         node.extra_spans.push(d.span);
                     }
+                    // `const f = () => …` matches both the variable pattern and the
+                    // function one, and which arrives first is a property of the
+                    // query engine rather than of the language. The more specific
+                    // kind wins, so a bound function is a function (#53).
+                    if node.kind == NodeKind::Variable && d.kind == NodeKind::Function {
+                        node.kind = NodeKind::Function;
+                    }
                 }
                 None => {
                     at.insert(d.id, nodes.len());
