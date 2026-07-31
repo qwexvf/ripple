@@ -53,6 +53,10 @@ fn kind_weight(kind: EdgeKind) -> f32 {
         // not discounted twice here
         EdgeKind::References => 0.9,
         EdgeKind::DbQuery | EdgeKind::Implements | EdgeKind::Extends => 0.9,
+        // a handler is unreachable if the declaration that mounts it changes; the
+        // dependency is as real as a call, and what is uncertain lives in the
+        // edge's confidence
+        EdgeKind::Serves => 0.9,
         EdgeKind::Imports => 0.7,
         EdgeKind::ChangesWith => 0.6,
         _ => 0.5,

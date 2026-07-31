@@ -71,6 +71,11 @@ pub enum HandlerRef {
 pub struct Provides {
     pub key: RouteKey,
     pub handler: HandlerRef,
+    /// Where the declaration is written, so the linker can attribute it to the
+    /// symbol that encloses it rather than to the whole file (#54). 0 when the
+    /// detector has no line to give — a spec file has no symbols anyway.
+    #[serde(default)]
+    pub line: u32,
     /// For transports with a type graph (GraphQL): what this field returns, as the
     /// schema spells it, so a nested selection can be descended. `None` elsewhere.
     pub returns: Option<String>,
@@ -157,6 +162,19 @@ pub fn http_key(method: &str, path: &str) -> RouteKey {
         transport: Transport::Http,
         method: Some(method.to_uppercase()),
         path: http_path(path),
+    }
+}
+
+/// The key a whole module mounted at a path answers under (`socket "/socket", Mod`,
+/// `forward "/graphql", Absinthe.Plug`). No method: a mount answers every verb, and
+/// everything below the path. See #54.
+pub fn mount_key(path: &str) -> RouteKey {
+    let mut path = http_path(path);
+    path.push(Segment::Wildcard);
+    RouteKey {
+        transport: Transport::Http,
+        method: None,
+        path,
     }
 }
 
@@ -333,6 +351,7 @@ fn file_route(call: TsNode, src: &[u8]) -> Vec<Provides> {
                 .then(|| Provides {
                     key: http_key(method, &path),
                     handler: HandlerRef::Here,
+                    line: pair.start_position().row as u32 + 1,
                     returns: None,
                 })
         })

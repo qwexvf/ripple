@@ -163,6 +163,14 @@ pub enum EdgeKind {
     ChangesWith,
     /// a function reads/writes a persisted DB entity (e.g. an ORM schema/table)
     DbQuery,
+    /// `src` is a handler reachable only because `dst` declares the route that
+    /// mounts it — a router, an endpoint, a schema type block.
+    ///
+    /// Direction follows the rest of this vocabulary: `src` is the dependent. A
+    /// router calls nothing, so without this edge the file that governs every
+    /// route in a service has a fanout of zero and sinks to the bottom of every
+    /// review. See #54.
+    Serves,
 }
 
 // ── cross-service vocabulary ────────────────────────────────────────────────

@@ -24,6 +24,10 @@ const CONF_IMPORTED_CALL: f32 = 0.9; // bare call resolved through an explicit `
 /// much of the path was literal are applied. Same band as a matched GraphQL
 /// operation: both sides wrote the route down, and the two spellings agree.
 const CONF_ENDPOINT: f32 = 0.9;
+/// A handler ← the declaration that mounts it. Same band as a matched endpoint:
+/// the declaration names the handler outright. Split 1/N when the named module
+/// resolves to several files. See #54.
+const CONF_SERVES: f32 = 0.9;
 
 pub struct CrossEdges {
     pub edges: Vec<Edge>,
@@ -33,6 +37,8 @@ pub struct CrossEdges {
     pub db: usize,
     /// bare calls resolved through an `import`
     pub imported: usize,
+    /// handlers linked back to the router/schema declaration that mounts them (#54)
+    pub mounted: usize,
     /// edges whose caller is a file or module rather than a function, because the
     /// call sits outside every definition (a module body, a `test` block, a script)
     pub file_granular: usize,
@@ -165,6 +171,11 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
     let mut field_type: HashMap<(&str, &str), String> = HashMap::new();
     // fields whose resolver names a module, not a function: the edge is file-granular
     let mut context_producer: RouteIndex<SymbolId> = RouteIndex::default();
+    // (handler, the declaration that mounts it, confidence). Filled by both provider
+    // passes and emitted once below, so the rule is stated in one place for every
+    // transport. A declaration mounting many handlers is not ambiguous — the split is
+    // over how many files answered to the *one* module name it wrote down.
+    let mut serves: Vec<(SymbolId, SymbolId, f32)> = Vec::new();
     for f in files {
         for p in &f.extract.cross.provides {
             let Some((declared, field)) = cross::graphql_scope_field(&p.key) else {
@@ -192,6 +203,9 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
                         .iter()
                         .filter_map(|file| fn_by_loc.get(&(*file, name.as_str())).copied())
                         .collect();
+                    let declaration = declaration_at(&fn_spans, &f.module_path, p.line);
+                    let conf = CONF_SERVES / ids.len().max(1) as f32;
+                    serves.extend(ids.iter().map(|id| (*id, declaration, conf)));
                     for scope in scopes {
                         for id in &ids {
                             producer.insert(cross::graphql_field_key(scope, field), *id);
@@ -206,6 +220,13 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
                     let Some(hosts) = fqn_to_module.get(module.as_str()) else {
                         continue;
                     };
+                    let declaration = declaration_at(&fn_spans, &f.module_path, p.line);
+                    let conf = CONF_SERVES / hosts.len().max(1) as f32;
+                    serves.extend(
+                        hosts
+                            .iter()
+                            .map(|h| (SymbolId::module(h), declaration, conf)),
+                    );
                     for scope in scopes {
                         for host in hosts {
                             context_producer.insert(
@@ -469,8 +490,38 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
                 cross::HandlerRef::Here => Some(SymbolId::module(&f.module_path)),
             };
             if let Some(handler) = handler {
+                // one Option: the route named exactly one place to go
+                let declaration = declaration_at(&fn_spans, &f.module_path, p.line);
+                serves.push((handler, declaration, CONF_SERVES));
                 endpoints_idx.insert(p.key.clone(), handler);
             }
+        }
+    }
+
+    // A router calls nothing it routes to, so the file governing every route in a
+    // service otherwise has a fanout of zero and sinks to the bottom of every review
+    // (#54). Emitted after both provider passes so one rule covers every transport:
+    // whoever the declaration named now depends on the declaration. `emit` drops the
+    // self-edge a `HandlerRef::Here` produces.
+    let mut mounted = 0;
+    // the strongest evidence wins when a handler is named more than once: sorting
+    // by confidence descending puts it first, and `emit` keeps the first of a pair
+    serves.sort_by(|a, b| {
+        (a.0, a.1)
+            .cmp(&(b.0, b.1))
+            .then(b.2.total_cmp(&a.2))
+            .then(a.0.cmp(&b.0))
+    });
+    for (handler, declaration, conf) in &serves {
+        if emit(
+            &mut edges,
+            *handler,
+            *declaration,
+            EdgeKind::Serves,
+            *conf,
+            0,
+        ) {
+            mounted += 1;
         }
     }
 
@@ -518,6 +569,7 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
         db,
         file_granular,
         imported,
+        mounted,
         unmatched_consumers,
         unused_providers,
         endpoints,
@@ -638,6 +690,22 @@ fn enclosing(
 /// definition or the file — so the two paths disagreed about the same construct and
 /// the coarser (but true) edges existed only for one of them. This makes both fall
 /// back the same way: enclosing definition, else the module body, else the file.
+/// The symbol a route declaration is written inside.
+///
+/// A Phoenix `socket`/`get` sits in the router module's body, not in any function,
+/// so this lands on the module — which is the symbol `review` ranks. Attributing it
+/// to `SymbolId::module(path)` instead pointed the edge at the *file* node, a
+/// different symbol that no reviewer ever looks at (#54).
+fn declaration_at(
+    fn_spans: &HashMap<&str, Vec<(u32, u32, SymbolId, Granularity)>>,
+    module_path: &str,
+    line: u32,
+) -> SymbolId {
+    let empty = Vec::new();
+    let spans = fn_spans.get(module_path).unwrap_or(&empty);
+    caller_at(spans, module_path, line).0
+}
+
 fn caller_at(
     spans: &[(u32, u32, SymbolId, Granularity)],
     module_path: &str,

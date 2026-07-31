@@ -98,6 +98,8 @@ impl SpecDetector for OpenApi {
                     // Naming the generated handler would mean guessing which of
                     // several code generators produced it and how it spells names
                     handler: HandlerRef::Here,
+                    // a data file has no enclosing symbol to attribute to
+                    line: 0,
                     returns: None,
                 });
             }

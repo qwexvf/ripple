@@ -7,7 +7,8 @@
 
 use super::macros::{FunRef, MacroCall, Scan};
 use crate::cross::{
-    camelize, graphql_field_key, http_key, CrossFacts, HandlerRef, Provides, GQL_ROOT_SCOPES,
+    camelize, graphql_field_key, http_key, mount_key, CrossFacts, HandlerRef, Provides,
+    GQL_ROOT_SCOPES,
 };
 use std::collections::HashMap;
 
@@ -50,11 +51,16 @@ struct RouterDsl {
     prefix_blocks: &'static [&'static str],
     /// verb macros, spelled as the method they declare
     verbs: &'static [&'static str],
+    /// macros mounting a whole module at a path rather than routing one action to
+    /// one function (`socket "/socket", UserSocket`, `forward "/gql", Absinthe.Plug`).
+    /// No action atom, and they answer every verb below the path.
+    mounts: &'static [&'static str],
 }
 
 const PHOENIX: RouterDsl = RouterDsl {
     prefix_blocks: &["scope"],
     verbs: &["get", "post", "put", "patch", "delete", "head", "options"],
+    mounts: &["socket", "forward"],
 };
 
 const ECTO: DataDsl = DataDsl {
@@ -129,6 +135,7 @@ fn schema_facts(scan: &Scan, dsl: &SchemaDsl, out: &mut CrossFacts) {
                 out.provides.push(Provides {
                     key: graphql_field_key(&scope, &camelize(atom)),
                     handler: HandlerRef::Module(module),
+                    line: call.line,
                     returns,
                 });
             }
@@ -137,6 +144,7 @@ fn schema_facts(scan: &Scan, dsl: &SchemaDsl, out: &mut CrossFacts) {
         out.provides.push(Provides {
             key: graphql_field_key(&scope, &camelize(atom)),
             handler: HandlerRef::Function { module, name: func },
+            line: call.line,
             // `field :author, :player` → the second atom; `list_of(:lfg_post)` puts it
             // one level in. Anything else stays None rather than being guessed at.
             returns,
@@ -205,6 +213,19 @@ fn type_scope(atom: &str) -> String {
 /// Both show up in the unmatched-provider count instead of as invented edges.
 fn router_facts(scan: &Scan, dsl: &RouterDsl, out: &mut CrossFacts) {
     for call in &scan.calls {
+        if dsl.mounts.contains(&&*call.name) {
+            let (Some(path), Some(module)) = (call.strings.first(), call.modules.first()) else {
+                continue;
+            };
+            let full = format!("{}/{}", prefix_of(&call.scope, dsl), unquote(path));
+            out.provides.push(Provides {
+                key: mount_key(&full),
+                handler: HandlerRef::Module(module.clone()),
+                line: call.line,
+                returns: None,
+            });
+            continue;
+        }
         if !dsl.verbs.contains(&&*call.name) {
             continue;
         }
@@ -222,6 +243,7 @@ fn router_facts(scan: &Scan, dsl: &RouterDsl, out: &mut CrossFacts) {
                 module: controller.clone(),
                 name: action.clone(),
             },
+            line: call.line,
             returns: None,
         });
     }
@@ -362,6 +384,34 @@ mod tests {
                     }
                 ),
             ]
+        );
+    }
+
+    /// A router routes an action to a function; an endpoint mounts a whole module
+    /// and answers every verb below the path. Without the second shape the file
+    /// governing every socket in a Phoenix app produced no fact at all (#54).
+    #[test]
+    fn a_mount_names_a_module_and_claims_everything_below_its_path() {
+        let r = routes(
+            "defmodule Endpoint do\n  socket \"/socket\", MyWeb.UserSocket,\n    websocket: [path: \"\", subprotocols: [\"graphql-transport-ws\"]]\n\n  scope \"/api\" do\n    forward \"/graphql\", Absinthe.Plug, schema: MyWeb.Schema\n  end\nend\n",
+        );
+        use ir::Segment::{Literal, Wildcard};
+        let lit = |s: &str| Literal(s.to_owned());
+        assert_eq!(
+            r,
+            vec![
+                (
+                    None,
+                    vec![lit("socket"), Wildcard],
+                    HandlerRef::Module("MyWeb.UserSocket".into())
+                ),
+                (
+                    None,
+                    vec![lit("api"), lit("graphql"), Wildcard],
+                    HandlerRef::Module("Absinthe.Plug".into())
+                ),
+            ],
+            "a mount has no method, takes the rest of the path, and names a module rather than an action"
         );
     }
 
