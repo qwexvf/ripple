@@ -226,6 +226,7 @@ fn index_project(roots: &[PathBuf], lsp_calls: Option<std::time::Duration>) -> R
     // cross-service: TS→resolver (GraphqlCall), resolver→context (Calls), fn→schema (DbQuery)
     let mut cross = resolve::link_cross_service(&indexed.files, &nodes);
     let (graphql, db, imported) = (cross.graphql, cross.db, cross.imported);
+    let (unmatched, unused) = (cross.unmatched_consumers, cross.unused_providers);
     let file_granular = cross.file_granular;
     edges.append(&mut cross.edges);
 
@@ -286,6 +287,14 @@ fn index_project(roots: &[PathBuf], lsp_calls: Option<std::time::Duration>) -> R
         nodes.len(), edge_count, cochange_applied, graphql, db, imported, tests, file_granular, repeated, with_dependents,
         own_db_path(&roots[0]).display()
     );
+    // the cross-service diagnostics: a boundary convention nobody taught a detector
+    // is invisible in the edge count but loud here (#32)
+    if unmatched > 0 || unused > 0 {
+        summary.push_str(&format!(
+            "\n  cross-service: {unmatched} consumer selection(s) matched no provider, \
+             {unused} provider key(s) nothing consumes"
+        ));
+    }
     if !dropped.is_empty() {
         summary.push_str(&format!(
             "\n⚠ dropped {} root(s) no longer indexed ({}) — their symbols are gone from this graph",

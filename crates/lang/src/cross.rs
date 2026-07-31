@@ -501,7 +501,8 @@ mod tests {
                 &function("App.Resolvers.PlayerResolver", "me")
             )]
         );
-        assert_eq!(f.provides[0].returns.as_deref(), Some("player"));
+        // wire spelling: the name a document writes, not the schema's atom
+        assert_eq!(f.provides[0].returns.as_deref(), Some("Player"));
         assert!(f
             .qualified_calls
             .iter()
@@ -538,7 +539,7 @@ mod tests {
             scopes,
             vec![
                 ("query", &function("Root", "name")),
-                ("object:player", &function("Player", "name")),
+                ("Player", &function("Player", "name")),
             ]
         );
     }
@@ -549,8 +550,8 @@ mod tests {
         assert_eq!(
             f.graphql.scope_includes,
             vec![
-                ("query".into(), "object:player_queries".into()),
-                ("mutation".into(), "object:player_mutations".into()),
+                ("query".into(), "PlayerQueries".into()),
+                ("mutation".into(), "PlayerMutations".into()),
             ]
         );
     }
@@ -568,11 +569,7 @@ mod tests {
         // the dataloader field is still served, one level coarser
         assert_eq!(
             provided(&f),
-            vec![(
-                "object:player",
-                "team",
-                &HandlerRef::Module("App.Teams".into())
-            )]
+            vec![("Player", "team", &HandlerRef::Module("App.Teams".into()))]
         );
         // the inline fn's body is still visible as a qualified call
         assert!(f

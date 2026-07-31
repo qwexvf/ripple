@@ -4,6 +4,7 @@
 //! function → Ecto schema (`DbQuery`). No parsing here; extraction lives in
 //! `lang::cross`. See docs/10-cross-service-resolution.md.
 
+use crate::routes::RouteIndex;
 use ir::{Edge, EdgeKind, EdgeSource, Node, NodeKind, Span, SymbolId};
 use lang::cross;
 use parse::CachedFile;
@@ -31,6 +32,13 @@ pub struct CrossEdges {
     /// edges whose caller is a file or module rather than a function, because the
     /// call sits outside every definition (a module body, a `test` block, a script)
     pub file_granular: usize,
+    /// selections a consumer asked for that no producer answered. A convention
+    /// nobody has taught the detector shows up here as a number; before there was
+    /// a counter, 11 operations lost to codegen casing showed up as nothing at all.
+    pub unmatched_consumers: usize,
+    /// distinct producer keys no consumer ever reached — a schema field, route or
+    /// topic that nothing calls, or one whose callers ripple cannot see yet
+    pub unused_providers: usize,
 }
 
 /// Link cross-service edges from the per-file facts already on each `CachedFile`.
@@ -143,14 +151,14 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
     // candidate means the match is ambiguous — all are kept and the confidence
     // is split, never collapsed to a single fabricated edge.
     let roots_by_scope = roots_by_scope(&includes);
-    let mut producer: HashMap<(&str, &str), Vec<SymbolId>> = HashMap::new();
+    let mut producer: RouteIndex<SymbolId> = RouteIndex::default();
     // (scope, field) → the scope that field's children are declared in. This is the
     // schema's type graph, and it is what lets a nested selection be followed:
     // `lfgPosts` returns `:lfg_post`, so `lfgPosts { author }` asks object:lfg_post
     // for `author` (issue #22).
     let mut field_type: HashMap<(&str, &str), String> = HashMap::new();
     // fields whose resolver names a module, not a function: the edge is file-granular
-    let mut context_producer: HashMap<(&str, &str), Vec<SymbolId>> = HashMap::new();
+    let mut context_producer: RouteIndex<SymbolId> = RouteIndex::default();
     for f in files {
         for p in &f.extract.cross.provides {
             let Some((declared, field)) = cross::graphql_scope_field(&p.key) else {
@@ -165,7 +173,7 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
             if let Some(returns) = &p.returns {
                 for scope in &scopes {
                     // the same spelling the detector uses for a type block's scope
-                    field_type.insert((scope, field), format!("object:{returns}"));
+                    field_type.insert((scope, field), returns.clone());
                 }
             }
             match &p.handler {
@@ -179,10 +187,9 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
                         .filter_map(|file| fn_by_loc.get(&(*file, name.as_str())).copied())
                         .collect();
                     for scope in scopes {
-                        producer
-                            .entry((scope, field))
-                            .or_default()
-                            .extend(ids.iter().copied());
+                        for id in &ids {
+                            producer.insert(cross::graphql_field_key(scope, field), *id);
+                        }
                     }
                 }
                 // no function is named, so the module node is the honest target
@@ -191,23 +198,16 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
                         continue;
                     };
                     for scope in scopes {
-                        context_producer
-                            .entry((scope, field))
-                            .or_default()
-                            .extend(hosts.iter().map(|f| SymbolId::module(f)));
+                        for host in hosts {
+                            context_producer.insert(
+                                cross::graphql_field_key(scope, field),
+                                SymbolId::module(host),
+                            );
+                        }
                     }
                 }
             }
         }
-    }
-
-    for ids in context_producer.values_mut() {
-        ids.sort_unstable();
-        ids.dedup();
-    }
-    for ids in producer.values_mut() {
-        ids.sort_unstable();
-        ids.dedup();
     }
 
     // ── build edges (deduped by src/dst/kind) ──
@@ -241,6 +241,11 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
 
     // GraphqlCall: consumer TS module → resolver
     let mut graphql = 0;
+    // what the consumers reached, and what they asked for and did not find. Both
+    // are reported: a number is how a drifted convention announces itself, and
+    // silence is how the last one hid (#32)
+    let mut matched: HashSet<ir::RouteKey> = HashSet::new();
+    let mut unmatched_consumers = 0usize;
     for f in files {
         if f.extract.cross.graphql.op_refs.is_empty() {
             continue;
@@ -251,10 +256,17 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
                 continue;
             };
             for (scope, path) in fields {
-                if let Some(resolvers) = resolvers_for(&producer, &field_type, scope, path) {
+                let resolvers = resolvers_for(&producer, &field_type, scope, path, &mut matched);
+                let contexts_empty =
+                    resolvers_for(&context_producer, &field_type, scope, path, &mut matched)
+                        .is_empty();
+                if resolvers.is_empty() && contexts_empty {
+                    unmatched_consumers += 1;
+                }
+                if !resolvers.is_empty() {
                     // N candidates for one field → 1/N each (docs/06-risk-and-queries.md)
                     let conf = CONF_GRAPHQL / resolvers.len() as f32;
-                    for &resolver in resolvers {
+                    for resolver in resolvers {
                         if emit(&mut edges, src_id, resolver, EdgeKind::GraphqlCall, conf, 0) {
                             graphql += 1;
                         }
@@ -262,9 +274,11 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
                 }
                 // a dataloader field names a context, not a function — coarser, and
                 // priced accordingly (unchanged below)
-                if let Some(contexts) = resolvers_for(&context_producer, &field_type, scope, path) {
+                let contexts =
+                    resolvers_for(&context_producer, &field_type, scope, path, &mut matched);
+                if !contexts.is_empty() {
                     let conf = CONF_GRAPHQL_CONTEXT / contexts.len() as f32;
-                    for &context in contexts {
+                    for context in contexts {
                         if emit(&mut edges, src_id, context, EdgeKind::GraphqlCall, conf, 0) {
                             graphql += 1;
                         }
@@ -281,16 +295,23 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
                     MAX_FRAGMENT_HOPS,
                     &mut |scope: &str, path: &[String]| {
                         let mut hits = Vec::new();
-                        if let Some(rs) = resolvers_for(&producer, &field_type, scope, path) {
+                        let rs = resolvers_for(&producer, &field_type, scope, path, &mut matched);
+                        if !rs.is_empty() {
                             hits.push((rs, CONF_GRAPHQL));
                         }
-                        if let Some(cs) = resolvers_for(&context_producer, &field_type, scope, path)
-                        {
+                        let cs = resolvers_for(
+                            &context_producer,
+                            &field_type,
+                            scope,
+                            path,
+                            &mut matched,
+                        );
+                        if !cs.is_empty() {
                             hits.push((cs, CONF_GRAPHQL_CONTEXT));
                         }
                         for (targets, base) in hits {
                             let conf = base / targets.len() as f32;
-                            for &t in targets {
+                            for t in targets {
                                 if emit(&mut edges, src_id, t, EdgeKind::GraphqlCall, conf, 0) {
                                     graphql += 1;
                                 }
@@ -414,6 +435,9 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
         }
     }
 
+    let declared: HashSet<&ir::RouteKey> = producer.keys().chain(context_producer.keys()).collect();
+    let unused_providers = declared.iter().filter(|k| !matched.contains(**k)).count();
+
     CrossEdges {
         edges,
         graphql,
@@ -421,6 +445,8 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
         db,
         file_granular,
         imported,
+        unmatched_consumers,
+        unused_providers,
     }
 }
 
@@ -468,10 +494,8 @@ fn expand_spread(
     let Some(fragment) = fragments.get(name) else {
         return; // spread of a fragment defined nowhere we indexed
     };
-    let scope = format!(
-        "object:{}",
-        lang::cross::decamelize(&fragment.type_condition)
-    );
+    // the type condition is already the wire name both sides agree on
+    let scope = fragment.type_condition.clone();
     for path in &fragment.paths {
         visit(&scope, path);
     }
@@ -486,20 +510,37 @@ fn expand_spread(
 /// its type, then asks that type's scope for `author`. A path whose intermediate type
 /// is unknown resolves to nothing rather than falling back to the root field — a
 /// wrong edge is worse than a missing one.
-fn resolvers_for<'a>(
-    producer: &'a HashMap<(&str, &str), Vec<SymbolId>>,
-    field_type: &'a HashMap<(&str, &str), String>,
-    root_scope: &'a str,
-    path: &'a [String],
-) -> Option<&'a Vec<SymbolId>> {
-    let (last, parents) = path.split_last()?;
-    // borrow the map's own strings rather than cloning: the returned resolvers borrow
-    // from `producer`, so the key must outlive the walk
+fn resolvers_for(
+    producer: &RouteIndex<SymbolId>,
+    field_type: &HashMap<(&str, &str), String>,
+    root_scope: &str,
+    path: &[String],
+    matched: &mut HashSet<ir::RouteKey>,
+) -> Vec<SymbolId> {
+    let Some((last, parents)) = path.split_last() else {
+        return Vec::new();
+    };
     let mut scope: &str = root_scope;
     for parent in parents {
-        scope = field_type.get(&(scope, parent.as_str()))?.as_str();
+        match field_type.get(&(scope, parent.as_str())) {
+            Some(next) => scope = next.as_str(),
+            None => return Vec::new(),
+        }
     }
-    producer.get(&(scope, last.as_str()))
+    // one target reached twice is one target: several scopes can carry the same
+    // field, and a diluted 1/N over a phantom ambiguity is a wrong number
+    let key = cross::graphql_field_key(scope, last);
+    let mut ids: Vec<SymbolId> = producer
+        .matches(&key)
+        .into_iter()
+        .map(|(id, _quality)| *id)
+        .collect();
+    if !ids.is_empty() {
+        matched.insert(key);
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    ids
 }
 
 /// Innermost definition span containing `line` (smallest range), so a call inside

@@ -100,11 +100,13 @@ fn schema_facts(scan: &Scan, dsl: &SchemaDsl, out: &mut CrossFacts) {
         let Some(atom) = call.atoms.first() else {
             continue;
         };
+        // wire spelling, same reason as `type_scope`: the linker uses this as the
+        // scope a nested selection descends into
         let returns = call
             .atoms
             .get(1)
             .or_else(|| call.wrapped_atoms.first())
-            .cloned();
+            .map(|atom| type_scope(atom));
         let Some((module, func)) = resolver_of(call, dsl, &block_resolvers) else {
             // no named function, but a context module is still an answer: a
             // `dataloader(Mod)` field is served by Mod, one level coarser
@@ -170,8 +172,13 @@ fn block_scope(entry: &str, dsl: &SchemaDsl) -> Option<String> {
         .then(|| type_scope(atom))
 }
 
+/// The wire spelling of a type scope: the name a GraphQL document writes.
+///
+/// The schema declares `object :lfg_post`; a document says `... on LfgPost`. The
+/// detector owns that translation — the linker compares wire names and never
+/// learns that this framework spells types in snake case (#32).
 fn type_scope(atom: &str) -> String {
-    format!("object:{atom}")
+    crate::cross::operation_key(&camelize(atom))
 }
 
 fn data_facts(scan: &Scan, dsl: &DataDsl, out: &mut CrossFacts) {

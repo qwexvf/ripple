@@ -17,12 +17,14 @@ use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 mod crossservice;
+mod routes;
 mod testlink;
 mod workspace;
 
 use workspace::Workspaces;
 
 pub use crossservice::{link_cross_service, CrossEdges};
+pub use routes::{Quality, RouteIndex};
 pub use testlink::{link_tests, TestScopes};
 
 /// Directories that hold code nobody is going to change in this repo:

@@ -61,6 +61,18 @@ deleted and rebuilt: indexing rewrites every table anyway, so there is nothing t
 migrate. A *query* against one says so and names the command to run, rather than
 surfacing redb's `Manual upgrade required`.
 
+When a cross-service boundary is involved, the summary also reports what did *not*
+match:
+
+```
+cross-service: 2599 consumer selection(s) matched no provider, 467 provider key(s) nothing consumes
+```
+
+Neither number is a defect count — a selection on a scalar field has no resolver to
+find, and a schema field nothing calls is ordinary. They are there because the
+alternative is silence: 11 GraphQL operations were once lost to a codegen casing
+convention, and the edge count alone could not say so.
+
 Re-running is incremental: unchanged files are reused from the content cache. The summary
 line reports added / changed / unchanged / removed alongside the node and edge counts.
 
