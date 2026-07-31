@@ -28,7 +28,10 @@ an explanation is the cheapest bug signal this project has, so re-measure and di
     aliased/namespace imports resolve. GraphQL side: nested selections descend the type
     graph, `dataloader(Mod)` links to its context module at 0.5, and fragment spreads
     expand (343 → 825 graphql edges)
-cold index ~1.6s, warm ~0.8s
+cold index 2.6s, warm 1.8s (2026-07-31, this machine). The previous line here said
+  1.6s/0.8s and was not comparable — rebuilding the 2026-07-30 binary and running it
+  on the same corpus gave 2.4s/1.6s, so today's work costs ~10%, not the 2x the stale
+  number implied. **Time a rebuilt old binary, never a recorded number from another day.**
 eval (5noobs-web, held out — co-change mined only from commits older than the test window):
   --commits 50 (503 train, 2078 pairs): static 11.8% | co-change 3.7% | fused 15.1%
   ↑ was static 7.1% / fused 10.5% before 2026-07-26's extraction work; a 300-commit
