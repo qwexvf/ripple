@@ -181,6 +181,16 @@ pub fn mount_key(path: &str) -> RouteKey {
     }
 }
 
+/// The key a persisted table is declared and read under. A migration creating
+/// `table(:games)` and a schema declaring `schema "games"` are the two sides. See #54.
+pub fn db_key(table: &str) -> RouteKey {
+    RouteKey {
+        transport: Transport::Db,
+        method: None,
+        path: vec![Segment::Literal(table.to_owned())],
+    }
+}
+
 /// The key a GraphQL field is served and requested under: its scope, then its
 /// name. One function so the producer and the consumer cannot spell it differently
 /// — they used to be two tuple literals in two crates.

@@ -7,8 +7,8 @@
 
 use super::macros::{FunRef, MacroCall, Scan};
 use crate::cross::{
-    camelize, graphql_field_key, http_key, mount_key, CrossFacts, HandlerRef, Provides,
-    GQL_ROOT_SCOPES,
+    camelize, db_key, graphql_field_key, http_key, mount_key, Consumes, CrossFacts, HandlerRef,
+    Provides, GQL_ROOT_SCOPES,
 };
 use std::collections::HashMap;
 
@@ -38,6 +38,10 @@ const ABSINTHE: SchemaDsl = SchemaDsl {
 struct DataDsl {
     /// macro declaring an entity, taking the table name as a string
     entity: &'static str,
+    /// macro naming a table inside a migration (`create table(:games)`), taking the
+    /// table as a leading atom. A migration governs a table without calling anything,
+    /// the same way a router governs a route (#54).
+    table: &'static str,
     /// last module segment whose calls take entities as arguments (`Repo.get(Player, id)`)
     repo: &'static str,
     /// query macros taking an entity (`from p in Player`)
@@ -65,6 +69,7 @@ const PHOENIX: RouterDsl = RouterDsl {
 
 const ECTO: DataDsl = DataDsl {
     entity: "schema",
+    table: "table",
     repo: "Repo",
     queries: &["from"],
 };
@@ -273,6 +278,32 @@ fn data_facts(scan: &Scan, dsl: &DataDsl, out: &mut CrossFacts) {
         .iter()
         .any(|c| c.name == dsl.entity && !c.strings.is_empty());
 
+    // A table is declared in one place and read from another, which is the shape
+    // `Provides`/`Consumes` already describes — so the migration and the schema go
+    // through the same matcher as every other boundary, and `resolve` learns nothing
+    // about Ecto. The schema consumes; the migration provides.
+    for call in scan.calls.iter().filter(|c| c.name == dsl.entity) {
+        if let Some(table) = call.strings.first() {
+            out.consumes.push(Consumes {
+                key: db_key(unquote(table)),
+                line: call.line,
+                confidence_hint: 1.0, // a table name is spelled out in full or not at all
+            });
+        }
+    }
+    for call in scan.calls.iter().filter(|c| c.name == dsl.table) {
+        if let Some(table) = call.atoms.first() {
+            out.provides.push(Provides {
+                key: db_key(table),
+                // a migration names no symbol that serves the table; it *is* the
+                // declaration, and the file is the honest granularity
+                handler: HandlerRef::Here,
+                line: call.line,
+                returns: None,
+            });
+        }
+    }
+
     out.entity_refs = scan.struct_refs.clone();
     for call in scan
         .calls
@@ -384,6 +415,57 @@ mod tests {
                     }
                 ),
             ]
+        );
+    }
+
+    /// A migration governs a table without calling anything, and a schema reads one
+    /// without importing it — the two sides of a boundary, so they travel as an
+    /// ordinary provider/consumer pair rather than as an Ecto special case (#54).
+    #[test]
+    fn a_migration_provides_the_table_a_schema_consumes() {
+        let facts = |src: &str| {
+            let mut p = tree_sitter::Parser::new();
+            p.set_language(&crate::elixir::Adapter::new().grammar())
+                .expect("elixir grammar");
+            let tree = p.parse(src, None).expect("parse");
+            cross_facts(&super::super::macros::scan(
+                tree.root_node(),
+                src.as_bytes(),
+            ))
+        };
+        let table = |k: &ir::RouteKey| match k.path.first() {
+            Some(ir::Segment::Literal(s)) => s.clone(),
+            _ => String::new(),
+        };
+
+        let migration = facts(
+            "defmodule Repo.Migrations.CreateGames do\n  def change do\n    create table(:games) do\n      add :name, :string\n    end\n\n    create unique_index(:player_games, [:player_id])\n  end\nend\n",
+        );
+        let provided: Vec<String> = migration
+            .provides
+            .iter()
+            .filter(|p| p.key.transport == ir::Transport::Db)
+            .map(|p| table(&p.key))
+            .collect();
+        assert_eq!(
+            provided,
+            vec!["games"],
+            "an index names a table it does not create, so it is not a provider"
+        );
+
+        let schema = facts(
+            "defmodule App.Game do\n  use Ecto.Schema\n  schema \"games\" do\n    field :name, :string\n  end\nend\n",
+        );
+        let consumed: Vec<String> = schema
+            .consumes
+            .iter()
+            .filter(|c| c.key.transport == ir::Transport::Db)
+            .map(|c| table(&c.key))
+            .collect();
+        assert_eq!(consumed, vec!["games"]);
+        assert_eq!(
+            migration.provides[0].key, schema.consumes[0].key,
+            "the two sides must reduce to the same key or the matcher never joins them"
         );
     }
 

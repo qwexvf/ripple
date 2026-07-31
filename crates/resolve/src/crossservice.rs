@@ -486,13 +486,21 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
                     .get(module.as_str())
                     .and_then(|files| files.first())
                     .map(|file| SymbolId::module(file)),
-                // the declaring file serves it — no symbol was named
-                cross::HandlerRef::Here => Some(SymbolId::module(&f.module_path)),
+                // no symbol was named, so the declaration itself is the target —
+                // the module the declaration sits in, or the file when nothing
+                // encloses it. `SymbolId::module` alone was the file node, which is
+                // a different symbol from the one `review` ranks (#54).
+                cross::HandlerRef::Here => Some(declaration_at(&fn_spans, &f.module_path, p.line)),
             };
             if let Some(handler) = handler {
-                // one Option: the route named exactly one place to go
-                let declaration = declaration_at(&fn_spans, &f.module_path, p.line);
-                serves.push((handler, declaration, CONF_SERVES));
+                // `Here` names no separate handler: the declaring file serves it, so
+                // there is nothing for the declaration to gain a dependent from.
+                // Pushing it anyway linked a file node to the module node beside it
+                // and inflated the declaring file's own fanout.
+                if !matches!(p.handler, cross::HandlerRef::Here) {
+                    let declaration = declaration_at(&fn_spans, &f.module_path, p.line);
+                    serves.push((handler, declaration, CONF_SERVES));
+                }
                 endpoints_idx.insert(p.key.clone(), handler);
             }
         }
@@ -539,7 +547,10 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
             let (caller, grain) = caller_at(spans, &f.module_path, c.line);
             let kind = match c.key.transport {
                 ir::Transport::PubSub => EdgeKind::AsyncCall,
-                ir::Transport::Db => EdgeKind::DbQuery,
+                // a table is declared, not called: the schema depends on the
+                // migration that creates it exactly the way a handler depends on
+                // the router that mounts it (#54)
+                ir::Transport::Db => EdgeKind::Serves,
                 _ => EdgeKind::HttpCall,
             };
             let n = hits.len() as f32;
