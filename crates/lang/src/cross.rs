@@ -367,6 +367,14 @@ fn http_call(call: TsNode, src: &[u8]) -> Option<Consumes> {
     let mut cursor = args.walk();
     let mut arg_list = args.named_children(&mut cursor);
     let first = arg_list.next()?;
+
+    // a request described by an options object: `client({ url: `/x`, method: "GET" })`.
+    // Every generated client spells it this way (orval, openapi-codegen with a custom
+    // instance), and it is a shape rather than a library name.
+    if first.kind() == "object" {
+        return request_object(call, first, src);
+    }
+
     let (path, literal_ratio) = url_of(first, src)?;
 
     let method = match callee.kind() {
@@ -374,9 +382,10 @@ fn http_call(call: TsNode, src: &[u8]) -> Option<Consumes> {
         "member_expression" => {
             let verb = text(callee.child_by_field_name("property")?, src);
             let object = text(callee.child_by_field_name("object")?, src);
-            // `axios.get(...)` and a client named after it; anything else is some
-            // other library whose shape we have not been taught
-            if !object.ends_with("axios") && object != "http" {
+            // an axios instance, however it was named. Deliberately narrow: `http.get`
+            // is also how MSW spells a *mock handler*, and reading those would invent
+            // a client for every stubbed endpoint
+            if !object.to_lowercase().contains("axios") {
                 return None;
             }
             if !HTTP_VERBS.contains(&verb) {
@@ -395,6 +404,38 @@ fn http_call(call: TsNode, src: &[u8]) -> Option<Consumes> {
 }
 
 const HTTP_VERBS: [&str; 7] = ["get", "post", "put", "patch", "delete", "head", "options"];
+
+/// `client({ url: "/x", method: "GET" })` — both written down, or nothing.
+fn request_object(call: TsNode, options: TsNode, src: &[u8]) -> Option<Consumes> {
+    let url = object_string(options, "url", src)?;
+    let method_node = object_string(options, "method", src)?;
+    let method = text(method_node, src)
+        .trim_matches(['"', '\'', '`'])
+        .to_owned();
+    if !HTTP_VERBS.contains(&method.to_lowercase().as_str()) {
+        return None;
+    }
+    let (path, literal_ratio) = url_of(url, src)?;
+    Some(Consumes {
+        key: http_key(&method, &path),
+        line: call.start_position().row as u32 + 1,
+        confidence_hint: literal_ratio,
+    })
+}
+
+/// The node behind `name:` in an object literal.
+fn object_string<'a>(object: TsNode<'a>, name: &str, src: &[u8]) -> Option<TsNode<'a>> {
+    if object.kind() != "object" {
+        return None;
+    }
+    let mut cursor = object.walk();
+    let pairs: Vec<TsNode> = object.named_children(&mut cursor).collect();
+    pairs.into_iter().find_map(|pair| {
+        let key = pair.child_by_field_name("key")?;
+        (text(key, src).trim_matches(['"', '\'']) == name)
+            .then(|| pair.child_by_field_name("value"))?
+    })
+}
 
 /// A `fetch`'s method: GET unless its options object says otherwise in a literal.
 /// `None` means the options were dynamic — under-link rather than assume GET.
@@ -880,6 +921,19 @@ mod tests {
                 0.5
             )]
         );
+
+        // a generated client describes the request in an object; both parts read
+        assert_eq!(
+            ts_consumes("customInstance({ url: `/api/v1/users/${id}`, method: \"POST\" }, opts);"),
+            vec![(
+                Some("POST".into()),
+                vec![lit("api"), lit("v1"), lit("users"), Segment::Param],
+                0.5
+            )]
+        );
+        // MSW spells a mock handler `http.get("*/health", …)`; reading those would
+        // invent a client for every stub
+        assert!(ts_consumes("http.get(\"*/health\", handler);").is_empty());
 
         // a method ripple cannot read is not a method it invents
         assert!(ts_consumes("fetch(url, { method: verb });").is_empty());
