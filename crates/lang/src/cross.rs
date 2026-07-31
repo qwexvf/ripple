@@ -375,7 +375,7 @@ fn http_call(call: TsNode, src: &[u8]) -> Option<Consumes> {
         return request_object(call, first, src);
     }
 
-    let (path, literal_ratio) = url_of(first, src)?;
+    let path = url_of(first, src)?;
 
     let method = match callee.kind() {
         "identifier" if text(callee, src) == "fetch" => fetch_method(arg_list.next(), src)?,
@@ -396,10 +396,11 @@ fn http_call(call: TsNode, src: &[u8]) -> Option<Consumes> {
         _ => return None,
     };
 
+    let key = http_key(&method, &path);
     Some(Consumes {
-        key: http_key(&method, &path),
+        confidence_hint: literal_share(&key),
+        key,
         line: call.start_position().row as u32 + 1,
-        confidence_hint: literal_ratio,
     })
 }
 
@@ -415,11 +416,11 @@ fn request_object(call: TsNode, options: TsNode, src: &[u8]) -> Option<Consumes>
     if !HTTP_VERBS.contains(&method.to_lowercase().as_str()) {
         return None;
     }
-    let (path, literal_ratio) = url_of(url, src)?;
+    let key = http_key(&method, &url_of(url, src)?);
     Some(Consumes {
-        key: http_key(&method, &path),
+        confidence_hint: literal_share(&key),
+        key,
         line: call.start_position().row as u32 + 1,
-        confidence_hint: literal_ratio,
     })
 }
 
@@ -465,41 +466,52 @@ fn fetch_method(options: Option<TsNode>, src: &[u8]) -> Option<String> {
     Some("GET".to_owned()) // options that say nothing about the method
 }
 
-/// The URL a call's first argument names, plus how much of it was literal.
+/// How much of a key the consumer actually spelled. Counted over the *segments the
+/// key ends up with*, not over the pieces the template was written in: a
+/// two-fragment template producing four segments is three-quarters literal, and
+/// saying one half would understate what the call pins.
+fn literal_share(key: &RouteKey) -> f32 {
+    if key.path.is_empty() {
+        return 1.0;
+    }
+    let literal = key
+        .path
+        .iter()
+        .filter(|s| matches!(s, Segment::Literal(_)))
+        .count();
+    literal as f32 / key.path.len() as f32
+}
+
+/// The URL a call's first argument names.
 ///
-/// A template literal keeps its literal segments and turns each interpolation into
-/// a `${}` placeholder, which `http_path` normalizes to `Param` — the same shape a
-/// route declares with `:id`.
-fn url_of(arg: TsNode, src: &[u8]) -> Option<(String, f32)> {
+/// A template literal keeps its literal text and turns each interpolation into a
+/// placeholder, which `http_path` normalizes to `Param` — the same shape a route
+/// declares with `:id`.
+fn url_of(arg: TsNode, src: &[u8]) -> Option<String> {
     match arg.kind() {
         "string" => {
             let path = text(arg, src).trim_matches(['"', '\'']).to_owned();
-            path.starts_with('/').then_some((path, 1.0))
+            path.starts_with('/').then_some(path)
         }
         "template_string" => {
             let mut path = String::new();
-            let mut literal = 0usize;
-            let mut total = 0usize;
+            let mut parts = 0usize;
             let mut cursor = arg.walk();
             for part in arg.children(&mut cursor) {
                 match part.kind() {
                     "string_fragment" => {
                         path.push_str(text(part, src));
-                        literal += 1;
-                        total += 1;
+                        parts += 1;
                     }
                     "template_substitution" => {
                         path.push_str("/:param/");
-                        total += 1;
+                        parts += 1;
                     }
                     _ => {}
                 }
             }
             let path = path.replace("//", "/");
-            if !path.starts_with('/') || total == 0 {
-                return None;
-            }
-            Some((path, literal as f32 / total as f32))
+            (path.starts_with('/') && parts > 0).then_some(path)
         }
         _ => None,
     }
@@ -918,7 +930,8 @@ mod tests {
             vec![(
                 Some("GET".into()),
                 vec![lit("api"), lit("users"), Segment::Param],
-                0.5
+                // two of three segments are spelled out, which is what the key pins
+                2.0 / 3.0
             )]
         );
 
@@ -928,7 +941,7 @@ mod tests {
             vec![(
                 Some("POST".into()),
                 vec![lit("api"), lit("v1"), lit("users"), Segment::Param],
-                0.5
+                0.75
             )]
         );
         // MSW spells a mock handler `http.get("*/health", …)`; reading those would

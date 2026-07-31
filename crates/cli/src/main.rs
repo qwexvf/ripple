@@ -69,6 +69,14 @@ fn db_path(root: &Path) -> Result<PathBuf> {
         );
     }
     let primary = PathBuf::from(text.trim());
+    if !primary.is_absolute() {
+        bail!(
+            "{} holds a relative index pointer ({}), which names a different database \
+             from every directory — re-run `ripple index` for both roots",
+            pointer.display(),
+            primary.display()
+        );
+    }
     let shared = own_db_path(&primary);
     if !shared.exists() {
         bail!(

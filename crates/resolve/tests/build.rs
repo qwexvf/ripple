@@ -1140,3 +1140,38 @@ fn an_intrinsic_element_is_not_a_call_even_when_a_symbol_shares_its_name() {
         "<main> is an element, not the function named main"
     );
 }
+
+/// `index /repo /repo/api` and `index /repo/api /repo` must describe the same
+/// files the same way. Discovery gives a file to whichever root reaches it first,
+/// and doing that in argv order made the module path — and therefore the SymbolId —
+/// depend on the order the caller happened to type.
+#[test]
+fn a_nested_root_claims_its_own_files_whatever_the_argument_order() {
+    let outer = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/xrepo");
+    let inner = outer.join("api");
+
+    let paths = |roots: Vec<std::path::PathBuf>| {
+        let r = resolve::build_incremental(&roots, &std::collections::HashMap::new()).unwrap();
+        let mut modules: Vec<String> = r
+            .result
+            .nodes
+            .iter()
+            .filter(|n| n.module_path.contains("client.ts"))
+            .map(|n| n.module_path.clone())
+            .collect();
+        modules.sort();
+        modules.dedup();
+        modules
+    };
+
+    let outer_first = paths(vec![outer.clone(), inner.clone()]);
+    let inner_first = paths(vec![inner, outer]);
+    assert_eq!(
+        outer_first, inner_first,
+        "the same file must have the same module path either way"
+    );
+    assert!(
+        outer_first.iter().all(|m| m.starts_with("api/")),
+        "the innermost root owns its files: {outer_first:?}"
+    );
+}

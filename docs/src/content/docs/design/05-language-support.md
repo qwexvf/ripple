@@ -100,8 +100,8 @@ Monorepos are first-class, not an afterthought:
 
 The promise ("adding a language touches only `lang/`") is enforced mechanically, not by discipline:
 
-- **CI check:** a test asserts that adding a fixture language's adapter produces graph output for a sample repo *without any diff outside `crates/lang/`*. If a new language forces a change in `resolve`/`store`/`overlay`/`query`, that's an abstraction leak — the build warns.
+- **Review rule, not a CI check.** This was written as though a test enforced it; nothing does. `ci.yml` runs fmt, clippy, the test suite and the docs build. The property is real — the Python adapter (2026-07-31) touched `crates/lang/`, a fixture and a doc line, nothing else — but it is defended by reading the diff, not by the build. Writing the check is worth doing; claiming it exists is not.
 - **Contract tests:** each adapter runs against a shared golden-fixture suite (a tiny repo per language) asserting expected nodes/edges per tier. Adding a language = adding a fixture + expected output.
 - **Tier conformance:** an adapter declares its tier; the suite only runs the checks valid for that tier, so a Tier-0 language isn't failed for lacking a call graph.
 
-This turns "clean architecture" from an aspiration into a property the CI defends on every PR.
+Contract tests and tier conformance *are* in CI. The confinement rule above is not, and this section said otherwise until someone checked.

@@ -142,23 +142,50 @@ pub fn build_incremental(
     // dedup files across roots (a root nested inside another would double-index)
     let mut seen_canon: HashSet<PathBuf> = HashSet::new();
 
-    for (i, root) in roots.iter().enumerate() {
-        let root = root
-            .canonicalize()
-            .with_context(|| format!("cannot access {}", root.display()))?;
+    let canonical: Vec<PathBuf> = roots
+        .iter()
+        .map(|root| {
+            root.canonicalize()
+                .with_context(|| format!("cannot access {}", root.display()))
+        })
+        .collect::<Result<_>>()?;
+    for root in &canonical {
         let tag = if single {
             String::new()
         } else {
-            unique_tag(&root, &mut tags)
+            unique_tag(root, &mut tags)
         };
+        used_roots.push((tag, root.clone()));
+    }
 
-        let (files, s) = discover(&root, &tag, &registry, &queries, cached, &mut seen_canon)?;
+    // Discover deepest root first, so a root nested inside another claims its own
+    // files. `seen_canon` gives a file to whoever reaches it first, and doing that
+    // in argv order made `index /repo /repo/api` and `index /repo/api /repo` produce
+    // different module paths — and therefore different SymbolIds — for the same
+    // file. Tags and reporting keep the order the caller gave.
+    let mut order: Vec<usize> = (0..canonical.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(canonical[i].as_os_str().len()));
+
+    let mut per_root: Vec<Vec<CachedFile>> = vec![Vec::new(); canonical.len()];
+    for &i in &order {
+        let (files, s) = discover(
+            &canonical[i],
+            &used_roots[i].0,
+            &registry,
+            &queries,
+            cached,
+            &mut seen_canon,
+        )?;
         stats.added += s.added;
         stats.changed += s.changed;
         stats.unchanged += s.unchanged;
+        per_root[i] = files;
+    }
+    // reassembled in the caller's order, so file order — and therefore edge order —
+    // does not depend on how deep the roots happen to be
+    for (i, files) in per_root.into_iter().enumerate() {
         file_root.extend(std::iter::repeat_n(i, files.len()));
         all_files.extend(files);
-        used_roots.push((tag, root));
     }
 
     let ws = Workspaces::discover_all(&used_roots);
