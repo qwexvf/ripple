@@ -216,7 +216,12 @@ fn discover(
     cached: &HashMap<String, CachedFile>,
     seen_canon: &mut HashSet<PathBuf>,
 ) -> Result<(Vec<CachedFile>, IndexStats)> {
+    let specs = lang::spec::registry();
     let mut candidates: Vec<(PathBuf, String)> = Vec::new();
+    // files that carry boundary facts without being code (an OpenAPI document).
+    // Kept apart from `candidates`: they have no grammar, so nothing below the
+    // cross facts applies to them — no defs, no refs, no adapter.
+    let mut spec_files: Vec<(PathBuf, String)> = Vec::new();
     for entry in WalkDir::new(root)
         .into_iter()
         .filter_entry(|e| !is_ignored_dir(e))
@@ -226,7 +231,9 @@ fn discover(
             continue;
         }
         let path = entry.path();
-        if lang::adapter_for(registry, path).is_none() {
+        let is_code = lang::adapter_for(registry, path).is_some();
+        let is_spec = !is_code && lang::spec::detector_for(&specs, path).is_some();
+        if !is_code && !is_spec {
             continue;
         }
         let Ok(canonical) = path.canonicalize() else {
@@ -236,19 +243,33 @@ fn discover(
             continue; // already indexed under an earlier (more specific) root
         }
         let module_path = namespace(tag, &rel_module_path(root, &canonical));
-        candidates.push((canonical, module_path));
+        if is_spec {
+            spec_files.push((canonical, module_path));
+        } else {
+            candidates.push((canonical, module_path));
+        }
     }
     // WalkDir hands back readdir order, which differs between machines and between
     // runs after a rewrite. File order is edge order, and the store keys edges by
     // insertion index, so this is what makes two indexes of one tree comparable.
     candidates.sort();
 
-    let parsed: Vec<(CachedFile, Change)> = candidates
+    spec_files.sort();
+    let mut parsed: Vec<(CachedFile, Change)> = candidates
         .par_iter()
         .map(|(canonical, module_path)| {
             parse_one(registry, queries, cached, canonical, module_path)
         })
         .collect::<Result<Vec<_>>>()?;
+
+    parsed.extend(
+        spec_files
+            .par_iter()
+            .filter_map(|(canonical, module_path)| {
+                read_spec(&specs, cached, canonical, module_path)
+            })
+            .collect::<Vec<_>>(),
+    );
 
     let mut stats = IndexStats::default();
     let mut files = Vec::with_capacity(parsed.len());
@@ -267,6 +288,46 @@ enum Change {
     Added,
     Changed,
     Unchanged,
+}
+
+/// A spec file's facts, cached on content hash exactly as a parsed file's are.
+///
+/// `None` when the text is not the kind of document its extension allows — a repo
+/// holds far more YAML than it holds API descriptions, and the alternative is
+/// parsing all of it.
+fn read_spec(
+    specs: &[Box<dyn lang::spec::SpecDetector>],
+    cached: &HashMap<String, CachedFile>,
+    canonical: &Path,
+    module_path: &str,
+) -> Option<(CachedFile, Change)> {
+    let detector = lang::spec::detector_for(specs, canonical)?;
+    let source = std::fs::read_to_string(canonical).ok()?;
+    if !detector.looks_like_one(&source) {
+        return None;
+    }
+    let hash = parse::content_hash(&source);
+    let (extract, change) = match cached.get(module_path) {
+        Some(c) if c.hash == hash => (c.extract.clone(), Change::Unchanged),
+        Some(_) => (spec_extract(detector, &source), Change::Changed),
+        None => (spec_extract(detector, &source), Change::Added),
+    };
+    Some((
+        CachedFile {
+            canonical: canonical.to_owned(),
+            module_path: module_path.to_owned(),
+            hash,
+            extract,
+        },
+        change,
+    ))
+}
+
+fn spec_extract(detector: &dyn lang::spec::SpecDetector, source: &str) -> parse::FileExtract {
+    parse::FileExtract {
+        cross: detector.facts(source),
+        ..Default::default()
+    }
 }
 
 fn parse_one(

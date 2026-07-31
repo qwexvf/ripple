@@ -9,6 +9,7 @@ pub mod go;
 pub mod graphql;
 pub mod resolve_import;
 pub mod rust;
+pub mod spec;
 pub mod typescript;
 
 use std::collections::HashMap;
