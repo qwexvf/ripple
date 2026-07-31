@@ -9,3 +9,7 @@ export async function createUser(body: string) {
 export async function unmatched() {
   return fetch("/api/v1/nothing-declares-this");
 }
+
+export async function session() {
+  return fetch("/auth/session");
+}

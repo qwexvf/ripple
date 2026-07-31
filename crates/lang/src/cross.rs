@@ -54,8 +54,16 @@ impl CrossFacts {
 /// dataloader resolvers on one real schema name only a module.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HandlerRef {
-    Function { module: String, name: String },
+    Function {
+        module: String,
+        name: String,
+    },
     Module(String),
+    /// The file that declared it. Some frameworks put the handler in an anonymous
+    /// position — a closure in a config object — where there is no symbol to name;
+    /// the declaring file is then the honest granularity, the same answer a call
+    /// outside every function gets.
+    Here,
 }
 
 /// One endpoint this file serves.
@@ -233,6 +241,7 @@ fn text<'a>(n: TsNode, src: &'a [u8]) -> &'a str {
 pub fn typescript(root: TsNode, src: &[u8]) -> CrossFacts {
     let mut docs = std::collections::HashSet::new();
     let mut consumes = Vec::new();
+    let mut provides = Vec::new();
     let mut stack = vec![root];
     while let Some(n) = stack.pop() {
         if n.kind() == "identifier" {
@@ -246,6 +255,7 @@ pub fn typescript(root: TsNode, src: &[u8]) -> CrossFacts {
             if let Some(call) = http_call(n, src) {
                 consumes.push(call);
             }
+            provides.extend(file_route(n, src));
         }
         let mut c = n.walk();
         for ch in n.children(&mut c) {
@@ -255,7 +265,10 @@ pub fn typescript(root: TsNode, src: &[u8]) -> CrossFacts {
     let mut op_refs: Vec<String> = docs.into_iter().collect();
     op_refs.sort();
     consumes.sort_by_key(|c: &Consumes| c.line);
+    provides
+        .sort_by(|a: &Provides, b: &Provides| format!("{:?}", a.key).cmp(&format!("{:?}", b.key)));
     CrossFacts {
+        provides,
         consumes,
         graphql: GraphqlFacts {
             op_refs,
@@ -271,6 +284,83 @@ pub fn typescript(root: TsNode, src: &[u8]) -> CrossFacts {
 /// The method is read, never guessed: `axios.<verb>` spells it, and a bare `fetch`
 /// is GET by specification. A `fetch` whose options name a method ripple cannot
 /// read statically produces nothing rather than a wrong verb.
+/// Routes a file-based router declares in source: TanStack Start's
+/// `createFileRoute("/auth/session")({ server: { handlers: { GET: … } } })`.
+///
+/// The path is written down, so this reads syntax rather than guessing from where
+/// the file sits — and the methods are the keys of `handlers`, so they are read
+/// too. A route whose path is computed produces nothing.
+fn file_route(call: TsNode, src: &[u8]) -> Vec<Provides> {
+    let Some(callee) = call.child_by_field_name("function") else {
+        return Vec::new();
+    };
+    // `createFileRoute("/p")(config)`: the callee is itself the call that names the path
+    if callee.kind() != "call_expression" {
+        return Vec::new();
+    }
+    let named = callee
+        .child_by_field_name("function")
+        .map(|f| text(f, src) == "createFileRoute")
+        .unwrap_or(false);
+    if !named {
+        return Vec::new();
+    }
+    let Some(path) = first_string_arg(callee, src) else {
+        return Vec::new();
+    };
+    let Some(args) = call.child_by_field_name("arguments") else {
+        return Vec::new();
+    };
+    let mut arg_cursor = args.walk();
+    let config: Vec<TsNode> = args.named_children(&mut arg_cursor).collect();
+    let Some(config) = config.into_iter().next() else {
+        return Vec::new();
+    };
+    let Some(handlers) =
+        object_value(config, "server", src).and_then(|s| object_value(s, "handlers", src))
+    else {
+        return Vec::new();
+    };
+    let mut cursor = handlers.walk();
+    let pairs: Vec<TsNode> = handlers.named_children(&mut cursor).collect();
+    pairs
+        .into_iter()
+        .filter_map(|pair| {
+            let key = pair.child_by_field_name("key")?;
+            let method = text(key, src).trim_matches(['"', '\'']);
+            HTTP_VERBS
+                .contains(&method.to_lowercase().as_str())
+                .then(|| Provides {
+                    key: http_key(method, &path),
+                    handler: HandlerRef::Here,
+                    returns: None,
+                })
+        })
+        .collect()
+}
+
+/// The first string argument of a call, unquoted.
+fn first_string_arg(call: TsNode, src: &[u8]) -> Option<String> {
+    let args = call.child_by_field_name("arguments")?;
+    let mut cursor = args.walk();
+    let arg = args.named_children(&mut cursor).next()?;
+    (arg.kind() == "string").then(|| text(arg, src).trim_matches(['"', '\'']).to_owned())
+}
+
+/// The value of `name:` in an object literal, if it is itself an object.
+fn object_value<'a>(object: TsNode<'a>, name: &str, src: &[u8]) -> Option<TsNode<'a>> {
+    if object.kind() != "object" {
+        return None;
+    }
+    let mut cursor = object.walk();
+    let pairs: Vec<TsNode> = object.named_children(&mut cursor).collect();
+    pairs.into_iter().find_map(|pair| {
+        let key = pair.child_by_field_name("key")?;
+        (text(key, src).trim_matches(['"', '\'']) == name)
+            .then(|| pair.child_by_field_name("value"))?
+    })
+}
+
 fn http_call(call: TsNode, src: &[u8]) -> Option<Consumes> {
     let callee = call.child_by_field_name("function")?;
     let args = call.child_by_field_name("arguments")?;

@@ -43,7 +43,10 @@ const EPSILON: f32 = 0.02;
 /// (dependents of the changed symbol). Co-change is the git signal.
 fn kind_weight(kind: EdgeKind) -> f32 {
     match kind {
-        EdgeKind::Calls | EdgeKind::GraphqlCall => 1.0,
+        // a boundary call is a call: the process it crosses does not make the
+        // dependency weaker, and the uncertainty about *which* handler already
+        // lives in the edge's confidence
+        EdgeKind::Calls | EdgeKind::GraphqlCall | EdgeKind::HttpCall => 1.0,
         // a reference is a real dependency even when it is a type mention rather
         // than a call; what is uncertain about it lives in the edge's confidence
         // (servers that can only answer `references` supply it at 0.7), so it is

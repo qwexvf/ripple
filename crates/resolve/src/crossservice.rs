@@ -198,6 +198,9 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
                         }
                     }
                 }
+                // a GraphQL field served by the file that declares it has no
+                // meaning today — only a router does that — so it is not linked
+                cross::HandlerRef::Here => {}
                 // no function is named, so the module node is the honest target
                 cross::HandlerRef::Module(module) => {
                     let Some(hosts) = fqn_to_module.get(module.as_str()) else {
@@ -462,6 +465,8 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
                     .get(module.as_str())
                     .and_then(|files| files.first())
                     .map(|file| SymbolId::module(file)),
+                // the declaring file serves it — no symbol was named
+                cross::HandlerRef::Here => Some(SymbolId::module(&f.module_path)),
             };
             if let Some(handler) = handler {
                 endpoints_idx.insert(p.key.clone(), handler);

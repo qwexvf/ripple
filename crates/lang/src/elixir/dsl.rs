@@ -289,7 +289,7 @@ mod tests {
                     HandlerRef::Function { module, name } => {
                         Some((field.to_owned(), module.clone(), name.clone()))
                     }
-                    HandlerRef::Module(_) => None,
+                    HandlerRef::Module(_) | HandlerRef::Here => None,
                 }
             })
             .collect()

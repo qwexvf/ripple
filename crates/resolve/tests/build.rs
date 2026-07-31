@@ -1051,6 +1051,16 @@ fn a_typescript_fetch_reaches_the_route_it_calls() {
         "the undeclared path should be reported"
     );
 
+    // a file-based route declares its own path in source, and the file serves it:
+    // the same matcher links it with no linker change (#52)
+    let caller = SymbolId::of("web/src/client.ts", "session");
+    let route_file = SymbolId::module("web/src/routes/auth/session.ts");
+    assert!(
+        http.iter()
+            .any(|(s, d, _)| *s == caller && *d == route_file),
+        "a fetch should reach the file-based route that declares it: {http:?}"
+    );
+
     // an interpolated path pins less than a fully spelled one
     let conf = |src: SymbolId| http.iter().find(|(s, _, _)| *s == src).map(|(_, _, c)| *c);
     assert!(

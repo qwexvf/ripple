@@ -82,12 +82,16 @@ fn db_path(root: &Path) -> Result<PathBuf> {
 }
 
 /// Edge kinds surfaced by `neighbors` (call/import/co-change/cross-service).
-const NEIGHBOR_KINDS: [EdgeKind; 6] = [
+const NEIGHBOR_KINDS: [EdgeKind; 8] = [
     EdgeKind::Calls,
     EdgeKind::References,
     EdgeKind::Imports,
     EdgeKind::ChangesWith,
     EdgeKind::GraphqlCall,
+    // a call across an HTTP or pub/sub boundary is a caller like any other; leaving
+    // them out made the first HttpCall edges invisible to `neighbors`
+    EdgeKind::HttpCall,
+    EdgeKind::AsyncCall,
     EdgeKind::DbQuery,
 ];
 
