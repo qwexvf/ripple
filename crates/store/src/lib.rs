@@ -20,6 +20,13 @@ const ROOTS: TableDefinition<u64, &[u8]> = TableDefinition::new("roots");
 const STAMPS: TableDefinition<&str, &[u8]> = TableDefinition::new("stamps");
 /// Verified call verdicts, keyed by the *content hash* of the file they came from.
 const VERIFIED: TableDefinition<&str, &[u8]> = TableDefinition::new("verified");
+/// The shape of a `FileExtract` at the time the cache was written.
+///
+/// A cache row is keyed on the file's content hash, which does not change when the
+/// *parser* does. A build whose extract gained a field therefore reads back rows the
+/// current parser never produced, and a `#[serde(default)]` field makes that succeed
+/// silently. Comparing the shape turns a wrong graph into a re-parse. See #56.
+const SHAPE: TableDefinition<&str, &str> = TableDefinition::new("extract_shape");
 
 /// Durable graph store. One writer, many readers; query happens after `load`.
 /// Also persists the per-file extract cache for incremental re-indexing.
@@ -204,6 +211,9 @@ fn put_graph(wtx: &redb::WriteTransaction, nodes: &[Node], edges: &[Edge]) -> Re
 fn put_extracts(wtx: &redb::WriteTransaction, files: &[CachedFile]) -> Result<()> {
     let _ = wtx.delete_table(EXTRACTS);
     let _ = wtx.delete_table(STAMPS);
+    let _ = wtx.delete_table(SHAPE);
+    wtx.open_table(SHAPE)?
+        .insert("extract", parse::extract_shape().as_str())?;
     let mut t = wtx.open_table(EXTRACTS)?;
     let mut s = wtx.open_table(STAMPS)?;
     for f in files {
@@ -217,6 +227,18 @@ fn put_extracts(wtx: &redb::WriteTransaction, files: &[CachedFile]) -> Result<()
         s.insert(f.module_path.as_str(), stamp.as_slice())?;
     }
     Ok(())
+}
+
+/// Was this cache written by a build whose extract had the shape this one produces?
+///
+/// A cache with no shape recorded predates the check, so it was written by a build
+/// whose extract certainly differs from today's — treated as a mismatch rather than
+/// trusted.
+fn shape_matches(rtx: &redb::ReadTransaction) -> bool {
+    let Ok(t) = rtx.open_table(SHAPE) else {
+        return false;
+    };
+    matches!(t.get("extract"), Ok(Some(v)) if v.value() == parse::extract_shape())
 }
 
 fn put_roots(wtx: &redb::WriteTransaction, roots: &[(String, PathBuf)]) -> Result<()> {
@@ -270,6 +292,11 @@ impl GraphStore for RedbStore {
         };
         let rtx = db.begin_read()?;
         let mut out = HashMap::new();
+        // written by a build whose extract had a different shape: every row is
+        // suspect, including the ones that still deserialize (#56)
+        if !shape_matches(&rtx) {
+            return Ok(out);
+        }
         if let Ok(t) = rtx.open_table(EXTRACTS) {
             for row in t.iter()? {
                 let (_k, v) = row?;
@@ -617,5 +644,49 @@ fn pick(e: &Edge, dir: Dir) -> SymbolId {
     match dir {
         Dir::Out => e.dst,
         Dir::In => e.src,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A cache written by a build whose extract had a different shape must be
+    /// ignored whole, not row by row. The rows still deserialize — that is the
+    /// point: `#[serde(default)]` makes a missing field succeed as a zero, and the
+    /// graph is then built from facts the parser never produced. Two measurement
+    /// runs on #54 were wrong before this existed.
+    #[test]
+    fn a_cache_from_a_different_extract_shape_is_not_read() {
+        let path = std::env::temp_dir().join(format!("ripple-shape-{}.redb", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut store = RedbStore::open(&path);
+        store
+            .write_extracts(&[CachedFile {
+                canonical: PathBuf::from("/p/a.ts"),
+                module_path: "a.ts".to_owned(),
+                hash: "h".to_owned(),
+                extract: parse::FileExtract::default(),
+            }])
+            .expect("write");
+        assert_eq!(store.read_extracts().expect("read").len(), 1);
+
+        // exactly what a parser change does: the rows are untouched and still valid
+        // JSON, only the shape they were written under has moved on
+        {
+            let db = store.db().expect("db");
+            let wtx = db.begin_write().expect("write tx");
+            wtx.open_table(SHAPE)
+                .expect("shape")
+                .insert("extract", "a shape from some other build")
+                .expect("insert");
+            wtx.commit().expect("commit");
+        }
+        assert!(
+            store.read_extracts().expect("read").is_empty(),
+            "a cache whose shape does not match must be a miss, not a silent zero"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 }

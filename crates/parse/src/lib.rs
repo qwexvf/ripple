@@ -22,6 +22,9 @@ pub fn content_hash(source: &str) -> String {
 /// A file's extraction plus its content hash — the unit of incremental caching.
 /// Unchanged files reuse this across `index` runs, skipping the parse. See
 /// docs/v0-plan.md "incremental".
+mod schema;
+pub use schema::extract_shape;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedFile {
     pub canonical: PathBuf,

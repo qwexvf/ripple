@@ -74,7 +74,10 @@ pub struct Provides {
     /// Where the declaration is written, so the linker can attribute it to the
     /// symbol that encloses it rather than to the whole file (#54). 0 when the
     /// detector has no line to give — a spec file has no symbols anyway.
-    #[serde(default)]
+    ///
+    /// No `serde(default)`, the same convention as `FileExtract::reexports`: a row
+    /// written before this field existed must be a cache miss rather than a silent
+    /// zero. Adding the default here is what broke #56.
     pub line: u32,
     /// For transports with a type graph (GraphQL): what this field returns, as the
     /// schema spells it, so a nested selection can be descended. `None` elsewhere.

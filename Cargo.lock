@@ -304,6 +304,7 @@ dependencies = [
  "lang",
  "regex",
  "serde",
+ "serde_json",
  "streaming-iterator",
  "tree-sitter",
 ]
