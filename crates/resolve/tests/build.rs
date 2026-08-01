@@ -358,6 +358,41 @@ fn resolves_bare_calls_through_an_elixir_import() {
     assert_eq!(cross.imported, 1, "exactly one call resolved via import");
 }
 
+/// Struct fields became symbols, and a field routinely shares its name with the
+/// getter beside it. Nothing filtered call targets by kind, so `plan()` matched the
+/// field too and the real edge kept only half its confidence — 26 call edges in
+/// ripple's own tree fell from 0.95 to 0.475 against something that cannot be called.
+#[test]
+fn a_field_is_not_a_candidate_for_a_bare_call() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rust_field_call");
+    let r = resolve::build(&root).unwrap();
+
+    let run = SymbolId::of("lib.rs", "run");
+    let func = SymbolId::of("lib.rs", "plan");
+    let field = SymbolId::of("lib.rs", "Config.plan");
+
+    let calls: Vec<(SymbolId, f32)> = r
+        .edges
+        .iter()
+        .filter(|e| e.src == run && e.kind == EdgeKind::Calls)
+        .map(|e| (e.dst, e.confidence))
+        .collect();
+
+    assert!(
+        !calls.iter().any(|(dst, _)| *dst == field),
+        "the field `Config.plan` cannot be invoked, so `plan()` must not reach it: {calls:?}"
+    );
+    let conf = calls
+        .iter()
+        .find(|(dst, _)| *dst == func)
+        .map(|(_, c)| *c)
+        .expect("`plan()` should reach the function `plan`");
+    assert!(
+        conf > 0.9,
+        "one callable candidate means undivided confidence, got {conf}"
+    );
+}
+
 /// Rust reaches other modules through paths, so resolving only same-file names left
 /// `impact` blind on any Rust project — it reported zero dependents for functions
 /// used across crates, including ripple's own.

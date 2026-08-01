@@ -424,6 +424,14 @@ struct DefIndex {
     /// which root each symbol came from, so an edge that leaves one can be priced
     /// for it
     root_of: HashMap<SymbolId, usize>,
+    /// symbols a bare call can never name. A struct field and a getter routinely
+    /// share a name (`Config.path` and `fn path(&self)`), so once fields became
+    /// symbols every such call split its confidence across both — 26 call edges in
+    /// this repo alone dropped from 0.95 to 0.475 against a field that cannot be
+    /// invoked. Kept as the exclusion rather than a callable allow-list so a kind
+    /// added later is a candidate until someone rules it out, which is the
+    /// direction that fails loudly.
+    uncallable: HashSet<SymbolId>,
 }
 
 /// The trailing identifier of a qualified name or path — `Client` from
@@ -447,6 +455,8 @@ fn index_defs(files: &[CachedFile], file_root: &[usize]) -> (DefIndex, Vec<Node>
     // table, losing every definition site but the last. Collapse here instead, and
     // keep the spans.
     let mut at: HashMap<SymbolId, usize> = HashMap::new();
+    // a field and a function can collapse onto one id; that id is still callable
+    let mut callable: HashSet<SymbolId> = HashSet::new();
 
     for (f, &root) in files.iter().zip(file_root) {
         let by_name = idx.file_defs.entry(f.canonical.clone()).or_default();
@@ -476,6 +486,11 @@ fn index_defs(files: &[CachedFile], file_root: &[usize]) -> (DefIndex, Vec<Node>
                 .entry((root, d.name.clone()))
                 .or_default()
                 .push(d.id);
+            if d.kind == NodeKind::Field {
+                idx.uncallable.insert(d.id);
+            } else {
+                callable.insert(d.id);
+            }
             idx.root_of.insert(d.id, root);
             // an owner is anything the qualified name carries in front of the name
             if d.qualified_name.len() > d.name.len() && d.qualified_name.ends_with(&d.name) {
@@ -512,6 +527,7 @@ fn index_defs(files: &[CachedFile], file_root: &[usize]) -> (DefIndex, Vec<Node>
         idx.root_of.insert(module.id, root);
         nodes.push(module);
     }
+    idx.uncallable.retain(|id| !callable.contains(id));
     (idx, nodes)
 }
 
@@ -713,7 +729,7 @@ fn resolve_calls(
             continue;
         }
 
-        let (targets, base_conf) = match r.kind {
+        let (mut targets, base_conf) = match r.kind {
             RefKind::Call => {
                 match resolve_qualified(&r.name, r.qualifier.as_deref(), local, idx, root) {
                     // an explicit qualifier names its target, so it decides — including
@@ -754,11 +770,17 @@ fn resolve_calls(
             }
         };
 
+        // `plan(…)` names the function `plan`, never the struct field beside it.
+        // Dropping these before the count matters as much as the edge itself: a
+        // candidate that cannot be called still divides the 1/N confidence.
+        if r.kind == RefKind::Call {
+            targets.retain(|id| !idx.uncallable.contains(id));
+        }
+
         // several definitions can share one id — Elixir's multi-clause functions
         // and default args all key to (module, name). They are one target, so
         // dedup before counting or the confidence is diluted by a phantom
         // ambiguity and the same edge is emitted once per clause.
-        let mut targets = targets;
         targets.sort_unstable();
         targets.dedup();
 
