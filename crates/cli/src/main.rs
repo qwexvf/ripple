@@ -1907,9 +1907,9 @@ fn mcp_tools() -> Value {
     json!([
         {
             "name": "search",
-            "description": "Find symbols/files by substring (use this first to get exact names/paths for other tools).",
+            "description": "Find symbols/files by name, path, or a few words describing the area (use this first to get exact names/paths for other tools). Best match first.",
             "inputSchema": obj(json!({
-                "query": { "type": "string" },
+                "query": { "type": "string", "description": "one or more words; `_`, `-`, `.`, `/` split like spaces" },
                 "limit": { "type": "integer", "description": "max results (default 30)" }
             }), json!(["query"]))
         },
@@ -1971,6 +1971,58 @@ fn mcp_text(v: Value) -> Value {
     json!({ "content": [{ "type": "text", "text": v.to_string() }] })
 }
 
+/// Split a query into lowercase terms. Word separators an agent is likely to type
+/// (`_`, `-`, `.`, `/`, `::`) are treated as spaces, so `review focus`,
+/// `review_focus` and `query/review` all reach the same symbol.
+fn search_terms(query: &str) -> Vec<String> {
+    query
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// How well a node answers a query, summed over its terms. Zero means no term
+/// matched at all and the node is dropped.
+///
+/// Terms are scored independently and summed rather than required to all match:
+/// an agent describing an area ("incremental reindex cache") writes words that no
+/// single symbol carries, and requiring all of them returned nothing at all —
+/// which is what the plain substring match on the whole query used to do.
+fn search_score(n: &ir::Node, terms: &[String]) -> u32 {
+    let name = n.name.to_lowercase();
+    let qualified = n.qualified_name.to_lowercase();
+    let module = n.module_path.to_lowercase();
+    let name_terms = search_terms(&name);
+    let per_term: u32 = terms
+        .iter()
+        .map(|t| {
+            if name_terms.contains(t) {
+                4 // a whole word of the name
+            } else if name.starts_with(t.as_str()) {
+                3
+            } else if name.contains(t.as_str()) {
+                2
+            } else if qualified.contains(t.as_str()) || module.contains(t.as_str()) {
+                1
+            } else {
+                0
+            }
+        })
+        .sum();
+    // the whole query names the whole symbol — `review focus` and `review_focus`
+    // both land on `review_focus`, and must outrank the symbol merely called
+    // `review`, which one strong term alone would otherwise win
+    let exact = {
+        let (mut q, mut s) = (terms.to_vec(), name_terms);
+        q.sort();
+        s.sort();
+        q == s
+    };
+    per_term + if exact { 8 } else { 0 }
+}
+
 fn mcp_call(
     graph: &mut InMemoryGraph,
     root: &Path,
@@ -2011,28 +2063,30 @@ fn mcp_call(
             Ok(mcp_text(json!({ "reindexed": summary })))
         }
         "search" => {
-            let q = str_arg("query").ok_or("query required")?.to_lowercase();
+            let terms = search_terms(&str_arg("query").ok_or("query required")?);
             let limit = usize_arg("limit", 30);
             let mut hits: Vec<_> = graph
                 .nodes()
-                .filter(|n| {
-                    n.name.to_lowercase().contains(&q)
-                        || n.qualified_name.to_lowercase().contains(&q)
-                        || n.module_path.to_lowercase().contains(&q)
+                .filter_map(|n| match search_score(n, &terms) {
+                    0 => None,
+                    s => Some((s, n)),
                 })
                 .collect();
-            hits.sort_by(|a, b| {
-                (a.module_path.as_str(), a.name.as_str())
-                    .cmp(&(b.module_path.as_str(), b.name.as_str()))
+            // best match first; the name/path pair keeps equal scores in a fixed order
+            hits.sort_by(|(sa, a), (sb, b)| {
+                sb.cmp(sa).then_with(|| {
+                    (a.module_path.as_str(), a.name.as_str())
+                        .cmp(&(b.module_path.as_str(), b.name.as_str()))
+                })
             });
             let total = hits.len();
             let out: Vec<_> = hits
                 .iter()
                 .take(limit)
-                .map(|n| {
+                .map(|(score, n)| {
                     json!({
                         "symbol": n.name, "qualified": n.qualified_name, "module": n.module_path,
-                        "kind": format!("{:?}", n.kind),
+                        "kind": format!("{:?}", n.kind), "score": score,
                     })
                 })
                 .collect();
@@ -2406,6 +2460,73 @@ mod tests {
             node: node(dst),
             depth,
         }
+    }
+
+    fn sym(name: &str, module: &str) -> ir::Node {
+        let span = ir::Span {
+            start_line: 1,
+            start_col: 1,
+            end_line: 1,
+            end_col: 1,
+        };
+        ir::Node {
+            id: ir::SymbolId::of(module, name),
+            kind: ir::NodeKind::Function,
+            name: name.to_owned(),
+            qualified_name: name.to_owned(),
+            module_path: module.to_owned(),
+            span,
+            extra_spans: Vec::new(),
+            is_exported: true,
+            risk: ir::RiskScores::default(),
+        }
+    }
+
+    /// `search` matched the whole query as one substring, so any query with a space
+    /// in it — the way an agent describes an area — matched nothing at all.
+    #[test]
+    fn a_multi_word_query_finds_what_one_substring_could_not() {
+        let n = sym("build_incremental", "crates/resolve/src/lib.rs");
+        assert_eq!(
+            search_score(&n, &search_terms("build_incremental")),
+            16,
+            "both words are the name: 4 + 4, plus the whole-symbol bonus"
+        );
+        assert_eq!(
+            search_score(&n, &search_terms("incremental build")),
+            16,
+            "the same symbol, described in two words, in either order"
+        );
+        assert_eq!(
+            search_score(&n, &search_terms("resolve incremental")),
+            5,
+            "one term off the path (1) plus one whole word of the name (4)"
+        );
+        assert_eq!(search_score(&n, &search_terms("elixir dsl")), 0);
+    }
+
+    /// Separators an agent types instead of spaces must not glue terms together.
+    #[test]
+    fn search_terms_split_on_word_separators() {
+        assert_eq!(
+            search_terms("query/review_focus"),
+            v(&["query", "review", "focus"])
+        );
+        assert_eq!(search_terms("Store::load"), v(&["store", "load"]));
+        assert_eq!(search_terms("   "), Vec::<String>::new());
+    }
+
+    /// More terms hit must outrank a single lucky one, or a multi-word query is
+    /// no better than its worst word.
+    #[test]
+    fn a_symbol_matching_more_terms_ranks_higher() {
+        let both = sym("review_focus", "crates/query/src/lib.rs");
+        let one = sym("review", "crates/cli/src/verify.rs");
+        let terms = search_terms("review focus");
+        assert!(
+            search_score(&both, &terms) > search_score(&one, &terms),
+            "review_focus (both words) must beat review (one)"
+        );
     }
 
     /// A depth-2 walk printed every second-level hop at the same indentation whatever
