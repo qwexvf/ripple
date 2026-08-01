@@ -54,11 +54,20 @@ impl LanguageAdapter for Adapter {
     /// `(*Reader).Loop` stay distinct symbols. `bare_name` strips the qualifier
     /// again when reconciling against a server, which spells the same method
     /// `(*Terminal).Loop`.
+    ///
+    /// Type members carry the same qualifier for a second reason: unqualified,
+    /// a field `Name` and a package-level `func Name` hash to the same
+    /// `SymbolId`, and whichever the query engine yields first would swallow
+    /// the other.
     fn qualified_name(&self, kind: ir::NodeKind, name: &str, def: Node, src: &[u8]) -> String {
-        if kind != ir::NodeKind::Method {
-            return name.to_owned();
-        }
-        match receiver_type(def, src) {
+        let owner = match kind {
+            // an interface's `method_elem` has no receiver — its owner is the
+            // type declaration it sits in.
+            ir::NodeKind::Method => receiver_type(def, src).or_else(|| owner_type(def, src)),
+            ir::NodeKind::Field => owner_type(def, src),
+            _ => return name.to_owned(),
+        };
+        match owner {
             Some(ty) => format!("{ty}.{name}"),
             None => name.to_owned(),
         }
@@ -92,6 +101,18 @@ fn receiver_type<'a>(def: Node, src: &'a [u8]) -> Option<&'a str> {
     let param = receiver.named_children(&mut c).next()?;
     let ty = param.child_by_field_name("type")?;
     Some(short_type(ty.utf8_text(src).ok()?))
+}
+
+/// Name of the type declaration a member was written inside: a struct field or
+/// an interface method sits a couple of levels under the `type_spec` that names
+/// the type it belongs to.
+fn owner_type<'a>(def: Node, src: &'a [u8]) -> Option<&'a str> {
+    let mut cur = def.parent()?;
+    while cur.kind() != "type_spec" {
+        cur = cur.parent()?;
+    }
+    let name = cur.child_by_field_name("name")?;
+    Some(short_type(name.utf8_text(src).ok()?))
 }
 
 /// `*Terminal[T]` → `Terminal`, `pkg.Thing` → `Thing`.
@@ -144,9 +165,9 @@ mod tests {
             .collect()
     }
 
-    /// The captures a tags-only language lives or dies by: what the query matches
-    /// is the entire set of places an LSP-reported call can be attributed to.
-    fn captured(src: &str) -> Vec<(String, String)> {
+    /// Every def capture as `(kind, name, qualified name)`, mirroring what
+    /// `parse::extract_defs` does with the same query.
+    fn captures(src: &str) -> Vec<(String, String, String)> {
         let adapter = Adapter::new();
         let lang = adapter.grammar();
         let query = tree_sitter::Query::new(&lang, adapter.tags_query()).expect("tags.scm");
@@ -157,20 +178,40 @@ mod tests {
         let mut matches = cursor.matches(&query, tree.root_node(), bytes);
         let mut out = Vec::new();
         while let Some(m) = streaming_iterator::StreamingIterator::next(&mut matches) {
-            let mut kind = None;
+            let mut def = None;
             let mut name = None;
             for cap in m.captures {
                 let cap_name = names[cap.index as usize];
                 if let Some(k) = cap_name.strip_prefix("def.") {
-                    kind = Some(k.to_owned());
+                    def = Some((k.to_owned(), cap.node));
                 } else if cap_name == "name" {
                     name = cap.node.utf8_text(bytes).ok().map(str::to_owned);
                 }
             }
-            if let (Some(k), Some(n)) = (kind, name) {
-                out.push((k, n));
-            }
+            let (Some((k, node)), Some(n)) = (def, name) else {
+                continue;
+            };
+            let Some(kind) = NodeKind::from_capture(&format!("def.{k}")) else {
+                continue;
+            };
+            let qn = adapter.qualified_name(kind, &n, node, bytes);
+            out.push((k, n, qn));
         }
+        out.sort();
+        out
+    }
+
+    /// The captures a tags-only language lives or dies by: what the query matches
+    /// is the entire set of places an LSP-reported call can be attributed to.
+    fn captured(src: &str) -> Vec<(String, String)> {
+        captures(src).into_iter().map(|(k, n, _)| (k, n)).collect()
+    }
+
+    /// Captures keyed by qualified name — the string `SymbolId` is hashed from,
+    /// so this is where two symbols either stay apart or collide.
+    fn qualified(src: &str) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> =
+            captures(src).into_iter().map(|(k, _, q)| (k, q)).collect();
         out.sort();
         out
     }
@@ -215,7 +256,8 @@ mod tests {
     #[test]
     fn a_struct_is_captured_once_as_a_class() {
         let caps = captured("package p\ntype Item struct{ n int }\n");
-        assert_eq!(caps, [("class".to_owned(), "Item".to_owned())]);
+        let named_item: Vec<&(String, String)> = caps.iter().filter(|(_, n)| n == "Item").collect();
+        assert_eq!(named_item, [&("class".to_owned(), "Item".to_owned())]);
     }
 
     #[test]
@@ -241,5 +283,107 @@ mod tests {
         let caps = captured("package p\nvar Top = 1\nfunc f() {\n\tinner := 2\n\tvar also = 3\n\t_ = inner + also\n}\n");
         let vars: Vec<&(String, String)> = caps.iter().filter(|(k, _)| k == "variable").collect();
         assert_eq!(vars, [&("variable".to_owned(), "Top".to_owned())]);
+    }
+
+    /// `item.Name` is a reference gopls can report, so the field needs a symbol.
+    #[test]
+    fn struct_fields_are_captured_and_owned_by_their_struct() {
+        let qns = qualified(
+            "package p\ntype Item struct {\n\tName string `json:\"name\"`\n\tcount int\n\tX, Y int\n}\ntype Order struct{ Name string }\n",
+        );
+        let fields: Vec<&(String, String)> = qns.iter().filter(|(k, _)| k == "field").collect();
+        assert_eq!(
+            fields,
+            [
+                &("field".to_owned(), "Item.Name".to_owned()),
+                &("field".to_owned(), "Item.X".to_owned()),
+                &("field".to_owned(), "Item.Y".to_owned()),
+                &("field".to_owned(), "Item.count".to_owned()),
+                &("field".to_owned(), "Order.Name".to_owned()),
+            ]
+        );
+    }
+
+    /// Unqualified, a field and a package-level func of the same name hash to
+    /// one `SymbolId` and the loser is dropped.
+    #[test]
+    fn a_field_does_not_collide_with_a_package_level_function() {
+        let qns = qualified(
+            "package p\nfunc Name() string { return \"\" }\ntype Item struct{ Name string }\n",
+        );
+        assert_eq!(
+            qns,
+            [
+                ("class".to_owned(), "Item".to_owned()),
+                ("field".to_owned(), "Item.Name".to_owned()),
+                ("function".to_owned(), "Name".to_owned()),
+            ]
+        );
+    }
+
+    /// Embedded fields have no name to key a symbol on, and a field of an
+    /// anonymous struct — nested or in a function body — is not addressable
+    /// from anywhere the owning type could be named.
+    #[test]
+    fn nameless_and_anonymous_struct_fields_are_not_captured() {
+        let caps = captured(
+            "package p\nimport \"io\"\ntype Item struct {\n\tio.Reader\n\t*Embedded\n\tinner struct{ deep int }\n}\nfunc f() {\n\tanon := struct{ q int }{}\n\t_ = anon\n}\n",
+        );
+        let fields: Vec<&(String, String)> = caps.iter().filter(|(k, _)| k == "field").collect();
+        assert_eq!(fields, [&("field".to_owned(), "inner".to_owned())]);
+    }
+
+    /// A call through an interface is reported against `Doer.Do`, so the
+    /// method element needs a symbol even though it has no receiver.
+    #[test]
+    fn interface_methods_are_captured_and_owned_by_their_interface() {
+        let qns = qualified(
+            "package p\nimport \"io\"\ntype Doer interface {\n\tDo() error\n\tio.Closer\n}\nfunc (t *Terminal) Do() error { return nil }\n",
+        );
+        let methods: Vec<&(String, String)> = qns.iter().filter(|(k, _)| k == "method").collect();
+        assert_eq!(
+            methods,
+            [
+                &("method".to_owned(), "Doer.Do".to_owned()),
+                &("method".to_owned(), "Terminal.Do".to_owned()),
+            ]
+        );
+    }
+
+    /// Every member of a `const ( … )` block, including the valueless `iota`
+    /// continuations and multi-name specs.
+    #[test]
+    fn const_block_members_are_all_captured() {
+        let caps = captured(
+            "package p\ntype Color int\nconst (\n\tRed Color = iota\n\tGreen\n\tBlue\n)\nconst A, B = 1, 2\n",
+        );
+        let vars: Vec<&(String, String)> = caps.iter().filter(|(k, _)| k == "variable").collect();
+        assert_eq!(
+            vars,
+            [
+                &("variable".to_owned(), "A".to_owned()),
+                &("variable".to_owned(), "B".to_owned()),
+                &("variable".to_owned(), "Blue".to_owned()),
+                &("variable".to_owned(), "Green".to_owned()),
+                &("variable".to_owned(), "Red".to_owned()),
+            ]
+        );
+    }
+
+    /// `var ( … )` nests a `var_spec_list` under the declaration; the ungrouped
+    /// pattern walks straight past it.
+    #[test]
+    fn grouped_package_vars_are_captured() {
+        let caps = captured("package p\nvar Top = 1\nvar (\n\tG1 = 1\n\tG2, G3 int\n)\n");
+        let vars: Vec<&(String, String)> = caps.iter().filter(|(k, _)| k == "variable").collect();
+        assert_eq!(
+            vars,
+            [
+                &("variable".to_owned(), "G1".to_owned()),
+                &("variable".to_owned(), "G2".to_owned()),
+                &("variable".to_owned(), "G3".to_owned()),
+                &("variable".to_owned(), "Top".to_owned()),
+            ]
+        );
     }
 }

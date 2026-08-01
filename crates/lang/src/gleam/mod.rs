@@ -63,6 +63,42 @@ impl LanguageAdapter for Adapter {
         }
         false
     }
+
+    /// A record field is named by the type that declares it, not on its own:
+    /// identity is (path, qualified name), so `Person(name: String)` and
+    /// `Company(name: String)` in one module would otherwise collapse into a
+    /// single `name` symbol.
+    ///
+    /// The owner is the *type*, not the constructor, because that is what the
+    /// access is written against — `person.name` is legal exactly when every
+    /// constructor of the type declares the label, and the two declarations are
+    /// then two definition sites of one symbol.
+    fn qualified_name(&self, kind: ir::NodeKind, name: &str, def: Node, src: &[u8]) -> String {
+        if kind != ir::NodeKind::Field {
+            return name.to_owned();
+        }
+        match enclosing_type_name(def, src) {
+            Some(ty) => format!("{ty}.{name}"),
+            None => name.to_owned(),
+        }
+    }
+}
+
+/// Name of the `type` declaration a constructor argument sits in.
+fn enclosing_type_name(node: Node, src: &[u8]) -> Option<String> {
+    let mut cur = node.parent();
+    while let Some(n) = cur {
+        if n.kind() == "type_definition" {
+            let mut c = n.walk();
+            let type_name = n
+                .named_children(&mut c)
+                .find(|ch| ch.kind() == "type_name")?;
+            let name = type_name.child_by_field_name("name")?;
+            return name.utf8_text(src).ok().map(str::to_owned);
+        }
+        cur = n.parent();
+    }
+    None
 }
 
 fn has_pub(node: Node, src: &[u8]) -> bool {
@@ -83,7 +119,9 @@ mod tests {
         p.parse(src, None).expect("parse")
     }
 
-    /// `(kind, name, exported)` for every definition the tags query captures.
+    /// `(kind, qualified name, exported)` for every definition the tags query
+    /// captures. Qualification is part of what a capture yields — a field that
+    /// forgot it would share a `SymbolId` with the next type's same-named field.
     fn captured(src: &str) -> Vec<(String, String, bool)> {
         let adapter = Adapter::new();
         let lang = adapter.grammar();
@@ -100,15 +138,19 @@ mod tests {
             let mut def = None;
             for cap in m.captures {
                 let cap_name = names[cap.index as usize];
-                if let Some(k) = cap_name.strip_prefix("def.") {
-                    kind = Some(k.to_owned());
+                if let Some(k) = ir::NodeKind::from_capture(cap_name) {
+                    kind = Some(k);
                     def = Some(cap.node);
                 } else if cap_name == "name" {
                     name = cap.node.utf8_text(bytes).ok().map(str::to_owned);
                 }
             }
             if let (Some(k), Some(n), Some(d)) = (kind, name, def) {
-                out.push((k, n, adapter.is_exported(d, bytes)));
+                out.push((
+                    format!("{k:?}").to_lowercase(),
+                    adapter.qualified_name(k, &n, d, bytes),
+                    adapter.is_exported(d, bytes),
+                ));
             }
         }
         out.sort();
@@ -154,6 +196,33 @@ mod tests {
                 ("type".to_owned(), "Shape".to_owned(), true),
                 ("variable".to_owned(), "limit".to_owned(), true),
                 ("variable".to_owned(), "secret".to_owned(), false),
+            ]
+        );
+    }
+
+    /// A labelled constructor argument is what makes `person.name` legal, so the
+    /// label is a symbol; before it was captured, every record field in a Gleam
+    /// repo was invisible. Two types declaring `name` must stay two symbols, and
+    /// a positional argument declares no label to capture.
+    #[test]
+    fn labelled_constructor_arguments_are_fields_qualified_by_their_type() {
+        let caps = captured(
+            "pub type Person {\n  Person(name: String, age: Int)\n}\n\
+             pub type Company {\n  Company(name: String)\n}\n\
+             pub type Shape {\n  Circle(Float)\n}\n",
+        );
+        assert_eq!(
+            caps,
+            [
+                ("field".to_owned(), "Company.name".to_owned(), true),
+                ("field".to_owned(), "Person.age".to_owned(), true),
+                ("field".to_owned(), "Person.name".to_owned(), true),
+                ("function".to_owned(), "Circle".to_owned(), true),
+                ("function".to_owned(), "Company".to_owned(), true),
+                ("function".to_owned(), "Person".to_owned(), true),
+                ("type".to_owned(), "Company".to_owned(), true),
+                ("type".to_owned(), "Person".to_owned(), true),
+                ("type".to_owned(), "Shape".to_owned(), true),
             ]
         );
     }
