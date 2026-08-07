@@ -84,6 +84,43 @@ fn resolves_member_calls_by_type() {
 }
 
 #[test]
+fn resolves_gleam_same_module_and_qualified_calls() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/gleam");
+    let r = resolve::build(&root).unwrap();
+
+    let scrub = "src/nande_ingest/scrub.gleam";
+    let processor = "src/nande_ingest/processor.gleam";
+    let payload = SymbolId::of(scrub, "payload");
+    let luhn = SymbolId::of(scrub, "luhn");
+    let process = SymbolId::of(processor, "process");
+
+    // same-module unqualified call: payload() -> luhn()
+    assert!(
+        r.edges
+            .iter()
+            .any(|e| e.src == payload && e.dst == luhn && e.kind == EdgeKind::Calls),
+        "payload should call luhn in the same module"
+    );
+
+    // cross-module qualified call: process() -> scrub.payload()
+    assert!(
+        r.edges
+            .iter()
+            .any(|e| e.src == process && e.dst == payload && e.kind == EdgeKind::Calls),
+        "process should call scrub.payload across modules"
+    );
+
+    // the qualifying import lands as an Imports edge on the module
+    assert!(
+        r.edges.iter().any(|e| e.kind == EdgeKind::Imports
+            && r.nodes
+                .iter()
+                .any(|n| n.id == e.dst && n.module_path == scrub)),
+        "processor should import the scrub module"
+    );
+}
+
+#[test]
 fn incremental_matches_full_and_reuses_cache() {
     use std::collections::HashMap;
     let root = fixture();

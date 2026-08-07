@@ -443,8 +443,15 @@ fn extract_imports(tree: &Tree, matcher: &Matcher, src: &[u8]) -> Result<Vec<Imp
             });
         }
         if let Some((n, site)) = namespace {
+            // A namespace binding's local name is an explicit `as` alias, else the
+            // node's own text. Gleam names the module by its path (`a/b/scrub`) and
+            // binds the last segment (`scrub`); other languages capture a bare
+            // identifier here, which has no `/`, so the segment split is a no-op.
+            let local_name = alias
+                .clone()
+                .unwrap_or_else(|| n.rsplit('/').next().unwrap_or(&n).to_owned());
             out.push(ImportRec {
-                local_name: n,
+                local_name,
                 imported_name: "*".to_owned(),
                 specifier: specifier.clone(),
                 site,

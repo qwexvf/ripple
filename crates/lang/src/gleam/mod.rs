@@ -1,13 +1,14 @@
-//! Gleam adapter — Tier 0, with call edges from `gleam lsp`.
+//! Gleam adapter — Tier 2: definitions, imports, and static call edges.
 //!
-//! Same shape as the Go adapter and for the same reason (docs/11 phase 4): the
-//! language server is a better call resolver than a hand-written refs query would
-//! be, so there is no `refs_query` here. What makes Gleam worth adding first is
-//! measurement rather than preference — it is the backend language of the repos
-//! where cross-service resolution was emitting zero edges, because the producer
-//! side of every GraphQL join was unparsed. See issue #40.
+//! Calls come from a `refs.scm` rather than `gleam lsp`: Gleam's two call forms
+//! are unambiguous in the tree (a bare `identifier` in call position, or a
+//! `field_access` whose record is the module alias), so static extraction gives
+//! the same edges without a language server in the loop. Gleam is the backend
+//! language of the repos where cross-service resolution was emitting zero edges,
+//! because the producer side of every GraphQL join was unparsed. See issue #40.
 
-use crate::LanguageAdapter;
+use crate::{LanguageAdapter, Workspace};
+use std::path::{Path, PathBuf};
 use tree_sitter::Node;
 
 pub struct Adapter;
@@ -43,6 +44,32 @@ impl LanguageAdapter for Adapter {
 
     fn tags_query(&self) -> &'static str {
         include_str!("queries/tags.scm")
+    }
+
+    fn refs_query(&self) -> Option<&'static str> {
+        Some(include_str!("queries/refs.scm"))
+    }
+
+    fn imports_query(&self) -> Option<&'static str> {
+        Some(include_str!("queries/imports.scm"))
+    }
+
+    /// A Gleam module path (`nande_ingest/scrub`) is resolved against the package
+    /// source root — the nearest `src/` or `test/` ancestor of the importing file.
+    /// Cross-package imports (a dependency's module) are out of the indexed graph.
+    fn resolve_import(&self, spec: &str, from_file: &Path, _ws: &Workspace) -> Option<PathBuf> {
+        let mut dir = from_file.parent();
+        while let Some(d) = dir {
+            let name = d.file_name().and_then(|n| n.to_str());
+            if matches!(name, Some("src" | "test")) {
+                let cand = d.join(format!("{spec}.gleam"));
+                if cand.is_file() {
+                    return cand.canonicalize().ok();
+                }
+            }
+            dir = d.parent();
+        }
+        None
     }
 
     /// `pub` makes a definition visible outside its module. A data constructor has
@@ -164,13 +191,13 @@ mod tests {
     }
 
     #[test]
-    fn tier_two_queries_are_absent_on_purpose() {
+    fn refs_and_imports_queries_compile() {
         let adapter = Adapter::new();
-        assert!(
-            adapter.refs_query().is_none(),
-            "gleam calls come from gleam lsp"
-        );
-        assert!(adapter.imports_query().is_none());
+        let lang = adapter.grammar();
+        tree_sitter::Query::new(&lang, adapter.refs_query().expect("refs.scm")).expect("refs.scm");
+        tree_sitter::Query::new(&lang, adapter.imports_query().expect("imports.scm"))
+            .expect("imports.scm");
+        // no type inference for member calls, so no bindings query
         assert!(adapter.bindings_query().is_none());
     }
 

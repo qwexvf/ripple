@@ -1,6 +1,5 @@
-; Gleam Tier-0 definition captures. Like Go (docs/11 phase 4) there is no
-; refs.scm: call edges come from `gleam lsp` via `index --calls lsp`, and these
-; captures exist to give those calls a symbol to land in.
+; Gleam definition captures. Call edges come from `refs.scm` (static, no LSP);
+; these captures give those calls a symbol to land in.
 ;
 ; Gleam has no methods — every function is module-level — so nothing here needs
 ; qualifying by a receiver.
