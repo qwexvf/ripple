@@ -25,17 +25,34 @@ done
 
 say() { printf '\033[1;36m▸\033[0m %s\n' "$*"; }
 
-# ── 1. binary ────────────────────────────────────────────────────────────────
-case "$(uname -s)-$(uname -m)" in
-  Linux-x86_64)   triple=x86_64-unknown-linux-gnu;;
-  Darwin-arm64)   triple=aarch64-apple-darwin;;
-  Darwin-x86_64)  triple=x86_64-apple-darwin;;
-  *) echo "no prebuilt binary for $(uname -s)-$(uname -m); build with: cargo install --path crates/cli" >&2; exit 1;;
-esac
-url="https://github.com/$REPO/releases/latest/download/ripple-$triple.tar.gz"
-say "downloading ripple ($triple)"
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
-curl -fsSL "$url" | tar -xz -C "$tmp"
+
+# Run from a ripple checkout → use the local binary + skill (offline, no download).
+# Run standalone (curl | bash) → download the release binary + skill from GitHub.
+SCRIPT_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd || echo "")"
+LOCAL_REPO=""
+[ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/crates/cli/Cargo.toml" ] && LOCAL_REPO="$SCRIPT_DIR"
+
+# ── 1. binary ────────────────────────────────────────────────────────────────
+if [ -n "$LOCAL_REPO" ]; then
+  bin="$LOCAL_REPO/target/release/ripple"
+  if [ ! -x "$bin" ]; then
+    say "building ripple (release) from $LOCAL_REPO"
+    ( cd "$LOCAL_REPO" && cargo build --release --locked -p ripple-cli )
+  else
+    say "using existing build $bin"
+  fi
+  cp "$bin" "$tmp/ripple"
+else
+  case "$(uname -s)-$(uname -m)" in
+    Linux-x86_64)   triple=x86_64-unknown-linux-gnu;;
+    Darwin-arm64)   triple=aarch64-apple-darwin;;
+    Darwin-x86_64)  triple=x86_64-apple-darwin;;
+    *) echo "no prebuilt binary for $(uname -s)-$(uname -m); run this from a clone to build from source" >&2; exit 1;;
+  esac
+  say "downloading ripple ($triple)"
+  curl -fsSL "https://github.com/$REPO/releases/latest/download/ripple-$triple.tar.gz" | tar -xz -C "$tmp"
+fi
 mkdir -p "$BINDIR"
 install -m755 "$tmp/ripple" "$BINDIR/ripple"
 say "installed → $BINDIR/ripple"
@@ -44,8 +61,12 @@ case ":$PATH:" in *":$BINDIR:"*) :;; *) echo "  ⚠ add $BINDIR to your PATH";; 
 # ── 2. skill ─────────────────────────────────────────────────────────────────
 say "installing ripple-orient skill → $SKILLS_DIR/ripple-orient"
 mkdir -p "$SKILLS_DIR/ripple-orient"
-curl -fsSL "https://raw.githubusercontent.com/$REPO/main/.claude/skills/ripple-orient/SKILL.md" \
-  -o "$SKILLS_DIR/ripple-orient/SKILL.md"
+if [ -n "$LOCAL_REPO" ]; then
+  cp "$LOCAL_REPO/.claude/skills/ripple-orient/SKILL.md" "$SKILLS_DIR/ripple-orient/SKILL.md"
+else
+  curl -fsSL "https://raw.githubusercontent.com/$REPO/main/.claude/skills/ripple-orient/SKILL.md" \
+    -o "$SKILLS_DIR/ripple-orient/SKILL.md"
+fi
 
 # ── 3. CLAUDE.md note (idempotent marked block) ──────────────────────────────
 claude_md="$TARGET/CLAUDE.md"

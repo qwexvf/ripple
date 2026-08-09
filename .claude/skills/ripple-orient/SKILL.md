@@ -24,6 +24,12 @@ curl -fsSL https://raw.githubusercontent.com/qwexvf/ripple/main/install.sh \
   | bash -s -- --target /path/to/your/repo --mcp
 ```
 
+From a clone it runs offline — uses the local build and skill, no download:
+
+```
+./install.sh --target /path/to/your/repo
+```
+
 **By hand instead:**
 
 ```
