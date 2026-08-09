@@ -351,6 +351,8 @@ fn extract_defs(
                 extra_spans: Vec::new(),
                 is_exported: adapter.is_exported(def_node, src),
                 risk: ir::RiskScores::default(),
+                doc: adapter.doc(def_node, src),
+                route_path: None,
             });
         }
     }
@@ -729,6 +731,46 @@ mod tests {
         assert!(names.contains(&(NodeKind::Interface, "Options")));
         assert!(names.contains(&(NodeKind::Type, "Id")));
         assert!(names.contains(&(NodeKind::Enum, "Color")));
+    }
+
+    #[test]
+    fn captures_a_leading_doc_comment() {
+        let nodes = extract(
+            "// limits repeated login attempts\n\
+             export function guard() {}\n",
+            &ts(),
+        )
+        .unwrap();
+        let guard = nodes.iter().find(|n| n.name == "guard").unwrap();
+        assert_eq!(guard.doc.as_deref(), Some("limits repeated login attempts"));
+    }
+
+    #[test]
+    fn a_trailing_comment_is_not_taken_as_a_doc() {
+        // the comment belongs to the statement above, not to `next`
+        let nodes = extract(
+            "const rate = 5; // requests per second\n\
+             export function next() {}\n",
+            &ts(),
+        )
+        .unwrap();
+        let next = nodes.iter().find(|n| n.name == "next").unwrap();
+        assert_eq!(next.doc, None);
+    }
+
+    #[test]
+    fn a_doc_is_seen_through_an_attribute() {
+        // the Rust attribute sits between the doc and the fn; the doc must survive it
+        let rust = lang::rust::Adapter::new();
+        let nodes = extract(
+            "/// handles the login route\n\
+             #[tracing::instrument]\n\
+             pub fn login() {}\n",
+            &rust,
+        )
+        .unwrap();
+        let login = nodes.iter().find(|n| n.name == "login").unwrap();
+        assert_eq!(login.doc.as_deref(), Some("handles the login route"));
     }
 
     #[test]

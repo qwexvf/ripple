@@ -460,6 +460,298 @@ pub fn review_focus(
     }
 }
 
+// ── locate: natural-language task → entrypoint seeds ───────────────────────
+
+/// One place to start work, with why it surfaced and what it touches.
+pub struct Seed {
+    pub node: Node,
+    /// Which field carried each matched task word (`route:login`, `name:verify`),
+    /// so the agent gets the reason, not just the rank.
+    pub why: Vec<String>,
+    /// Dependents (in-degree) — a cheap, stable proxy for how central the symbol is.
+    pub centrality: usize,
+    /// Summed lexical match strength across the task words.
+    pub lexical: u32,
+    /// One-hop blast-radius preview: the top dependents of this seed, so an agent
+    /// sees "start here, and this is what it touches" without a second call.
+    pub touches: Vec<Touch>,
+}
+
+/// A dependent shown in a seed's blast preview.
+pub struct Touch {
+    pub node: Node,
+    pub via: EdgeKind,
+}
+
+/// Ranked entrypoints for a task, and how many candidates the ranking chose among.
+pub struct Located {
+    pub seeds: Vec<Seed>,
+    /// Candidates with a non-zero text match, before the budget cut.
+    pub total: usize,
+    /// The budget cut fell inside a run of equally-ranked candidates: the tail is
+    /// arbitrary among them, so an agent should widen rather than trust the order.
+    pub ambiguous: bool,
+}
+
+/// Split identifiers and prose into lowercase word tokens — on non-alphanumerics
+/// (`review_focus`, `auth/login`) and on camelCase humps (`getUserId` →
+/// `get user id`) — then strip a trailing plural `s` so "tokens" reaches `token`.
+pub fn tokenize(s: &str) -> Vec<String> {
+    split_words(s).iter().map(|w| singular(w)).collect()
+}
+
+/// The word split without stemming — on non-alphanumerics and camelCase humps,
+/// lowercased. `tokenize` stems each of these; `locate` keeps the unstemmed form
+/// to name the reason (`name:focus`, not the clipped `name:focu`).
+fn split_words(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut prev_lower = false;
+    for ch in s.chars() {
+        if ch.is_alphanumeric() {
+            if ch.is_uppercase() && prev_lower && !cur.is_empty() {
+                out.push(std::mem::take(&mut cur));
+            }
+            cur.extend(ch.to_lowercase());
+            prev_lower = ch.is_lowercase();
+        } else {
+            if !cur.is_empty() {
+                out.push(std::mem::take(&mut cur));
+            }
+            prev_lower = false;
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// Grammatical filler and the canonical "implement X" verb — words a task sentence
+/// carries that name no code. Left in, `a`/`the`/`into` substring-match almost every
+/// symbol, drowning the ranking and inflating the candidate count. Code verbs
+/// (`get`, `set`, `add`, `create`) are deliberately *not* here: they are real names.
+const STOPWORDS: &[&str] = &[
+    "a",
+    "an",
+    "the",
+    "to",
+    "of",
+    "in",
+    "on",
+    "at",
+    "by",
+    "for",
+    "and",
+    "or",
+    "as",
+    "is",
+    "are",
+    "be",
+    "it",
+    "its",
+    "this",
+    "that",
+    "with",
+    "into",
+    "from",
+    "after",
+    "before",
+    "when",
+    "where",
+    "how",
+    "what",
+    "which",
+    "then",
+    "than",
+    "so",
+    "if",
+    "no",
+    "not",
+    "implement",
+    "please",
+];
+
+/// Is this a task word worth matching? Drops stopwords and one-character tokens
+/// (a lone `a`/`s` substring-matches everything and means nothing).
+fn is_signal(word: &str) -> bool {
+    word.len() >= 2 && !STOPWORDS.contains(&word)
+}
+
+/// Trivial de-pluralization: drop a trailing `s` on a word long enough not to be
+/// an initialism, but keep `ss` (class, address). Deterministic, no model.
+fn singular(word: &str) -> String {
+    if word.len() > 3 && word.ends_with('s') && !word.ends_with("ss") {
+        word[..word.len() - 1].to_owned()
+    } else {
+        word.to_owned()
+    }
+}
+
+/// Score `node` against task `terms`, recording which field carried each hit.
+/// Zero with no reasons means drop it. A route word weighs most (a URL is a
+/// deliberate name for a feature), then the symbol name, then module/qualified,
+/// then prose in the doc comment.
+fn locate_score(node: &Node, terms: &[(String, String)]) -> (u32, Vec<String>) {
+    let name_tokens = tokenize(&node.name);
+    let module_tokens = tokenize(&node.module_path);
+    let route_tokens = node.route_path.as_deref().map(tokenize).unwrap_or_default();
+    let doc_tokens = node.doc.as_deref().map(tokenize).unwrap_or_default();
+    let name_lower = node.name.to_lowercase();
+    let qualified_lower = node.qualified_name.to_lowercase();
+
+    let mut score = 0u32;
+    let mut why: Vec<String> = Vec::new();
+    for (t, raw) in terms {
+        let (pts, field) = if route_tokens.iter().any(|w| w == t) {
+            (5, "route")
+        } else if name_tokens.iter().any(|w| w == t) {
+            (4, "name")
+        } else if name_lower.contains(t.as_str()) {
+            (2, "name")
+        } else if module_tokens.iter().any(|w| w == t) || qualified_lower.contains(t.as_str()) {
+            (2, "module")
+        } else if doc_tokens.iter().any(|w| w == t) {
+            (1, "doc")
+        } else {
+            (0, "")
+        };
+        if pts > 0 {
+            score += pts;
+            why.push(format!("{field}:{raw}"));
+        }
+    }
+    (score, why)
+}
+
+/// Rank starting points for a natural-language task across the whole graph. Text
+/// recall is fused with graph centrality and risk by Reciprocal Rank Fusion, so a
+/// word landing on a central, risky symbol outranks a bare substring hit; the top
+/// `budget` seeds each carry a one-hop blast-radius preview. See docs/07.
+pub fn locate(graph: &InMemoryGraph, task: &str, budget: usize) -> Located {
+    // stemmed for matching, raw kept alongside so a reason reads `name:focus`;
+    // stopwords and lone letters are dropped so the sentence's grammar is not matched,
+    // and a repeated word is counted once so "login login" does not inflate the score
+    let mut seen_terms: HashSet<String> = HashSet::new();
+    let terms: Vec<(String, String)> = split_words(task)
+        .into_iter()
+        .filter(|raw| is_signal(raw))
+        .map(|raw| (singular(&raw), raw))
+        .filter(|(stem, _)| seen_terms.insert(stem.clone()))
+        .collect();
+    if terms.is_empty() {
+        return Located {
+            seeds: Vec::new(),
+            total: 0,
+            ambiguous: false,
+        };
+    }
+
+    struct Cand<'a> {
+        node: &'a Node,
+        lexical: u32,
+        why: Vec<String>,
+        centrality: usize,
+    }
+    let cands: Vec<Cand> = graph
+        .nodes()
+        .filter_map(|n| match locate_score(n, &terms) {
+            (0, _) => None,
+            (lexical, why) => Some(Cand {
+                node: n,
+                lexical,
+                why,
+                centrality: graph.in_edges(n.id).len(),
+            }),
+        })
+        .collect();
+    let total = cands.len();
+    if cands.is_empty() {
+        return Located {
+            seeds: Vec::new(),
+            total: 0,
+            ambiguous: false,
+        };
+    }
+
+    // RRF: each signal contributes 1/(K + rank). K dampens how much the top of any
+    // one ranking dominates. Ties are broken by SymbolId inside every sort so the
+    // ranks — and therefore the fused order — are reproducible run to run.
+    const K: f32 = 60.0;
+    let n = cands.len();
+    let mut rrf = vec![0f32; n];
+    let tie = |a: &Cand, b: &Cand| a.node.id.0.cmp(&b.node.id.0);
+
+    // Competition ranking, not ordinal: candidates equal on a signal share the same
+    // rank (the position where their run begins), so two indistinguishable matches
+    // get an identical fused score — which is what makes a tie detectable instead of
+    // silently broken by the sort's own arbitrary order. `cmp` orders (descending),
+    // `eq` decides who ties.
+    let mut fuse = |cmp: &dyn Fn(&Cand, &Cand) -> Ordering, eq: &dyn Fn(&Cand, &Cand) -> bool| {
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by(|&a, &b| cmp(&cands[a], &cands[b]).then_with(|| tie(&cands[a], &cands[b])));
+        let mut rank = 0usize;
+        for pos in 0..n {
+            if pos > 0 && !eq(&cands[order[pos]], &cands[order[pos - 1]]) {
+                rank = pos;
+            }
+            rrf[order[pos]] += 1.0 / (K + rank as f32);
+        }
+    };
+    fuse(&|a, b| b.lexical.cmp(&a.lexical), &|a, b| {
+        a.lexical == b.lexical
+    });
+    fuse(&|a, b| b.centrality.cmp(&a.centrality), &|a, b| {
+        a.centrality == b.centrality
+    });
+    fuse(
+        &|a, b| b.node.risk.composite.total_cmp(&a.node.risk.composite),
+        &|a, b| a.node.risk.composite.total_cmp(&b.node.risk.composite) == Ordering::Equal,
+    );
+
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| {
+        rrf[b]
+            .total_cmp(&rrf[a])
+            .then_with(|| tie(&cands[a], &cands[b]))
+    });
+
+    let ambiguous = budget >= 1
+        && n > budget
+        && (rrf[order[budget - 1]] - rrf[order[budget]]).abs() < f32::EPSILON;
+
+    let seeds = order
+        .iter()
+        .take(budget)
+        .map(|&i| {
+            let c = &cands[i];
+            // reuse the blast-radius engine, tiny budget — the preview is a teaser,
+            // not the full impact an agent runs once it has picked a seed
+            let touches = impact(graph, &[c.node.id], 3)
+                .hits
+                .into_iter()
+                .map(|h| Touch {
+                    node: h.node,
+                    via: h.via,
+                })
+                .collect();
+            Seed {
+                node: c.node.clone(),
+                why: c.why.clone(),
+                centrality: c.centrality,
+                lexical: c.lexical,
+                touches,
+            }
+        })
+        .collect();
+
+    Located {
+        seeds,
+        total,
+        ambiguous,
+    }
+}
+
 struct QItem {
     weight: f32,
     id: SymbolId,
@@ -507,6 +799,8 @@ mod tests {
             extra_spans: Vec::new(),
             is_exported: true,
             risk: ir::RiskScores::default(),
+            doc: None,
+            route_path: None,
         }
     }
 
@@ -715,5 +1009,113 @@ mod tests {
         let all = review_focus(&graph, &changed, 20, "");
         assert_eq!(all.focus.len(), 5);
         assert_eq!(all.total, 5, "nothing cut, nothing to report");
+    }
+
+    #[test]
+    fn tokenize_splits_camel_snake_and_strips_plurals() {
+        assert_eq!(tokenize("getUserId"), ["get", "user", "id"]);
+        assert_eq!(tokenize("auth/login.ts"), ["auth", "login", "ts"]);
+        // trailing plural dropped, but `ss` kept
+        assert_eq!(tokenize("tokens class"), ["token", "class"]);
+        // de-pluralization is crude (it also clips "focus" → "focu"), but it runs
+        // on both the query and the field, so an exact token still meets its match
+        assert_eq!(tokenize("review_focus"), tokenize("reviewFocus"));
+    }
+
+    /// A task word that names a URL must reach the handler even though its function
+    /// name says none of the word — that is the whole point of stamping route_path.
+    #[test]
+    fn locate_reaches_a_handler_through_its_route() {
+        let mut handler = node("api/auth.ex", "handle");
+        handler.route_path = Some("auth login".to_owned());
+        let unrelated = node("api/other.ex", "handle");
+        let graph = InMemoryGraph::from_parts(vec![handler.clone(), unrelated], Vec::new());
+
+        let r = locate(&graph, "implement login", 10);
+        assert_eq!(r.seeds.len(), 1, "only the routed handler matches 'login'");
+        assert_eq!(r.seeds[0].node.id, handler.id);
+        assert!(r.seeds[0].why.iter().any(|w| w == "route:login"));
+    }
+
+    /// Prose in a doc comment is the weakest but real signal — a symbol named
+    /// nothing like the task is still reachable through what it documents.
+    #[test]
+    fn locate_matches_doc_comment_text() {
+        let mut guard = node("api/mw.ts", "mw");
+        guard.doc = Some("limits repeated login attempts".to_owned());
+        let graph = InMemoryGraph::from_parts(vec![guard.clone()], Vec::new());
+
+        let r = locate(&graph, "login attempts", 10);
+        assert_eq!(r.seeds.len(), 1);
+        assert_eq!(r.seeds[0].node.id, guard.id);
+        assert!(r.seeds[0].why.iter().any(|w| w == "doc:login"));
+    }
+
+    /// A task sentence's grammar must not be matched: `a`/`the`/`into` would
+    /// substring-hit nearly every symbol and drown the ranking.
+    #[test]
+    fn locate_ignores_stopwords_and_lone_letters() {
+        let real = node("a.ts", "parse");
+        // named only with words a task sentence carries; nothing real to match
+        let noise = node("a.ts", "the");
+        let graph = InMemoryGraph::from_parts(vec![real.clone(), noise.clone()], Vec::new());
+
+        // only "parse" is signal; "the"/"a"/"into" and the lone "x" are dropped
+        let r = locate(&graph, "parse the a file into x", 10);
+        assert_eq!(r.seeds.len(), 1, "only the real word matched");
+        assert_eq!(r.seeds[0].node.id, real.id);
+
+        // a task made entirely of stopwords matches nothing at all
+        assert!(locate(&graph, "the a of into", 10).seeds.is_empty());
+    }
+
+    /// The determinism invariant: two runs over the same graph agree exactly, so a
+    /// diff of two `locate` outputs means something.
+    #[test]
+    fn locate_ranking_is_deterministic() {
+        let nodes: Vec<Node> = (0..20)
+            .map(|i| node("a.ts", &format!("login{i}")))
+            .collect();
+        let graph = InMemoryGraph::from_parts(nodes, Vec::new());
+
+        let a = locate(&graph, "login", 8);
+        let b = locate(&graph, "login", 8);
+        let ids = |r: &Located| r.seeds.iter().map(|s| s.node.id.0).collect::<Vec<_>>();
+        assert_eq!(ids(&a), ids(&b));
+    }
+
+    /// A budget that cuts through a run of identical candidates is flagged, and the
+    /// total is reported so a thin ranking never reads as a confident one.
+    #[test]
+    fn locate_declares_a_tied_truncation() {
+        // 10 indistinguishable matches: same name shape, no edges, no risk
+        let nodes: Vec<Node> = (0..10)
+            .map(|i| node("a.ts", &format!("login{i}")))
+            .collect();
+        let graph = InMemoryGraph::from_parts(nodes, Vec::new());
+
+        let r = locate(&graph, "login", 3);
+        assert_eq!(r.seeds.len(), 3);
+        assert_eq!(r.total, 10);
+        assert!(r.ambiguous, "the cut fell inside a tie");
+    }
+
+    /// Centrality breaks a lexical tie: two equally-named matches, the one more
+    /// things depend on ranks first, because that is where work usually starts.
+    #[test]
+    fn locate_prefers_the_more_central_of_two_equal_matches() {
+        let hub = node("a.ts", "login");
+        let leaf = node("b.ts", "login");
+        let d1 = node("a.ts", "d1");
+        let d2 = node("a.ts", "d2");
+        // d1, d2 depend on hub; nothing depends on leaf
+        let graph = InMemoryGraph::from_parts(
+            vec![hub.clone(), leaf.clone(), d1.clone(), d2.clone()],
+            vec![calls(&d1, &hub), calls(&d2, &hub)],
+        );
+
+        let r = locate(&graph, "login", 2);
+        assert_eq!(r.seeds[0].node.id, hub.id, "the hub outranks the leaf");
+        assert_eq!(r.seeds[0].centrality, 2);
     }
 }

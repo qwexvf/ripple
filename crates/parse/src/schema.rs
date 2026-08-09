@@ -100,6 +100,8 @@ fn canonical() -> FileExtract {
                 test_proximity: 0.0,
                 composite: 0.0,
             },
+            doc: Some("d".to_owned()),
+            route_path: Some("r".to_owned()),
         }],
         imports: vec![ImportRec {
             local_name: "l".to_owned(),

@@ -882,6 +882,8 @@ mod tests {
             extra_spans: Vec::new(),
             is_exported: true,
             risk: ir::RiskScores::default(),
+            doc: None,
+            route_path: None,
         }
     }
 

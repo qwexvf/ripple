@@ -127,10 +127,12 @@ pub fn build_incremental(
 ) -> Result<Indexed> {
     let registry = lang::registry();
     // compile queries once, shared across all roots + rayon threads
-    let queries: HashMap<&str, Queries> = registry
-        .iter()
-        .map(|a| Ok((a.id(), Queries::compile(a.as_ref())?)))
-        .collect::<Result<_>>()?;
+    let queries: HashMap<&str, Queries> = ir::timing::step("compile_queries", || {
+        registry
+            .iter()
+            .map(|a| Ok((a.id(), Queries::compile(a.as_ref())?)))
+            .collect::<Result<_>>()
+    })?;
 
     let single = roots.len() == 1;
     let mut tags = HashMap::new();
@@ -167,6 +169,8 @@ pub fn build_incremental(
     order.sort_by_key(|&i| std::cmp::Reverse(canonical[i].as_os_str().len()));
 
     let mut per_root: Vec<Vec<CachedFile>> = vec![Vec::new(); canonical.len()];
+    let discover_span = ir::timing::start("discover+parse");
+    let mut discovered = 0usize;
     for &i in &order {
         let (files, s) = discover(
             &canonical[i],
@@ -179,8 +183,10 @@ pub fn build_incremental(
         stats.added += s.added;
         stats.changed += s.changed;
         stats.unchanged += s.unchanged;
+        discovered += files.len();
         per_root[i] = files;
     }
+    discover_span.stop(discovered);
     // reassembled in the caller's order, so file order — and therefore edge order —
     // does not depend on how deep the roots happen to be
     for (i, files) in per_root.into_iter().enumerate() {
@@ -188,9 +194,16 @@ pub fn build_incremental(
         all_files.extend(files);
     }
 
-    let ws = Workspaces::discover_all(&used_roots);
+    let ws = ir::timing::step("discover_workspaces", || {
+        Workspaces::discover_all(&used_roots)
+    });
+    let idx_span = ir::timing::start("index_defs");
     let (index, nodes) = index_defs(&all_files, &file_root);
+    idx_span.stop(nodes.len());
+
+    let link_span = ir::timing::start("link");
     let edges = link(&all_files, &file_root, &index, &registry, &ws);
+    link_span.stop(edges.len());
 
     // removed = cached entries no longer present in any root
     let seen: HashSet<&str> = all_files.iter().map(|f| f.module_path.as_str()).collect();
@@ -1001,6 +1014,8 @@ fn module_node(module_path: &str) -> Node {
         extra_spans: Vec::new(),
         is_exported: false,
         risk: ir::RiskScores::default(),
+        doc: None,
+        route_path: None,
     }
 }
 
