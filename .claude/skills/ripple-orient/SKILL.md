@@ -15,7 +15,17 @@ question is structural: entrypoints, callers, blast radius, cross-service reach.
 
 ## Install
 
-One-time. From a clone of the ripple repo:
+One-time. **From a release (no compile)** — grab the prebuilt binary for your
+platform from <https://github.com/qwexvf/ripple/releases/latest>:
+
+```
+# linux x86_64 (swap the target for macOS: aarch64-apple-darwin / x86_64-apple-darwin)
+curl -fsSL https://github.com/qwexvf/ripple/releases/latest/download/ripple-VERSION-x86_64-unknown-linux-gnu.tar.gz \
+  | tar -xz && install -m755 ripple ~/.local/bin/ripple    # anywhere on PATH
+```
+
+Replace `VERSION` with the tag (e.g. `v0.5.0`). Or **build from source** if you're
+hacking on ripple itself, from a clone of the repo:
 
 ```
 cargo install --path crates/cli      # builds + puts `ripple` on your PATH
