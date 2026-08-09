@@ -13,6 +13,34 @@ ranked, reasoned starting set, so you spend attention (and tokens) where they ma
 It is **not** a grep replacement for "find the string `foo`". Use it when the
 question is structural: entrypoints, callers, blast radius, cross-service reach.
 
+## Install
+
+One-time. From a clone of the ripple repo:
+
+```
+cargo install --path crates/cli      # builds + puts `ripple` on your PATH
+```
+
+Then either wire it as an MCP server (an agent calls the tools directly)…
+
+```
+claude mcp add ripple -- ripple mcp --root /path/to/your/repo
+```
+
+…or skip MCP and use the CLI (`ripple locate …`, `ripple impact …`). The MCP server
+**indexes on first tool call**, so pointing it at a never-indexed repo just works; from
+the CLI, run `ripple index <path>` once first.
+
+Make this skill available everywhere (not just inside the ripple repo) by copying it
+into your user skills dir — otherwise it only loads for repos that carry it under
+`.claude/skills/`:
+
+```
+cp -r .claude/skills/ripple-orient ~/.claude/skills/
+```
+
+Verify: `ripple --help` lists `locate`, and `/ripple-orient` is offered as a skill.
+
 ## The one rule
 
 **Start every implement/change task with `locate`, not with reading files.** You are
