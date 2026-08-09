@@ -15,21 +15,29 @@ question is structural: entrypoints, callers, blast radius, cross-service reach.
 
 ## Install
 
-One-time. **From a release (no compile)** — grab the prebuilt binary for your
-platform from <https://github.com/qwexvf/ripple/releases/latest>:
+**One command** (prebuilt binary + this skill + a CLAUDE.md note on when to use
+ripple, patched into the target repo). Re-runnable; add `--mcp` to also register the
+MCP server:
 
 ```
-# linux x86_64 (swap the target for macOS: aarch64-apple-darwin / x86_64-apple-darwin)
-curl -fsSL https://github.com/qwexvf/ripple/releases/latest/download/ripple-VERSION-x86_64-unknown-linux-gnu.tar.gz \
-  | tar -xz && install -m755 ripple ~/.local/bin/ripple    # anywhere on PATH
+curl -fsSL https://raw.githubusercontent.com/qwexvf/ripple/main/install.sh \
+  | bash -s -- --target /path/to/your/repo --mcp
 ```
 
-Replace `VERSION` with the tag (e.g. `v0.5.0`). Or **build from source** if you're
-hacking on ripple itself, from a clone of the repo:
+**By hand instead:**
 
 ```
-cargo install --path crates/cli      # builds + puts `ripple` on your PATH
+# 1. binary — prebuilt, no compile (macOS: aarch64-apple-darwin / x86_64-apple-darwin)
+curl -fsSL https://github.com/qwexvf/ripple/releases/latest/download/ripple-x86_64-unknown-linux-gnu.tar.gz \
+  | tar -xz && install -m755 ripple ~/.local/bin/ripple
+# 2. this skill, available in every repo
+mkdir -p ~/.claude/skills/ripple-orient && curl -fsSL \
+  https://raw.githubusercontent.com/qwexvf/ripple/main/.claude/skills/ripple-orient/SKILL.md \
+  -o ~/.claude/skills/ripple-orient/SKILL.md
 ```
+
+Contributors hacking on ripple itself build from a clone instead:
+`cargo install --path crates/cli`.
 
 Then either wire it as an MCP server (an agent calls the tools directly)…
 

@@ -36,9 +36,11 @@ jobs:
           key: ${{ matrix.target }}
       - run: cargo build --release --locked -p ripple-cli --target ${{ matrix.target }}
       - name: package
+        # no version in the name, so `releases/latest/download/ripple-<target>.tar.gz`
+        # is a stable URL the installer can curl without knowing the tag
         run: |
           tar -C target/${{ matrix.target }}/release -czf \
-            ripple-${{ github.ref_name }}-${{ matrix.target }}.tar.gz ripple
+            ripple-${{ matrix.target }}.tar.gz ripple
       - uses: softprops/action-gh-release@v2
         with:
-          files: ripple-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+          files: ripple-${{ matrix.target }}.tar.gz
