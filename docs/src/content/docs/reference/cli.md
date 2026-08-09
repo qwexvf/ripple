@@ -10,6 +10,7 @@ sidebar:
 ripple parse <file> [--json]
 ripple index <path>... [--calls lsp [--calls-budget 120s]]
 ripple neighbors <symbol> [--in|--out] [--depth N] [--in-file <substr>] [--root <path>] [--json]
+ripple locate <task words...> [--budget N] [--root <path>] [--json]
 ripple impact <symbol>... [--budget N] [--in-file <substr>] [--root <path>] [--json] [--verify lsp]
 ripple review [<base>] [--budget N] [--root <path>] [--json] [--verify lsp]
 ripple path <from> <to> [--depth 6] [--limit 3] [--root <path>] [--json]
@@ -115,6 +116,21 @@ than a call, so it is a weaker claim and gets its own edge kind; it still shows 
 `impact`, `path` and `neighbors`. Yield depends on the server having a project it can load:
 232 Gleam files in aegis gave 2431 edges, while 208 `.gleam` files scattered through a repo
 with no `gleam.toml` gave 98.
+
+## `ripple locate <task words...>`
+
+The front door for a task you can only describe, not name yet. Give it the task in plain
+words and it returns the symbols to start from, ranked across every indexed repo. It
+matches the words against symbol names, module paths, endpoint routes, and doc comments
+(splitting `camelCase` and `snake_case`, and a trailing plural), then fuses that lexical
+recall with graph centrality and per-symbol risk by Reciprocal Rank Fusion — so a word
+landing on a central, risky symbol beats a bare substring hit.
+
+Each seed line shows its kind, the fields that matched (`why`), its dependent count, and a
+one-hop blast-radius preview of what it touches. `--budget` defaults to 10; when the cut
+falls inside a run of equally-ranked candidates it says so, so a thin ranking is never
+mistaken for a confident one. Use this before `impact`/`neighbors`, which want the exact
+name `locate` hands you.
 
 ## `ripple impact <symbol>...`
 

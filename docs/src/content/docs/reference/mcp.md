@@ -38,7 +38,8 @@ first (`ripple index repo-a repo-b`) and point `--root` at the root that holds t
 
 | Tool | Required | Optional | What it answers |
 |---|---|---|---|
-| `search` | `query` | `limit` (30) | Find symbols and files by substring. **Call this first** — the other tools want exact names |
+| `locate` | `task` | `budget` (10) | "Where do I start for this task?" Plain-words task in, ranked starting symbols across every repo out — each with why it matched and a blast-radius preview. **Call this first for an implement/feature task** |
+| `search` | `query` | `limit` (30) | Find symbols and files by substring. **Call this first to disambiguate a known name** — the other tools want exact names |
 | `impact` | `symbol` | `budget` (20) | Risk-ranked blast radius across languages and services |
 | `review_focus` | — | `base`, `budget` | Rank the symbols in a diff by review priority. No `base` means working tree vs `HEAD` |
 | `neighbors` | `symbol` | `direction` (`in`/`out`), `depth`, `limit` (50) | One hop of callers/importers or callees/imports |
@@ -50,11 +51,24 @@ first (`ripple index repo-a repo-b`) and point `--root` at the root that holds t
 There is no `search` subcommand on the CLI — it exists only here, because picking the
 right symbol out of several same-named candidates is an agent problem.
 
-## Why `search` first
+## Why `locate` first for a task
+
+An agent handed "implement rate limiting on login" has no symbol yet, and the task's
+words rarely appear in a function name. `locate` maps the task to code: it matches the
+words against symbol names, module paths, endpoint routes, and doc comments, then fuses
+that lexical recall with graph centrality and risk (Reciprocal Rank Fusion) so a word
+landing on a central, risky symbol outranks a bare substring hit. Each returned seed
+carries its `repo`, the fields that matched (`why`), its dependent count, and a one-hop
+blast-radius preview (`touches`) — so one call answers "start here, and this is what it
+touches" instead of a search followed by a read of every candidate and a separate
+`impact`. On a cross-repo index the seeds span both repos in one ranked list.
+
+## Why `search` for a known name
 
 On a real repository a bare name is usually ambiguous. `search` returns each candidate
 with its kind, qualified name, and module, so the agent picks deliberately instead of
-guessing at the first hit and editing the wrong `getPath`.
+guessing at the first hit and editing the wrong `getPath`. Use it once you already know
+the name; use `locate` when you only know the task.
 
 ## Contracts worth relying on
 

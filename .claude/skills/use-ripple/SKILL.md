@@ -111,6 +111,7 @@ Multiple roots become one graph: `index <web> <api>`. The database lives under t
 ## Queries
 
 ```
+locate <task words...> [--budget N] [--root P] [--json]  # task → ranked start symbols
 neighbors <symbol> [--in|--out] [--depth N] [--root P] [--json]
 impact <symbol>... [--budget N] [--root P] [--json]     # ranked blast radius
 review [<base-rev>] [--budget N] [--root P] [--json]    # hunks to look at first
@@ -160,9 +161,12 @@ cargo run -p ripple-cli -- mcp --root <p>
 #        "params":{"name":"search","arguments":{"query":"device"}}}
 ```
 
-MCP tools: `search`, `impact`, `review_focus`, `neighbors`, `risk`, `explain_edge`,
-`reindex`. `explain_edge` gives an edge's kind, confidence and site — use it whenever
-an edge looks wrong. `reindex` after edits, or results are stale.
+MCP tools: `locate`, `search`, `impact`, `review_focus`, `neighbors`, `risk`,
+`explain_edge`, `reindex`. `locate` takes a plain-words task and returns ranked start
+symbols (each with why + a blast preview) — the front door when you don't have a name
+yet; `search` is for disambiguating one you do. `explain_edge` gives an edge's kind,
+confidence and site — use it whenever an edge looks wrong. `reindex` after edits, or
+results are stale.
 
 ## Read confidence, don't ignore it
 
