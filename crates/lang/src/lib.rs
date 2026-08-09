@@ -16,6 +16,120 @@ pub mod typescript;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+/// Leading-comment extraction shared by the default `LanguageAdapter::doc`.
+mod doc_comment {
+    /// The run of comment lines directly above `def`, stripped of comment markers
+    /// and collapsed to one line. `None` when there is no adjacent comment.
+    ///
+    /// Adjacency is by row: a comment separated from the definition by a blank line
+    /// is a section header or a leftover, not this symbol's doc, so the walk stops
+    /// at the first gap. An attribute or decorator between the comment and the
+    /// definition (`#[instrument]`, `@Get('/login')`) is seen through, since the doc
+    /// sits above it — otherwise every decorated handler, the shape this feature most
+    /// targets, would lose its doc. A comment with code before it on its line is a
+    /// trailing comment on the statement above, not a doc, so it stops the walk.
+    /// Capped so a license header above a top-level symbol cannot bloat the index.
+    pub fn preceding(def: tree_sitter::Node, src: &[u8]) -> Option<String> {
+        // The captured def is often nested — `export function f` wraps the function
+        // in an `export_statement`, a decorated def wraps it with its decorator — so
+        // the doc comment is a sibling of the wrapper, not of the def. Climb to that
+        // wrapper first, or the walk starts from a node that has no prior sibling.
+        let mut anchor = def;
+        while let Some(p) = anchor.parent() {
+            let same_line = p.start_position().row == def.start_position().row;
+            if p.parent().is_some() && (same_line || is_wrapper(p.kind())) {
+                anchor = p;
+            } else {
+                break;
+            }
+        }
+        let mut parts: Vec<String> = Vec::new();
+        let mut next_start = anchor.start_position().row;
+        let mut cur = anchor.prev_sibling();
+        while let Some(n) = cur {
+            // a blank-line gap means this sibling is not attached to the definition
+            if next_start.saturating_sub(n.end_position().row) > 1 {
+                break;
+            }
+            let kind = n.kind();
+            if kind.contains("comment") {
+                if !line_leading(n, src) {
+                    break; // a trailing comment on the line above, not a doc
+                }
+                if let Ok(t) = n.utf8_text(src) {
+                    parts.push(strip(t));
+                }
+                next_start = n.start_position().row;
+            } else if is_decorator(kind) {
+                next_start = n.start_position().row; // see past it to the doc above
+            } else {
+                break;
+            }
+            cur = n.prev_sibling();
+        }
+        if parts.is_empty() {
+            return None;
+        }
+        parts.reverse();
+        let joined = parts.join(" ");
+        let collapsed = joined.split_whitespace().collect::<Vec<_>>().join(" ");
+        if collapsed.is_empty() {
+            return None;
+        }
+        Some(collapsed.chars().take(400).collect())
+    }
+
+    /// Is `n` the first non-whitespace thing on its line? A comment that is not
+    /// (code precedes it) is a trailing comment on that statement, not a doc.
+    fn line_leading(n: tree_sitter::Node, src: &[u8]) -> bool {
+        let mut i = n.start_byte();
+        while i > 0 {
+            let b = src[i - 1];
+            if b == b'\n' {
+                break;
+            }
+            if !b.is_ascii_whitespace() {
+                return false;
+            }
+            i -= 1;
+        }
+        true
+    }
+
+    /// Attribute/decorator/annotation node kinds — the thing that can legitimately
+    /// sit between a doc comment and the definition it documents.
+    fn is_decorator(kind: &str) -> bool {
+        kind.contains("attribute") || kind.contains("decorator") || kind.contains("annotation")
+    }
+
+    /// Node kinds that wrap a definition without being on its own line — a doc
+    /// comment attaches above the wrapper, so the walk must start from the wrapper.
+    fn is_wrapper(kind: &str) -> bool {
+        kind.contains("export") || kind.contains("decorated") || kind.contains("attributed")
+    }
+
+    /// Strip line/block comment punctuation without knowing the language: every
+    /// grammar's markers are a subset of these.
+    fn strip(text: &str) -> String {
+        text.lines()
+            .map(|line| {
+                line.trim()
+                    .trim_start_matches("///")
+                    .trim_start_matches("//!")
+                    .trim_start_matches("//")
+                    .trim_start_matches("/**")
+                    .trim_start_matches("/*")
+                    .trim_end_matches("*/")
+                    .trim_start_matches('*')
+                    .trim_start_matches('#')
+                    .trim()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
 /// Project resolution context: tsconfig `paths`/`baseUrl` aliases and workspace
 /// package locations. Discovered once per index and passed to `resolve_import`.
 /// Empty by default (relative resolution still works). See docs/05-language-support.md.
@@ -70,6 +184,17 @@ pub trait LanguageAdapter: Send + Sync {
         _src: &[u8],
     ) -> String {
         name.to_owned()
+    }
+
+    /// Leading doc comment for a definition, if any — searchable prose so a task
+    /// described in words ("limit login attempts") can reach a symbol whose
+    /// identifier shares none of them (`query::locate`). The default collects the
+    /// run of comment lines directly above the definition, which covers every
+    /// grammar whose comment node kind carries "comment" in its name (TS, Elixir,
+    /// Rust, Go, Python, Gleam). Override for languages whose docs are not
+    /// preceding comments (a Python docstring, an Elixir `@doc` attribute).
+    fn doc(&self, def: tree_sitter::Node, src: &[u8]) -> Option<String> {
+        doc_comment::preceding(def, src)
     }
 
     /// Tier 1: imports.scm capturing `@import.source`, `@import.name`, `@import.default`.

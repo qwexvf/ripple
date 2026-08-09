@@ -21,6 +21,7 @@ fn main() -> Result<()> {
         Some("parse") => cmd_parse(&args[1..]),
         Some("index") => cmd_index(&args[1..]),
         Some("neighbors") => cmd_neighbors(&args[1..]),
+        Some("locate") => cmd_locate(&args[1..]),
         Some("impact") => cmd_impact(&args[1..]),
         Some("review") => cmd_review(&args[1..]),
         Some("path") => cmd_path(&args[1..]),
@@ -33,7 +34,7 @@ fn main() -> Result<()> {
     }
 }
 
-const USAGE: &str = "usage:\n  ripple parse <file> [--json]\n  ripple index <path>... [--calls lsp [--calls-budget 120s]]   (--calls lsp: call edges from a language server, for languages with no refs query)\n  ripple neighbors <symbol> [--in|--out] [--depth N] [--in-file <substr>] [--root <path>] [--json]\n  ripple impact <symbol>... [--budget N] [--in-file <substr>] [--root <path>] [--json] [--verify lsp]\n  ripple review [<base>] [--budget N] [--root <path>] [--json] [--verify lsp]\n    --verify lsp [--verify-budget 2s] [--floor-contradicted|--drop-contradicted]  (upgrade call edges from a language server)\n  ripple path <from> <to> [--depth 6] [--limit 3] [--root <path>] [--json]   (how does A reach B?)\n  ripple risk <symbol|file> [--root <path>] [--json]\n  ripple mcp [--root <path>]   (MCP server over stdio for AI agents)\n  ripple eval [--commits N] [--skip N] [--weights <spec>] [--root <path>]   (held-out co-change recall)\n    --risk                                        (do the risk terms rank the files a later fix touched?)\n    --oracle lsp [--sample N] [--granularity function|file]   (agree with a language server?)\n  ripple lsp doctor [--root <path>] [--budget 10s] [--json]   (are language servers usable here?)\n  ripple lsp trust [--root <path>]   (allow this repo's own .ripple/lsp.json to launch servers)";
+const USAGE: &str = "usage:\n  ripple parse <file> [--json]\n  ripple index <path>... [--calls lsp [--calls-budget 120s]] [--debug]   (--calls lsp: call edges from a language server; --debug: per-phase timings to stderr)\n  ripple neighbors <symbol> [--in|--out] [--depth N] [--in-file <substr>] [--root <path>] [--json]\n  ripple locate <task words...> [--budget N] [--root <path>] [--json] [--debug]   (where do I start for this task?)\n  ripple impact <symbol>... [--budget N] [--in-file <substr>] [--root <path>] [--json] [--verify lsp]\n  ripple review [<base>] [--budget N] [--root <path>] [--json] [--verify lsp]\n    --verify lsp [--verify-budget 2s] [--floor-contradicted|--drop-contradicted]  (upgrade call edges from a language server)\n  ripple path <from> <to> [--depth 6] [--limit 3] [--root <path>] [--json]   (how does A reach B?)\n  ripple risk <symbol|file> [--root <path>] [--json]\n  ripple mcp [--root <path>]   (MCP server over stdio for AI agents)\n  ripple eval [--commits N] [--skip N] [--weights <spec>] [--root <path>]   (held-out co-change recall)\n    --risk                                        (do the risk terms rank the files a later fix touched?)\n    --oracle lsp [--sample N] [--granularity function|file]   (agree with a language server?)\n  ripple lsp doctor [--root <path>] [--budget 10s] [--json]   (are language servers usable here?)\n  ripple lsp trust [--root <path>]   (allow this repo's own .ripple/lsp.json to launch servers)";
 
 /// Where `root`'s own database would live.
 fn own_db_path(root: &Path) -> PathBuf {
@@ -193,6 +194,9 @@ fn cmd_parse(args: &[String]) -> Result<()> {
 }
 
 fn cmd_index(args: &[String]) -> Result<()> {
+    if args.iter().any(|a| a == "--debug") {
+        ir::timing::force_on();
+    }
     let roots: Vec<PathBuf> = {
         let r: Vec<PathBuf> = positionals(args).into_iter().map(PathBuf::from).collect();
         if r.is_empty() {
@@ -216,17 +220,21 @@ fn cmd_index(args: &[String]) -> Result<()> {
 /// Build the graph for `roots` (parse + git overlay + cross-service) and persist
 /// it. Returns a one-line summary. Shared by `index` and the MCP `reindex` tool.
 fn index_project(roots: &[PathBuf], lsp_calls: Option<std::time::Duration>) -> Result<String> {
+    let total = ir::timing::start("index total");
     let mut store = RedbStore::open(own_db_path(&roots[0])); // db + cache live under root[0]
 
-    let cached = store.read_extracts()?;
-    let indexed = resolve::build_incremental(roots, &cached)?;
+    let cached = ir::timing::step("read_cache", || store.read_extracts())?;
+    let indexed = ir::timing::step("build_incremental", || {
+        resolve::build_incremental(roots, &cached)
+    })?;
     let mut nodes = indexed.result.nodes;
     let mut edges = indexed.result.edges;
 
     // git overlay per root (best-effort), namespaced to match module paths
+    let git_span = ir::timing::start("git_overlay_mine");
     let mut git = overlay::GitOverlay::default();
     for (tag, root) in &indexed.roots {
-        let o = overlay::mine(root);
+        let o = overlay::mine_cached(root);
         for (k, v) in o.file_risk {
             git.file_risk.insert(resolve::namespace(tag, &k), v);
         }
@@ -235,25 +243,51 @@ fn index_project(roots: &[PathBuf], lsp_calls: Option<std::time::Duration>) -> R
                 .push((resolve::namespace(tag, &a), resolve::namespace(tag, &b), s));
         }
     }
+    git_span.stop(git.cochange.len());
+    let cochange_span = ir::timing::start("cochange_apply");
     let cochange_applied = overlay::apply(&git, &mut nodes, &mut edges);
+    cochange_span.stop(cochange_applied);
 
     // cross-service: TS→resolver (GraphqlCall), resolver→context (Calls), fn→schema (DbQuery)
-    let mut cross = resolve::link_cross_service(&indexed.files, &nodes);
+    let mut cross = ir::timing::step("cross_service", || {
+        resolve::link_cross_service(&indexed.files, &nodes)
+    });
     let (graphql, db, imported) = (cross.graphql, cross.db, cross.imported);
     let (unmatched, unused) = (cross.unmatched_consumers, cross.unused_providers);
     let (endpoints, mounted) = (cross.endpoints, cross.mounted);
     let file_granular = cross.file_granular;
     edges.append(&mut cross.edges);
 
+    // stamp each handler with the route it serves, so `locate("login")` reaches the
+    // handler through its URL and not only through a call that happens to say "login"
+    if !cross.route_paths.is_empty() {
+        let mut by_id: HashMap<ir::SymbolId, Vec<String>> = HashMap::new();
+        for (id, text) in cross.route_paths.drain(..) {
+            let routes = by_id.entry(id).or_default();
+            if !routes.contains(&text) {
+                routes.push(text);
+            }
+        }
+        for n in &mut nodes {
+            if let Some(routes) = by_id.get(&n.id) {
+                n.route_path = Some(routes.join(" "));
+            }
+        }
+    }
+
     // tests last: an Elixir call edge only exists after the cross-service pass, and
     // a test that calls nothing ripple resolved is a test ripple can't see (#36)
     let scopes = resolve::TestScopes::of(&indexed.files, &indexed.roots, &lang::registry());
+    let tests_span = ir::timing::start("link_tests");
     let mut test_edges = resolve::link_tests(&scopes, &edges);
+    tests_span.stop(test_edges.len());
     let tests = test_edges.len();
     edges.append(&mut test_edges);
 
     // structural risk needs every edge, including the cross-service ones
+    let struct_span = ir::timing::start("score_structure");
     let with_dependents = overlay::score_structure(&mut nodes, &edges);
+    struct_span.stop(with_dependents);
     // several call sites between the same pair are several edges. Counted rather than
     // merged: a site is real information (`path` prints its line), and the count is the
     // number that decides whether merging would be worth the loss (#28)
@@ -280,11 +314,14 @@ fn index_project(roots: &[PathBuf], lsp_calls: Option<std::time::Duration>) -> R
 
     // one transaction: a crash between these three would leave the graph, the
     // extract cache and the roots describing different indexes
-    store.write_index(&nodes, &edges, &indexed.files, &indexed.roots)?;
+    ir::timing::step("write_index", || {
+        store.write_index(&nodes, &edges, &indexed.files, &indexed.roots)
+    })?;
     write_index_pointers(&roots[0], &indexed.roots)?;
     for root in &dropped {
         let _ = std::fs::remove_file(root.join(".ripple").join(INDEX_POINTER));
     }
+    total.stop(nodes.len());
 
     let edge_count = edges.len();
     let calls_report = match lsp_calls {
@@ -722,6 +759,126 @@ fn cmd_impact(args: &[String]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn cmd_locate(args: &[String]) -> Result<()> {
+    if args.iter().any(|a| a == "--debug") {
+        ir::timing::force_on();
+    }
+    let json = args.iter().any(|a| a == "--json");
+    let root: PathBuf = flag_value(args, "--root").map_or_else(|| ".".into(), PathBuf::from);
+    let budget: usize = flag_value(args, "--budget")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10);
+    let task = positionals(args)
+        .iter()
+        .map(|s| s.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if task.trim().is_empty() {
+        bail!("{USAGE}");
+    }
+
+    let store = RedbStore::open(db_path(&root)?);
+    let load_span = ir::timing::start("graph_load");
+    let graph = store.load()?;
+    load_span.stop(graph.node_count());
+    let tags = store.read_roots()?;
+    let locate_span = ir::timing::start("locate");
+    let located = query::locate(&graph, &task, budget);
+    locate_span.stop(located.total);
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&locate_payload(&located, &tags))?
+        );
+        return Ok(());
+    }
+
+    if located.seeds.is_empty() {
+        if located.total > 0 {
+            // matches exist; the budget just hid all of them — never let that read
+            // as "nothing matched"
+            println!(
+                "{} candidate(s) for \"{task}\", all cut by --budget {budget}",
+                located.total
+            );
+        } else {
+            println!("no starting point matched: {task}");
+        }
+        return Ok(());
+    }
+    let cut = located.total.saturating_sub(located.seeds.len());
+    let note = if cut > 0 {
+        format!(" — {cut} more cut by --budget {budget}")
+    } else {
+        String::new()
+    };
+    println!(
+        "start here for \"{task}\" — {} of {} candidates{note}:",
+        located.seeds.len(),
+        located.total
+    );
+    if located.ambiguous {
+        println!("  (many candidates tied at the cut — widen --budget or the task words)");
+    }
+    for s in &located.seeds {
+        println!(
+            "  {:?} {}  [{}]  {} dependents",
+            s.node.kind,
+            hit_name(&s.node),
+            s.why.join(", "),
+            s.centrality
+        );
+        for t in &s.touches {
+            println!("      ← {:?} {}", t.via, hit_name(&t.node));
+        }
+    }
+    Ok(())
+}
+
+/// The repo tag a module path belongs to (`web/src/...` → `web`), for grouping
+/// cross-repo results. Empty when the graph is single-root and unnamespaced.
+fn repo_of(module_path: &str, tags: &[(String, PathBuf)]) -> String {
+    tags.iter()
+        .map(|(t, _)| t)
+        .find(|t| module_path.starts_with(&format!("{t}/")))
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Shared JSON for `locate`, over CLI and MCP. Flat ranked list (a global order is
+/// more useful than per-repo buckets), each seed tagged with its repo, its reasons,
+/// its centrality, and a one-hop blast preview. Truncation is declared.
+fn locate_payload(located: &query::Located, tags: &[(String, PathBuf)]) -> serde_json::Value {
+    let seeds: Vec<_> = located
+        .seeds
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "symbol": s.node.name,
+                "module": s.node.module_path,
+                "repo": repo_of(&s.node.module_path, tags),
+                "kind": format!("{:?}", s.node.kind),
+                "why": s.why,
+                "centrality": s.centrality,
+                "lexical": s.lexical,
+                "touches": s.touches.iter().map(|t| serde_json::json!({
+                    "symbol": t.node.name,
+                    "module": t.node.module_path,
+                    "via": format!("{:?}", t.via),
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "shown": located.seeds.len(),
+        "total": located.total,
+        "ambiguous": located.ambiguous,
+        "reason": if located.total > located.seeds.len() { "budget" } else { "" },
+        "seeds": seeds,
+    })
 }
 
 /// Look a symbol up, widening the rule if needed, and say so whenever the answer
@@ -1906,6 +2063,14 @@ fn mcp_tools() -> Value {
     let obj = |props: Value, req: Value| json!({ "type": "object", "properties": props, "required": req });
     json!([
         {
+            "name": "locate",
+            "description": "Where do I start for a task? Give the task in plain words (\"implement rate limiting on login\") and get risk- and centrality-ranked starting symbols across all indexed repos, each with why it matched and a one-hop blast-radius preview. Call this first for an implement/feature task, as `search` is for disambiguating a known name.",
+            "inputSchema": obj(json!({
+                "task": { "type": "string", "description": "the task in plain words; matched against names, paths, routes, and doc comments" },
+                "budget": { "type": "integer", "description": "max seeds (default 10)" }
+            }), json!(["task"]))
+        },
+        {
             "name": "search",
             "description": "Find symbols/files by name, path, or a few words describing the area (use this first to get exact names/paths for other tools). Best match first.",
             "inputSchema": obj(json!({
@@ -2061,6 +2226,14 @@ fn mcp_call(
             let db = db_path(root).map_err(|e| e.to_string())?;
             *graph = RedbStore::open(db).load().map_err(|e| e.to_string())?;
             Ok(mcp_text(json!({ "reindexed": summary })))
+        }
+        "locate" => {
+            let task = str_arg("task").ok_or("task required")?;
+            let budget = usize_arg("budget", 10);
+            let store = RedbStore::open(db_path(root).map_err(|e| e.to_string())?);
+            let tags = store.read_roots().map_err(|e| e.to_string())?;
+            let located = query::locate(graph, &task, budget);
+            Ok(mcp_text(locate_payload(&located, &tags)))
         }
         "search" => {
             let terms = search_terms(&str_arg("query").ok_or("query required")?);
@@ -2447,6 +2620,8 @@ mod tests {
             extra_spans: Vec::new(),
             is_exported: true,
             risk: ir::RiskScores::default(),
+            doc: None,
+            route_path: None,
         };
         store::Hop {
             edge: ir::Edge {
@@ -2479,6 +2654,8 @@ mod tests {
             extra_spans: Vec::new(),
             is_exported: true,
             risk: ir::RiskScores::default(),
+            doc: None,
+            route_path: None,
         }
     }
 
@@ -2664,6 +2841,8 @@ mod tests {
             extra_spans: Vec::new(),
             is_exported: true,
             risk: ir::RiskScores::default(),
+            doc: None,
+            route_path: None,
         }
     }
 

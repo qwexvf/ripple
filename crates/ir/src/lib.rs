@@ -6,6 +6,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod timing;
+
 /// Stable symbol identity. See docs/04-architecture.md "Symbol identity rules":
 /// keyed on module-relative path + qualified name + signature discriminator so
 /// overloads don't collide and file moves don't orphan history. v0 fills the
@@ -125,6 +127,16 @@ pub struct Node {
     /// Overlay-derived risk; zero until the git overlay runs. See docs/06.
     #[serde(default)]
     pub risk: RiskScores,
+    /// Leading comment / docstring, if the adapter captured one. Searchable text
+    /// so a task described in prose ("limit login attempts") can reach a symbol
+    /// whose identifier says none of those words. See docs/07 + `query::locate`.
+    #[serde(default)]
+    pub doc: Option<String>,
+    /// Endpoint path this symbol handles, joined from a matched `RouteKey`'s
+    /// literal segments (`auth login`). Stamped by cross-service resolution so a
+    /// task word like "login" reaches the handler, not just a call named `login`.
+    #[serde(default)]
+    pub route_path: Option<String>,
 }
 
 impl Node {

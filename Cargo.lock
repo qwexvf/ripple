@@ -182,7 +182,7 @@ dependencies = [
 
 [[package]]
 name = "ir"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "serde",
 ]
@@ -205,7 +205,7 @@ dependencies = [
 
 [[package]]
 name = "lang"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "ir",
  "serde",
@@ -265,7 +265,7 @@ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
 name = "lsp"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -286,17 +286,19 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "overlay"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "git2",
  "ir",
+ "serde",
+ "serde_json",
  "tempfile",
 ]
 
 [[package]]
 name = "parse"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -326,7 +328,7 @@ dependencies = [
 
 [[package]]
 name = "query"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "ir",
  "store",
@@ -407,7 +409,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "resolve"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "ir",
@@ -421,7 +423,7 @@ dependencies = [
 
 [[package]]
 name = "ripple-cli"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "ir",
@@ -528,7 +530,7 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "store"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "ir",

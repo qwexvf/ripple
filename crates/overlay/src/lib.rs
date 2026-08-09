@@ -7,6 +7,7 @@
 //! Best-effort: no git / shallow clone → an empty overlay, never an error.
 
 use ir::{Edge, EdgeKind, EdgeSource, Node, RiskScores, Span, SymbolId};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -53,7 +54,7 @@ struct RawMetrics {
 }
 
 /// Mined, normalized signals keyed by index-root-relative module path.
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct GitOverlay {
     pub file_risk: HashMap<String, RiskScores>,
     pub cochange: Vec<(String, String, f32)>,
@@ -62,6 +63,56 @@ pub struct GitOverlay {
 /// Mine `root`'s git history. Returns an empty overlay if there's no repo.
 pub fn mine(root: &Path) -> GitOverlay {
     try_mine(root).unwrap_or_default()
+}
+
+/// The overlay cache: the HEAD it was mined at, plus the overlay itself.
+#[derive(Serialize, Deserialize)]
+struct CachedOverlay {
+    head: String,
+    #[serde(flatten)]
+    overlay: GitOverlay,
+}
+
+/// HEAD commit id, or `None` when there is no repo / no commits.
+fn head_sha(root: &Path) -> Option<String> {
+    let repo = git2::Repository::discover(root).ok()?;
+    let sha = repo.head().ok()?.peel_to_commit().ok()?.id().to_string();
+    Some(sha)
+}
+
+/// `mine`, but skip it when HEAD has not moved since the last index.
+///
+/// The overlay is derived entirely from committed history (`git log`), so it can
+/// only change when HEAD changes — uncommitted edits never affect churn or
+/// co-change. Mining walks the whole history and was the single slowest phase of a
+/// warm re-index (≈490ms of 770ms on a 775-file repo); the common agent loop is
+/// edit → reindex with HEAD unmoved, so caching it by HEAD sha turns that phase into
+/// a file read. The cache lives at `<root>/.ripple/overlay.json`, so it is wiped and
+/// rebuilt with the graph, and a HEAD-sha mismatch (any new commit) re-mines.
+pub fn mine_cached(root: &Path) -> GitOverlay {
+    let Some(head) = head_sha(root) else {
+        return GitOverlay::default(); // no repo: nothing to mine or cache
+    };
+    let cache = root.join(".ripple").join("overlay.json");
+    if let Ok(bytes) = std::fs::read(&cache) {
+        if let Ok(cached) = serde_json::from_slice::<CachedOverlay>(&bytes) {
+            if cached.head == head {
+                return cached.overlay;
+            }
+        }
+    }
+    let cached = CachedOverlay {
+        head,
+        overlay: mine(root),
+    };
+    // best-effort persist: a write failure just means the next index re-mines
+    if let Ok(bytes) = serde_json::to_vec(&cached) {
+        if let Some(dir) = cache.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(&cache, bytes);
+    }
+    cached.overlay
 }
 
 /// Changed line ranges per file (index-root-relative) for a diff. `base = None`
@@ -733,6 +784,8 @@ mod tests {
             extra_spans: Vec::new(),
             is_exported: false,
             risk: RiskScores::default(),
+            doc: None,
+            route_path: None,
         }
     }
 
@@ -957,5 +1010,44 @@ mod tests {
         assert_eq!(applied, 1);
         assert_eq!(edges.len(), 2);
         assert!(edges.iter().all(|e| e.kind == EdgeKind::ChangesWith));
+    }
+
+    /// The overlay cache reuses a mine only while HEAD is unmoved, and re-mines the
+    /// moment a new commit lands — the correctness the warm-index speedup rests on.
+    #[test]
+    fn overlay_cache_reuses_until_head_moves() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = git2::Repository::init(dir.path()).expect("init");
+        commit(&repo, 0, &["seed.ts"]);
+        for n in 1..=3 {
+            commit(&repo, n, &["a.ts", "b.ts"]);
+        }
+        let cache = dir.path().join(".ripple").join("overlay.json");
+
+        // first call mines and writes the cache at the current HEAD
+        let first = mine_cached(dir.path());
+        assert!(!first.cochange.is_empty(), "a.ts/b.ts co-change was mined");
+        let head1 = head_sha(dir.path()).unwrap();
+        let read_head = |p: &std::path::Path| {
+            let v: serde_json::Value = serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap();
+            v["head"].as_str().unwrap().to_owned()
+        };
+        assert_eq!(read_head(&cache), head1, "cache stamped with HEAD");
+
+        // second call: HEAD unmoved → cache hit, same result, cache untouched
+        let cached = mine_cached(dir.path());
+        assert_eq!(cached.cochange.len(), first.cochange.len());
+        assert_eq!(read_head(&cache), head1);
+
+        // a new commit moves HEAD → the cache is stale and must be rewritten
+        commit(&repo, 4, &["a.ts", "b.ts"]);
+        let head2 = head_sha(dir.path()).unwrap();
+        assert_ne!(head1, head2);
+        let _ = mine_cached(dir.path());
+        assert_eq!(
+            read_head(&cache),
+            head2,
+            "re-mined and re-stamped at new HEAD"
+        );
     }
 }

@@ -51,6 +51,29 @@ pub struct CrossEdges {
     pub unused_providers: usize,
     /// consumer→handler edges across a non-GraphQL boundary (HTTP today)
     pub endpoints: usize,
+    /// handler symbol → the literal words of the route it serves (`auth login`),
+    /// so a task described by its URL reaches the handler in `query::locate`. A
+    /// handler serving several routes accumulates all of them. Applied to the
+    /// node's `route_path` by the caller, which holds the nodes mutably.
+    pub route_paths: Vec<(SymbolId, String)>,
+}
+
+/// The literal path segments of a route key, joined for search (`/auth/login`
+/// with a `:id` param → `auth login`). `None` when the route is all params.
+fn route_text(key: &ir::RouteKey) -> Option<String> {
+    let words: Vec<&str> = key
+        .path
+        .iter()
+        .filter_map(|s| match s {
+            ir::Segment::Literal(w) => Some(w.as_str()),
+            _ => None,
+        })
+        .collect();
+    if words.is_empty() {
+        None
+    } else {
+        Some(words.join(" "))
+    }
 }
 
 /// Link cross-service edges from the per-file facts already on each `CachedFile`.
@@ -471,6 +494,7 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
     // left is a lookup. Adding Express or FastAPI adds a detector, not a branch
     // here — that is what phases 1 and 2 were for.
     let mut endpoints_idx: RouteIndex<SymbolId> = RouteIndex::default();
+    let mut route_paths: Vec<(SymbolId, String)> = Vec::new();
     for f in files {
         for p in &f.extract.cross.provides {
             if p.key.transport == ir::Transport::Graphql {
@@ -500,6 +524,18 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
                 if !matches!(p.handler, cross::HandlerRef::Here) {
                     let declaration = declaration_at(&fn_spans, &f.module_path, p.line);
                     serves.push((handler, declaration, CONF_SERVES));
+                }
+                // only request routes locate a feature: an HTTP/RPC path names what a
+                // caller asked for. A `Db` key's "path" is a table name and a `PubSub`
+                // key's is a topic — stamping those made a migration's `up/change` the
+                // top hit for "send a notification", which is never where work starts.
+                if matches!(
+                    p.key.transport,
+                    ir::Transport::Http | ir::Transport::Grpc | ir::Transport::Rpc
+                ) {
+                    if let Some(text) = route_text(&p.key) {
+                        route_paths.push((handler, text));
+                    }
                 }
                 endpoints_idx.insert(p.key.clone(), handler);
             }
@@ -584,6 +620,7 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
         unmatched_consumers,
         unused_providers,
         endpoints,
+        route_paths,
     }
 }
 
