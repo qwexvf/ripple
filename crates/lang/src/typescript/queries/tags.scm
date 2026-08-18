@@ -40,9 +40,23 @@
 (public_field_definition
   name: [(property_identifier) (private_property_identifier)] @name) @def.field
 
-(lexical_declaration
-  (variable_declarator
-    name: (identifier) @name)) @def.variable
+; A module-scope `const`/`let` is a real symbol — a config object, a singleton, a
+; re-exported value. A *local* one is not: `const cache = makeCache()` inside a test
+; can't be referenced across files, and capturing it at any depth put every function
+; temporary into the graph, ranking test-block locals in `review` (#68). So the
+; plain-value variable is anchored to module scope, directly or through `export`. The
+; arrow-function pattern above stays depth-free on purpose: a local
+; `const handler = () => …` is still a callable whose edges are worth keeping.
+(program
+  (lexical_declaration
+    (variable_declarator
+      name: (identifier) @name)) @def.variable)
+
+(program
+  (export_statement
+    (lexical_declaration
+      (variable_declarator
+        name: (identifier) @name)) @def.variable))
 
 ; Everything below is appended on purpose: none of these patterns competes with
 ; another for the same node, so their position cannot disturb the arrow-function /

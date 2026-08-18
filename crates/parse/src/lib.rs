@@ -793,6 +793,37 @@ mod tests {
         assert!(names.contains(&(NodeKind::Enum, "Color")));
     }
 
+    /// A module-scope `const` is a symbol; a function-local one is not. Capturing
+    /// every `const` at any depth put test-block temporaries (`const cache = …`)
+    /// into the graph and ranked them in `review` (#68). The arrow-function pattern
+    /// stays depth-free, so a local callable still counts.
+    #[test]
+    fn only_module_scope_plain_consts_are_captured() {
+        let nodes = extract(
+            "export const config = { a: 1 };\n\
+             const topLevel = makeThing();\n\
+             function run() {\n\
+               const local = makeThing();\n\
+               const handler = () => local;\n\
+               return handler(config, topLevel);\n\
+             }\n",
+            &ts(),
+        )
+        .unwrap();
+        let names: Vec<_> = nodes.iter().map(|n| n.name.as_str()).collect();
+        assert!(names.contains(&"config"), "exported module const kept");
+        assert!(names.contains(&"topLevel"), "top-level const kept");
+        assert!(names.contains(&"run"));
+        assert!(
+            !names.contains(&"local"),
+            "a function-local plain const must not be a symbol"
+        );
+        assert!(
+            names.contains(&"handler"),
+            "a local arrow function is still a callable worth capturing"
+        );
+    }
+
     #[test]
     fn captures_a_leading_doc_comment() {
         let nodes = extract(
