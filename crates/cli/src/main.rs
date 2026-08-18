@@ -34,7 +34,7 @@ fn main() -> Result<()> {
     }
 }
 
-const USAGE: &str = "usage:\n  ripple parse <file> [--json]\n  ripple index <path>... [--calls lsp [--calls-budget 120s]] [--debug]   (--calls lsp: call edges from a language server; --debug: per-phase timings to stderr)\n  ripple neighbors <symbol> [--in|--out] [--depth N] [--in-file <substr>] [--root <path>] [--json]\n  ripple locate <task words...> [--budget N] [--root <path>] [--json] [--debug]   (where do I start for this task?)\n  ripple impact <symbol>... [--budget N] [--in-file <substr>] [--root <path>] [--json] [--verify lsp]\n  ripple review [<base>] [--budget N] [--root <path>] [--json] [--verify lsp]\n    --verify lsp [--verify-budget 2s] [--floor-contradicted|--drop-contradicted]  (upgrade call edges from a language server)\n  ripple path <from> <to> [--depth 6] [--limit 3] [--root <path>] [--json]   (how does A reach B?)\n  ripple risk <symbol|file> [--root <path>] [--json]\n  ripple mcp [--root <path>]   (MCP server over stdio for AI agents)\n  ripple eval [--commits N] [--skip N] [--weights <spec>] [--root <path>]   (held-out co-change recall)\n    --risk                                        (do the risk terms rank the files a later fix touched?)\n    --review [--budget N] [--cases N] [--converge 0.6] [--escape-days 7]   (does review rank the defective symbol within the change that introduced it?)\n    --oracle lsp [--sample N] [--granularity function|file]   (agree with a language server?)\n  ripple lsp doctor [--root <path>] [--budget 10s] [--json]   (are language servers usable here?)\n  ripple lsp trust [--root <path>]   (allow this repo's own .ripple/lsp.json to launch servers)";
+const USAGE: &str = "usage:\n  ripple parse <file> [--json]\n  ripple index <path>... [--calls lsp [--calls-budget 120s]] [--debug]   (--calls lsp: call edges from a language server; --debug: per-phase timings to stderr)\n  ripple neighbors <symbol> [--in|--out] [--depth N] [--in-file <substr>] [--root <path>] [--json]\n  ripple locate <task words...> [--budget N] [--root <path>] [--json] [--debug]   (where do I start for this task?)\n  ripple impact <symbol>... [--budget N] [--in-file <substr>] [--root <path>] [--json] [--verify lsp]\n  ripple review [<base>] [--budget N] [--root <path>] [--json] [--verify lsp]\n    --verify lsp [--verify-budget 2s] [--floor-contradicted|--drop-contradicted]  (upgrade call edges from a language server)\n  ripple path <from> <to> [--depth 6] [--limit 3] [--root <path>] [--json]   (how does A reach B?)\n  ripple risk <symbol|file> [--root <path>] [--json]\n  ripple mcp [--root <path>]   (MCP server over stdio for AI agents)\n  ripple eval [--commits N] [--skip N] [--weights <spec>] [--root <path>]   (held-out co-change recall)\n    --risk                                        (do the risk terms rank the files a later fix touched?)\n    --review [--budget N] [--cases N] [--converge 0.6] [--escape-days 7]   (does review rank the defective symbol within the change that introduced it?)\n    --vs-grep [--budget N] [--commits N]   (does the blast radius beat grep at predicting co-change?)\n    --oracle lsp [--sample N] [--granularity function|file]   (agree with a language server?)\n  ripple lsp doctor [--root <path>] [--budget 10s] [--json]   (are language servers usable here?)\n  ripple lsp trust [--root <path>]   (allow this repo's own .ripple/lsp.json to launch servers)";
 
 /// Where `root`'s own database would live.
 fn own_db_path(root: &Path) -> PathBuf {
@@ -2078,6 +2078,198 @@ fn cmd_eval_review(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Identifier-like tokens in a blob of source, deduped. The grep baseline's whole
+/// vocabulary: which names does this file mention, textually, in any language.
+fn identifier_tokens(src: &[u8]) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    let mut cur = String::new();
+    for &b in src {
+        let c = b as char;
+        if c.is_ascii_alphanumeric() || c == '_' {
+            cur.push(c);
+        } else if !cur.is_empty() {
+            if cur.len() >= 3 {
+                out.insert(std::mem::take(&mut cur));
+            } else {
+                cur.clear();
+            }
+        }
+    }
+    if cur.len() >= 3 {
+        out.insert(cur);
+    }
+    out
+}
+
+/// Recall@k: share of `truth` files that appear in the first `k` of `ranked`.
+fn recall_at_k(ranked: &[String], truth: &HashSet<String>, k: usize) -> f32 {
+    if truth.is_empty() {
+        return 0.0;
+    }
+    let hits = ranked.iter().take(k).filter(|f| truth.contains(*f)).count();
+    #[allow(clippy::cast_precision_loss)]
+    {
+        hits as f32 / truth.len() as f32
+    }
+}
+
+/// Reciprocal rank of the first `truth` file in `ranked`, 0 if none appears.
+fn reciprocal_rank(ranked: &[String], truth: &HashSet<String>) -> f32 {
+    ranked
+        .iter()
+        .position(|f| truth.contains(f))
+        .map_or(0.0, |i| 1.0 / (i as f32 + 1.0))
+}
+
+/// `eval --vs-grep`: does ripple's blast radius beat plain grep at anticipating
+/// what changes together?
+///
+/// Ground truth is held-out co-change: for each file a test commit touched, the
+/// *other* files it touched. Two predictors rank the rest of the repo for that
+/// seed — ripple by dependency reach (`impact`), grep by shared identifiers (the
+/// files that textually mention a name the seed defines, which is what a developer
+/// without ripple would grep for). Both get the same budget `k`; recall@k and MRR
+/// say which fills those slots with the files that actually changed. This is the
+/// "with ripple vs without" number, against a real baseline rather than chance.
+fn cmd_eval_vs_grep(args: &[String]) -> Result<()> {
+    let root: PathBuf = flag_value(args, "--root").map_or_else(|| ".".into(), PathBuf::from);
+    let k: usize = flag_value(args, "--budget")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10);
+    let commits: usize = flag_value(args, "--commits")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(200);
+
+    let store = RedbStore::open(db_path(&root)?);
+    let graph = store.load()?;
+    let tag = root_tag(&store, &root)?;
+    let extracts = store.read_extracts()?;
+
+    let indexed = |p: &str| graph.get(ir::SymbolId::module(p)).is_some();
+
+    // per file: the identifiers it defines (the grep query for a seed), and the
+    // identifiers it mentions (what the baseline searches). Both keyed by the
+    // namespaced module path, so they line up with co-change and the graph.
+    let mut defines: HashMap<String, Vec<String>> = HashMap::new();
+    let mut mentions: HashMap<String, HashSet<String>> = HashMap::new();
+    for cf in extracts.values() {
+        let names: Vec<String> = cf
+            .extract
+            .defs
+            .iter()
+            .map(|n| n.name.clone())
+            .filter(|n| n.len() >= 3)
+            .collect();
+        if !names.is_empty() {
+            defines.insert(cf.module_path.clone(), names);
+        }
+        if let Ok(bytes) = std::fs::read(&cf.canonical) {
+            mentions.insert(cf.module_path.clone(), identifier_tokens(&bytes));
+        }
+    }
+    let candidate_files: Vec<&String> = mentions.keys().collect();
+
+    // ripple's ranked files for a seed: the blast radius of the seed's symbols,
+    // deduped to distinct files in impact-score order (the seed itself dropped).
+    let ripple_rank = |seed: &str| -> Vec<String> {
+        let seeds: Vec<ir::SymbolId> = graph.nodes_in_file(seed).iter().map(|n| n.id).collect();
+        let imp = query::impact(&graph, &seeds, usize::MAX);
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for h in imp.hits {
+            let f = h.node.module_path;
+            if f != seed && seen.insert(f.clone()) {
+                out.push(f);
+            }
+        }
+        out
+    };
+
+    // grep's ranked files for a seed: every other file, scored by how many of the
+    // seed's defined names it mentions, most first. Deterministic tie-break on path.
+    let grep_rank = |seed: &str| -> Vec<String> {
+        let empty = Vec::new();
+        let names = defines.get(seed).unwrap_or(&empty);
+        if names.is_empty() {
+            return Vec::new();
+        }
+        let mut scored: Vec<(usize, &String)> = candidate_files
+            .iter()
+            .filter(|f| **f != seed)
+            .filter_map(|f| {
+                let toks = &mentions[*f];
+                let n = names.iter().filter(|nm| toks.contains(*nm)).count();
+                (n > 0).then_some((n, *f))
+            })
+            .collect();
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(b.1)));
+        scored.into_iter().map(|(_, f)| f.clone()).collect()
+    };
+
+    let split = overlay::holdout(&root, commits);
+    let (mut r_recall, mut g_recall, mut r_mrr, mut g_mrr) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+    let mut seeds = 0usize;
+    let mut truth_total = 0usize;
+    for tc in &split.test {
+        let files: Vec<String> = tc
+            .files
+            .iter()
+            .map(|p| resolve::namespace(&tag, p))
+            .filter(|p| indexed(p))
+            .collect();
+        if files.len() < 2 {
+            continue;
+        }
+        for seed in &files {
+            let truth: HashSet<String> = files.iter().filter(|f| *f != seed).cloned().collect();
+            if truth.is_empty() {
+                continue;
+            }
+            let rr = ripple_rank(seed);
+            let gr = grep_rank(seed);
+            r_recall += recall_at_k(&rr, &truth, k);
+            g_recall += recall_at_k(&gr, &truth, k);
+            r_mrr += reciprocal_rank(&rr, &truth);
+            g_mrr += reciprocal_rank(&gr, &truth);
+            seeds += 1;
+            truth_total += truth.len();
+        }
+    }
+
+    if seeds == 0 {
+        println!(
+            "no held-out co-change to score: {} test commits, none with two indexed files that \
+             changed together. Try a wider --commits.",
+            split.test.len()
+        );
+        return Ok(());
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    let n = seeds as f32;
+    let pct = |x: f32| 100.0 * x / n;
+    // a random ranking's expected recall@k ≈ k / (files it could have picked)
+    #[allow(clippy::cast_precision_loss)]
+    let floor = 100.0 * (k as f32 / candidate_files.len().max(1) as f32).min(1.0);
+    println!(
+        "ripple vs grep — held-out co-change prediction ({} test commits, {seeds} seed files, \
+         {:.1} co-changed files each on average, budget k={k}):",
+        split.test.len(),
+        truth_total as f32 / n
+    );
+    println!("                recall@{k}   MRR");
+    println!("  ripple        {:>6.1}%   {:.3}", pct(r_recall), r_mrr / n);
+    println!("  grep          {:>6.1}%   {:.3}", pct(g_recall), g_mrr / n);
+    println!("  random floor  {floor:>6.1}%     —");
+    let delta = pct(r_recall) - pct(g_recall);
+    println!(
+        "  → ripple {} grep by {:.1} pts recall@{k}",
+        if delta >= 0.0 { "beats" } else { "trails" },
+        delta.abs()
+    );
+    Ok(())
+}
+
 fn cmd_eval(args: &[String]) -> Result<()> {
     if flag_value(args, "--oracle") == Some("lsp") {
         return cmd_eval_oracle(args);
@@ -2087,6 +2279,9 @@ fn cmd_eval(args: &[String]) -> Result<()> {
     }
     if args.iter().any(|a| a == "--review") {
         return cmd_eval_review(args);
+    }
+    if args.iter().any(|a| a == "--vs-grep") {
+        return cmd_eval_vs_grep(args);
     }
     let root: PathBuf = flag_value(args, "--root").map_or_else(|| ".".into(), PathBuf::from);
     let k: usize = flag_value(args, "--commits")
@@ -2803,6 +2998,32 @@ mod tests {
     use super::*;
     fn v(a: &[&str]) -> Vec<String> {
         a.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn vs_grep_metrics() {
+        let truth: HashSet<String> = ["b.ts", "c.ts"].iter().map(|s| (*s).to_owned()).collect();
+        let ranked = v(&["x.ts", "b.ts", "y.ts", "c.ts"]);
+        // b.ts and c.ts both inside the top 4 → full recall; top-1 misses both → 0
+        assert!((recall_at_k(&ranked, &truth, 4) - 1.0).abs() < f32::EPSILON);
+        assert!((recall_at_k(&ranked, &truth, 1) - 0.0).abs() < f32::EPSILON);
+        assert!((recall_at_k(&ranked, &truth, 2) - 0.5).abs() < f32::EPSILON);
+        // first truth hit is at index 1 → reciprocal rank 1/2
+        assert!((reciprocal_rank(&ranked, &truth) - 0.5).abs() < f32::EPSILON);
+        assert_eq!(reciprocal_rank(&v(&["x.ts"]), &truth), 0.0);
+        // empty truth is a no-score, never a divide-by-zero
+        assert_eq!(recall_at_k(&ranked, &HashSet::new(), 4), 0.0);
+    }
+
+    #[test]
+    fn identifier_tokens_splits_on_non_word_and_drops_shorts() {
+        let toks = identifier_tokens(b"const markDmAsRead = (a, b) => foo_bar.x;");
+        assert!(toks.contains("markDmAsRead"));
+        assert!(toks.contains("foo_bar"));
+        assert!(toks.contains("const"));
+        // one- and two-char names are grep noise (`a`, `b`, `x`) and are dropped
+        assert!(!toks.contains("a"));
+        assert!(!toks.contains("x"));
     }
 
     fn hop(src: &str, dst: &str, depth: usize) -> store::Hop {

@@ -17,7 +17,7 @@ ripple path <from> <to> [--depth 6] [--limit 3] [--root <path>] [--json]
 ripple risk <symbol|file> [--root <path>] [--json]
 ripple mcp [--root <path>]
 ripple eval [--commits N] [--skip N] [--weights <spec>] [--root <path>]
-ripple eval --risk | --review | --oracle lsp [--sample N] [--granularity function|file]
+ripple eval --risk | --review | --vs-grep | --oracle lsp [--sample N] [--granularity function|file]
 ripple lsp doctor [--root <path>] [--budget 10s] [--json]
 ripple lsp trust [--root <path>]
 ```
@@ -215,6 +215,14 @@ Two other modes:
   **at each introducing commit** (a throwaway `git worktree`, so the on-disk index is
   untouched), and reports the mean normalized rank of the defective symbol against the 0.5
   chance line. `--cases N` bounds the corpus, `--budget N` sets the hit@budget cutoff.
+- `--vs-grep` asks the blunt question: does the graph beat plain grep? Ground truth is
+  held-out co-change — for each file a test commit touched, the *other* files it touched.
+  Ripple ranks the rest of the repo by dependency reach (`impact`); grep ranks it by shared
+  identifiers (the files that mention a name the seed defines — what you'd grep for without
+  ripple). Both get the same `--budget` k; it reports recall@k and MRR for each, plus the
+  random floor. On small, consistently-named repos grep nearly ties; the graph's lead grows
+  with size and cross-file/cross-language coupling (measured 3.3× grep on a real Elixir API,
+  2× on a TS app).
 
 This is how the numbers in the [dogfood log](../design/12-dogfood-log.md) were produced,
 including the ones that turned out to be wrong. When there is nothing to evaluate it says
