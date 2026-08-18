@@ -72,6 +72,21 @@ edge without knowing which language produced it.
 
 Adding a Tier-0 language ≈ writing this one file. No Rust beyond the 4 required trait methods.
 
+## Files that hold more than one language
+
+A single-file component — a `.vue` or `.svelte` file, or plain HTML with an inline
+`<script>` — is a template plus a script block that is really TypeScript. One
+adapter method carries that: `embedded_regions` returns the `(adapter id, range)`
+of each foreign region in the host file's own byte+point coordinates. `parse`
+re-parses each range with the named adapter using tree-sitter `included_ranges`, so
+the region's nodes report positions in the host file — there is no span arithmetic
+to get wrong, which is the whole risk. The region's symbols, imports, refs and
+cross-service facts merge into the host file's extract as if they had been written
+there. Import resolution stays keyed off the host path, so the host adapter answers
+`resolve_import`; the HTML adapter delegates to TypeScript's, since a `<script>`
+import names a `.ts` file. The `html` adapter is the minimal proof of this seam; the
+Vue and Svelte adapters are `embedded_regions` plus a template `tags.scm`.
+
 ## Import resolution is the language-specific part
 
 Module systems differ, so `resolve_import` is where per-language code actually lives. Defaults handle relative paths; override for the rest:

@@ -46,6 +46,19 @@ impl CrossFacts {
             && self.entity_refs.is_empty()
             && !self.entity_def
     }
+
+    /// Fold another file-region's facts in. Used when a file carries an embedded
+    /// language (a `.vue`/`.svelte` `<script>` block): the host and each region
+    /// are extracted separately, then their facts join into the one file's set.
+    pub fn merge(&mut self, other: CrossFacts) {
+        self.provides.extend(other.provides);
+        self.consumes.extend(other.consumes);
+        self.graphql.merge(other.graphql);
+        self.star_imports.extend(other.star_imports);
+        self.qualified_calls.extend(other.qualified_calls);
+        self.entity_refs.extend(other.entity_refs);
+        self.entity_def |= other.entity_def;
+    }
 }
 
 /// What serves a boundary key: a named function, or — when the framework names no
@@ -122,6 +135,15 @@ impl GraphqlFacts {
             && self.spreads.is_empty()
             && self.scope_includes.is_empty()
             && self.op_refs.is_empty()
+    }
+
+    /// Fold another region's GraphQL facts in (see `CrossFacts::merge`).
+    pub fn merge(&mut self, other: GraphqlFacts) {
+        self.operations.extend(other.operations);
+        self.fragments.extend(other.fragments);
+        self.spreads.extend(other.spreads);
+        self.scope_includes.extend(other.scope_includes);
+        self.op_refs.extend(other.op_refs);
     }
 }
 

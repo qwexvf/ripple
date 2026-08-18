@@ -7,6 +7,7 @@ pub mod elixir;
 pub mod gleam;
 pub mod go;
 pub mod graphql;
+pub mod html;
 pub mod python;
 pub mod resolve_import;
 pub mod rust;
@@ -211,6 +212,23 @@ pub trait LanguageAdapter: Send + Sync {
         None
     }
 
+    /// Regions of this file written in another language, as `(adapter id, range)`
+    /// in this file's own byte+point coordinates. A single-file component (`.vue`,
+    /// `.svelte`, `.html` with inline `<script>`) is a template plus a script block
+    /// that is really TypeScript. `parse` re-parses each range with the named
+    /// adapter using tree-sitter `included_ranges`, so the region's nodes report
+    /// positions in the host file — no span offsetting to get wrong. Default: none,
+    /// the file is the one language its extension says. The range must come from a
+    /// node of *this* adapter's parse of the file, so its points are already host
+    /// coordinates. See #46.
+    fn embedded_regions(
+        &self,
+        _root: tree_sitter::Node,
+        _src: &[u8],
+    ) -> Vec<(&'static str, tree_sitter::Range)> {
+        Vec::new()
+    }
+
     /// Tier 3: extract cross-service facts from the parsed AST (Absinthe fields,
     /// GraphQL operations, TS Document usage, Ecto refs). Runs during the single
     /// index parse; default = none. See `cross::CrossFacts`.
@@ -240,6 +258,7 @@ pub fn registry() -> Vec<Box<dyn LanguageAdapter>> {
         Box::new(go::Adapter::new()),
         Box::new(gleam::Adapter::new()),
         Box::new(python::Adapter::new()),
+        Box::new(html::Adapter::new()),
     ]
 }
 
