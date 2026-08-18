@@ -17,7 +17,7 @@ ripple path <from> <to> [--depth 6] [--limit 3] [--root <path>] [--json]
 ripple risk <symbol|file> [--root <path>] [--json]
 ripple mcp [--root <path>]
 ripple eval [--commits N] [--skip N] [--weights <spec>] [--root <path>]
-ripple eval --risk | --oracle lsp [--sample N] [--granularity function|file]
+ripple eval --risk | --review | --oracle lsp [--sample N] [--granularity function|file]
 ripple lsp doctor [--root <path>] [--budget 10s] [--json]
 ripple lsp trust [--root <path>]
 ```
@@ -205,6 +205,13 @@ Two other modes:
   `--sample N` (default 25) picks how many symbols to check, `--granularity function|file`
   how strictly to compare.
 - `--risk` asks whether risk ranks the files that actually get fixed.
+- `--review` asks the review-targeting question `--risk` can't: within the one change that
+  introduced a bug, does `review` rank the defective symbol high? It mines an SZZ corpus —
+  fix commits whose removed lines blame back to one introducing commit (`--converge`,
+  default 0.6) that escaped for `--escape-days` (default 7) — indexes the tree checked out
+  **at each introducing commit** (a throwaway `git worktree`, so the on-disk index is
+  untouched), and reports the mean normalized rank of the defective symbol against the 0.5
+  chance line. `--cases N` bounds the corpus, `--budget N` sets the hit@budget cutoff.
 
 This is how the numbers in the [dogfood log](../design/12-dogfood-log.md) were produced,
 including the ones that turned out to be wrong. When there is nothing to evaluate it says

@@ -34,7 +34,7 @@ fn main() -> Result<()> {
     }
 }
 
-const USAGE: &str = "usage:\n  ripple parse <file> [--json]\n  ripple index <path>... [--calls lsp [--calls-budget 120s]] [--debug]   (--calls lsp: call edges from a language server; --debug: per-phase timings to stderr)\n  ripple neighbors <symbol> [--in|--out] [--depth N] [--in-file <substr>] [--root <path>] [--json]\n  ripple locate <task words...> [--budget N] [--root <path>] [--json] [--debug]   (where do I start for this task?)\n  ripple impact <symbol>... [--budget N] [--in-file <substr>] [--root <path>] [--json] [--verify lsp]\n  ripple review [<base>] [--budget N] [--root <path>] [--json] [--verify lsp]\n    --verify lsp [--verify-budget 2s] [--floor-contradicted|--drop-contradicted]  (upgrade call edges from a language server)\n  ripple path <from> <to> [--depth 6] [--limit 3] [--root <path>] [--json]   (how does A reach B?)\n  ripple risk <symbol|file> [--root <path>] [--json]\n  ripple mcp [--root <path>]   (MCP server over stdio for AI agents)\n  ripple eval [--commits N] [--skip N] [--weights <spec>] [--root <path>]   (held-out co-change recall)\n    --risk                                        (do the risk terms rank the files a later fix touched?)\n    --oracle lsp [--sample N] [--granularity function|file]   (agree with a language server?)\n  ripple lsp doctor [--root <path>] [--budget 10s] [--json]   (are language servers usable here?)\n  ripple lsp trust [--root <path>]   (allow this repo's own .ripple/lsp.json to launch servers)";
+const USAGE: &str = "usage:\n  ripple parse <file> [--json]\n  ripple index <path>... [--calls lsp [--calls-budget 120s]] [--debug]   (--calls lsp: call edges from a language server; --debug: per-phase timings to stderr)\n  ripple neighbors <symbol> [--in|--out] [--depth N] [--in-file <substr>] [--root <path>] [--json]\n  ripple locate <task words...> [--budget N] [--root <path>] [--json] [--debug]   (where do I start for this task?)\n  ripple impact <symbol>... [--budget N] [--in-file <substr>] [--root <path>] [--json] [--verify lsp]\n  ripple review [<base>] [--budget N] [--root <path>] [--json] [--verify lsp]\n    --verify lsp [--verify-budget 2s] [--floor-contradicted|--drop-contradicted]  (upgrade call edges from a language server)\n  ripple path <from> <to> [--depth 6] [--limit 3] [--root <path>] [--json]   (how does A reach B?)\n  ripple risk <symbol|file> [--root <path>] [--json]\n  ripple mcp [--root <path>]   (MCP server over stdio for AI agents)\n  ripple eval [--commits N] [--skip N] [--weights <spec>] [--root <path>]   (held-out co-change recall)\n    --risk                                        (do the risk terms rank the files a later fix touched?)\n    --review [--budget N] [--cases N] [--converge 0.6] [--escape-days 7]   (does review rank the defective symbol within the change that introduced it?)\n    --oracle lsp [--sample N] [--granularity function|file]   (agree with a language server?)\n  ripple lsp doctor [--root <path>] [--budget 10s] [--json]   (are language servers usable here?)\n  ripple lsp trust [--root <path>]   (allow this repo's own .ripple/lsp.json to launch servers)";
 
 /// Where `root`'s own database would live.
 fn own_db_path(root: &Path) -> PathBuf {
@@ -1879,12 +1879,214 @@ fn cmd_eval_risk(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Build a fully-assembled in-memory graph for `roots` without persisting it — the
+/// same pipeline `index_project` runs, minus the store writes and diagnostics.
+///
+/// `eval --review` indexes historical checkouts and must not touch the on-disk
+/// index, so it needs the graph in memory only. `index_project` is the source of
+/// truth for this pipeline; if the order there changes, change it here too.
+fn build_indexed_graph(roots: &[PathBuf]) -> Result<InMemoryGraph> {
+    let indexed = resolve::build_incremental(roots, &HashMap::new())?;
+    let mut nodes = indexed.result.nodes;
+    let mut edges = indexed.result.edges;
+
+    let mut git = overlay::GitOverlay::default();
+    for (tag, root) in &indexed.roots {
+        let o = overlay::mine(root);
+        for (k, v) in o.file_risk {
+            git.file_risk.insert(resolve::namespace(tag, &k), v);
+        }
+        for (a, b, s) in o.cochange {
+            git.cochange
+                .push((resolve::namespace(tag, &a), resolve::namespace(tag, &b), s));
+        }
+    }
+    overlay::apply(&git, &mut nodes, &mut edges);
+
+    let mut cross = resolve::link_cross_service(&indexed.files, &nodes);
+    if !cross.route_paths.is_empty() {
+        let mut by_id: HashMap<ir::SymbolId, Vec<String>> = HashMap::new();
+        for (id, text) in cross.route_paths.drain(..) {
+            let routes = by_id.entry(id).or_default();
+            if !routes.contains(&text) {
+                routes.push(text);
+            }
+        }
+        for n in &mut nodes {
+            if let Some(routes) = by_id.get(&n.id) {
+                n.route_path = Some(routes.join(" "));
+            }
+        }
+    }
+    edges.append(&mut cross.edges);
+
+    let scopes = resolve::TestScopes::of(&indexed.files, &indexed.roots, &lang::registry());
+    let mut test_edges = resolve::link_tests(&scopes, &edges);
+    edges.append(&mut test_edges);
+
+    overlay::score_structure(&mut nodes, &edges);
+    Ok(InMemoryGraph::from_parts(nodes, edges))
+}
+
+/// Where `review` ranks the defective symbol of one SZZ case: index the tree at the
+/// introducing commit, review that commit's own diff, and find the best rank among
+/// the symbols it changed in the defective file. `None` when the introducer's edit
+/// to that file maps to no indexed symbol (nothing to rank).
+fn measure_case(repo_root: &Path, case: &overlay::SzzCase) -> Result<Option<CaseRank>> {
+    let scratch = tempfile::tempdir().context("temp dir for historical checkout")?;
+    let wt = scratch.path().join("t"); // must not pre-exist for `worktree add`
+    let added = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["worktree", "add", "--detach"])
+        .arg(&wt)
+        .arg(&case.introduced_at)
+        .output()
+        .context("git worktree add")?;
+    if !added.status.success() {
+        // a shallow clone or gc'd commit can't be checked out — skip, don't fail
+        return Ok(None);
+    }
+    let measured = (|| -> Result<Option<CaseRank>> {
+        let graph = build_indexed_graph(std::slice::from_ref(&wt))?;
+        // the introducer's own diff, in its tree's coordinates (workdir == its tree)
+        let base = format!("{}^", case.introduced_at);
+        let changed = overlay::diff_lines(&wt, Some(&base));
+        if changed.is_empty() {
+            return Ok(None);
+        }
+        // full ranking, so a defective symbol past the budget still gets a rank
+        let r = query::review_focus(&graph, &changed, usize::MAX, "");
+        let total = r.focus.len();
+        let rank = r
+            .focus
+            .iter()
+            .position(|f| f.node.module_path == case.file)
+            .map(|i| i + 1);
+        Ok(rank.map(|rank| CaseRank { rank, total }))
+    })();
+    // best-effort teardown; a leaked worktree is noise, not a failure
+    let _ = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["worktree", "remove", "--force"])
+        .arg(&wt)
+        .output();
+    measured
+}
+
+/// One SZZ case's outcome: where the defective symbol ranked, out of how many.
+struct CaseRank {
+    rank: usize,
+    total: usize,
+}
+
+/// `eval --review`: does `review` rank the defective symbol high, within the one
+/// change that introduced it? File-level `eval --risk` cannot answer this — it
+/// scores across commits, not within one (#55). Reports mean normalized rank
+/// against the 0.5 chance line, the shape of the manual SZZ measurement that
+/// motivated the issue.
+fn cmd_eval_review(args: &[String]) -> Result<()> {
+    let root: PathBuf = flag_value(args, "--root").map_or_else(|| ".".into(), PathBuf::from);
+    let budget: usize = flag_value(args, "--budget")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(15);
+    let scan: usize = flag_value(args, "--commits")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(300);
+    let max_cases: usize = flag_value(args, "--cases")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30);
+    let converge: f32 = flag_value(args, "--converge")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.6);
+    let escape_days: i64 = flag_value(args, "--escape-days")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(7);
+
+    let cases = overlay::szz_cases(&root, scan, max_cases, converge, escape_days);
+    if cases.is_empty() {
+        println!(
+            "no SZZ cases in the newest {scan} commits (fix commits whose removed lines \
+             converge ≥{converge:.0}% on one introducer that escaped ≥{escape_days}d) — \
+             nothing to measure."
+        );
+        return Ok(());
+    }
+
+    let mut norm_ranks: Vec<f32> = Vec::new();
+    let mut hits = 0usize;
+    let mut rows: Vec<(usize, usize, f32, &overlay::SzzCase)> = Vec::new();
+    let mut unmeasured = 0usize;
+    for case in &cases {
+        match measure_case(&root, case)? {
+            Some(cr) if cr.total > 0 => {
+                #[allow(clippy::cast_precision_loss)]
+                let norm = cr.rank as f32 / cr.total as f32;
+                norm_ranks.push(norm);
+                if cr.rank <= budget {
+                    hits += 1;
+                }
+                rows.push((cr.rank, cr.total, norm, case));
+            }
+            _ => unmeasured += 1,
+        }
+    }
+
+    if norm_ranks.is_empty() {
+        println!(
+            "found {} SZZ case(s) but none were measurable — each introducer's edit to \
+             its defective file mapped to no indexed symbol.",
+            cases.len()
+        );
+        return Ok(());
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    let mean = norm_ranks.iter().sum::<f32>() / norm_ranks.len() as f32;
+    println!(
+        "review targeting on an SZZ corpus ({} measurable case(s), budget {budget}):",
+        norm_ranks.len()
+    );
+    println!("  mean normalized rank : {mean:.3}   (0.500 = chance)");
+    println!(
+        "  hit@budget           : {hits}/{} ({:.1}%)",
+        norm_ranks.len(),
+        100.0 * hits as f32 / norm_ranks.len() as f32
+    );
+    if mean > 0.0 {
+        println!(
+            "  lift over chance     : {:.2}× (chance ÷ mean)",
+            0.5 / mean
+        );
+    }
+    if unmeasured > 0 {
+        println!("  ({unmeasured} case(s) skipped — no indexed symbol at the introducing edit)");
+    }
+    // deterministic: worst rank first, then by fix sha
+    rows.sort_by(|a, b| b.2.total_cmp(&a.2).then(a.3.fix.cmp(&b.3.fix)));
+    println!("  rank/total  norm   esc(d)  conv   file  (introducer)");
+    for (rank, total, norm, case) in rows {
+        println!(
+            "  {rank:>4}/{total:<5} {norm:.3}  {:>5}   {:.0}%   {}  ({})",
+            case.escaped_days,
+            100.0 * case.convergence,
+            case.file,
+            &case.introduced_at[..case.introduced_at.len().min(9)]
+        );
+    }
+    Ok(())
+}
+
 fn cmd_eval(args: &[String]) -> Result<()> {
     if flag_value(args, "--oracle") == Some("lsp") {
         return cmd_eval_oracle(args);
     }
     if args.iter().any(|a| a == "--risk") {
         return cmd_eval_risk(args);
+    }
+    if args.iter().any(|a| a == "--review") {
+        return cmd_eval_review(args);
     }
     let root: PathBuf = flag_value(args, "--root").map_or_else(|| ".".into(), PathBuf::from);
     let k: usize = flag_value(args, "--commits")

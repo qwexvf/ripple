@@ -435,6 +435,7 @@ dependencies = [
  "resolve",
  "serde_json",
  "store",
+ "tempfile",
 ]
 
 [[package]]
