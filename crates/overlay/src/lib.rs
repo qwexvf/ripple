@@ -221,6 +221,185 @@ fn try_holdout(root: &Path, skip: usize, k: usize) -> Result<Holdout, git2::Erro
     })
 }
 
+/// One SZZ case: a fix commit, the commit blame says introduced the bug it
+/// removed, and the file that bug lived in. Indexing the tree at `introduced_at`
+/// and asking `review` where the defective symbol ranks is the review-targeting
+/// measurement (#55) — the file-level `eval --risk` cannot see it because it scores
+/// across commits, not within one.
+pub struct SzzCase {
+    /// The fix commit's sha (reporting only).
+    pub fix: String,
+    /// The commit blame attributes the removed lines to — the tree to index.
+    pub introduced_at: String,
+    /// The defective file, index-root-relative. The symbol is localised at review
+    /// time from this commit's own diff, not by tracking lines across `C..F^`.
+    pub file: String,
+    /// Days between the introducing commit and the fix — the escape window.
+    pub escaped_days: i64,
+    /// Share of the fix's removed lines that blame to `introduced_at` (≥ the
+    /// threshold, by construction).
+    pub convergence: f32,
+}
+
+/// Mine an SZZ corpus: for each fix commit in the newest `scan`, blame the lines
+/// it removed back to the commit that introduced them, and keep the cases where
+/// blame converges on one commit (`min_convergence`) that is old enough to count
+/// as an escaped defect (`min_escape_days`). Returns up to `max_cases`, newest fix
+/// first. Empty on any git error.
+///
+/// The removed lines are the pre-fix (F^) version of what the fix rewrote — the
+/// bug. Blaming them at F^ names the commit that last touched each, the standard
+/// SZZ approximation for "who introduced it". Convergence guards against a fix that
+/// rewrites many unrelated lines: a case is only kept when one commit owns the
+/// majority of them.
+pub fn szz_cases(
+    root: &Path,
+    scan: usize,
+    max_cases: usize,
+    min_convergence: f32,
+    min_escape_days: i64,
+) -> Vec<SzzCase> {
+    try_szz(root, scan, max_cases, min_convergence, min_escape_days).unwrap_or_default()
+}
+
+/// Lines the fix removed from its parent, keyed by the file's workdir-relative path
+/// at the parent (F^) — the coordinates blame expects.
+fn removed_lines(
+    repo: &git2::Repository,
+    parent: &git2::Commit,
+    fix: &git2::Commit,
+) -> HashMap<std::path::PathBuf, Vec<u32>> {
+    let mut map: HashMap<std::path::PathBuf, Vec<u32>> = HashMap::new();
+    let (Ok(pt), Ok(ft)) = (parent.tree(), fix.tree()) else {
+        return map;
+    };
+    let Ok(diff) = repo.diff_tree_to_tree(Some(&pt), Some(&ft), None) else {
+        return map;
+    };
+    let _ = diff.foreach(
+        &mut |_, _| true,
+        None,
+        None,
+        Some(&mut |delta, _hunk, line| {
+            // '-' is a line present in F^ and gone in F: the code the fix rewrote
+            if line.origin() == '-' {
+                if let (Some(p), Some(l)) = (delta.old_file().path(), line.old_lineno()) {
+                    map.entry(p.to_path_buf()).or_default().push(l);
+                }
+            }
+            true
+        }),
+    );
+    map
+}
+
+fn try_szz(
+    root: &Path,
+    scan: usize,
+    max_cases: usize,
+    min_convergence: f32,
+    min_escape_days: i64,
+) -> Result<Vec<SzzCase>, git2::Error> {
+    let repo = git2::Repository::discover(root)?;
+    let workdir = repo
+        .workdir()
+        .and_then(|w| w.canonicalize().ok())
+        .ok_or_else(|| git2::Error::from_str("no workdir"))?;
+    let index_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let rel = |p: &Path| -> Option<String> {
+        let rel = workdir.join(p).strip_prefix(&index_root).ok()?.to_owned();
+        Some(rel.to_string_lossy().replace('\\', "/"))
+    };
+
+    let mut revwalk = repo.revwalk()?;
+    revwalk.push_head()?;
+    revwalk.set_sorting(git2::Sort::TIME)?;
+
+    let mut cases = Vec::new();
+    for oid in revwalk.take(scan) {
+        if cases.len() >= max_cases {
+            break;
+        }
+        let Ok(fix) = repo.find_commit(oid?) else {
+            continue;
+        };
+        if fix.parent_count() != 1 || !is_fix(fix.message().unwrap_or("")) {
+            continue;
+        }
+        let Ok(parent) = fix.parent(0) else { continue };
+        let removed = removed_lines(&repo, &parent, &fix);
+        if removed.is_empty() {
+            continue;
+        }
+
+        // blame every removed line at F^, tallying the introducing commit — overall
+        // (for convergence) and per file (to pick the defective file)
+        let mut per_commit: HashMap<git2::Oid, u32> = HashMap::new();
+        let mut per_file: HashMap<(git2::Oid, String), u32> = HashMap::new();
+        let mut total = 0u32;
+        for (path, lines) in &removed {
+            let mut opts = git2::BlameOptions::new();
+            opts.newest_commit(parent.id());
+            let Ok(blame) = repo.blame_file(path, Some(&mut opts)) else {
+                continue;
+            };
+            let Some(key) = rel(path) else { continue };
+            for &l in lines {
+                let Some(hunk) = blame.get_line(l as usize) else {
+                    continue;
+                };
+                let c = hunk.final_commit_id();
+                *per_commit.entry(c).or_default() += 1;
+                *per_file.entry((c, key.clone())).or_default() += 1;
+                total += 1;
+            }
+        }
+        if total == 0 {
+            continue;
+        }
+
+        // the introducing commit: most blamed lines, lowest oid to break ties
+        let Some((&c_oid, &c_lines)) = per_commit
+            .iter()
+            .max_by(|a, b| a.1.cmp(b.1).then_with(|| b.0.cmp(a.0)))
+        else {
+            continue;
+        };
+        #[allow(clippy::cast_precision_loss)]
+        let convergence = c_lines as f32 / total as f32;
+        if convergence < min_convergence || c_oid == fix.id() {
+            continue;
+        }
+        let Ok(introducer) = repo.find_commit(c_oid) else {
+            continue;
+        };
+        if introducer.parent_count() != 1 {
+            continue; // need a single-parent commit to diff for the review
+        }
+        let escaped = (fix.time().seconds() - introducer.time().seconds()) / 86_400;
+        if escaped < min_escape_days {
+            continue;
+        }
+        // defective file: the one this introducer owns the most blamed lines in
+        let Some(file) = per_file
+            .iter()
+            .filter(|((oid, _), _)| *oid == c_oid)
+            .max_by(|a, b| a.1.cmp(b.1).then_with(|| b.0 .1.cmp(&a.0 .1)))
+            .map(|((_, f), _)| f.clone())
+        else {
+            continue;
+        };
+        cases.push(SzzCase {
+            fix: fix.id().to_string(),
+            introduced_at: c_oid.to_string(),
+            file,
+            escaped_days: escaped,
+            convergence,
+        });
+    }
+    Ok(cases)
+}
+
 fn try_diff(
     root: &Path,
     base: Option<&str>,
@@ -824,6 +1003,81 @@ mod tests {
             &parents.iter().collect::<Vec<_>>(),
         )
         .expect("commit");
+    }
+
+    /// Write `content` to `path` and commit it at a fixed day offset, so escape
+    /// gaps in the SZZ tests are exact rather than dependent on wall-clock.
+    fn commit_at(
+        repo: &git2::Repository,
+        day: i64,
+        msg: &str,
+        path: &str,
+        content: &str,
+    ) -> git2::Oid {
+        let workdir = repo.workdir().expect("workdir").to_path_buf();
+        std::fs::write(workdir.join(path), content).expect("write");
+        let mut index = repo.index().expect("index");
+        index.add_path(Path::new(path)).expect("add");
+        index.write().expect("write index");
+        let tree = repo
+            .find_tree(index.write_tree().expect("write_tree"))
+            .expect("tree");
+        let sig = git2::Signature::new(
+            "t",
+            "t@e",
+            &git2::Time::new(1_700_000_000 + day * 86_400, 0),
+        )
+        .expect("sig");
+        let parents = repo
+            .head()
+            .ok()
+            .and_then(|h| h.peel_to_commit().ok())
+            .map(|c| vec![c])
+            .unwrap_or_default();
+        repo.commit(
+            Some("HEAD"),
+            &sig,
+            &sig,
+            msg,
+            &tree,
+            &parents.iter().collect::<Vec<_>>(),
+        )
+        .expect("commit")
+    }
+
+    #[test]
+    fn szz_blames_the_introducer_and_honours_the_escape_gap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = git2::Repository::init(dir.path()).expect("init");
+        commit_at(&repo, 0, "seed", "mod.ts", "fn a() {\n  ok();\n}\n");
+        // the introducing commit: rewrites line 2 into the bug
+        let introducer = commit_at(&repo, 1, "add call", "mod.ts", "fn a() {\n  buggy();\n}\n");
+        // the fix, nine days later, rewrites the same line
+        commit_at(
+            &repo,
+            10,
+            "fix: wrong call",
+            "mod.ts",
+            "fn a() {\n  fixed();\n}\n",
+        );
+
+        let cases = szz_cases(dir.path(), 10, 10, 0.5, 0);
+        assert_eq!(cases.len(), 1, "one converged fix→introducer pair");
+        let c = &cases[0];
+        assert_eq!(
+            c.introduced_at,
+            introducer.to_string(),
+            "line 2 blames to the introducer, not the seed"
+        );
+        assert_eq!(c.file, "mod.ts");
+        assert_eq!(c.escaped_days, 9);
+        assert!((c.convergence - 1.0).abs() < f32::EPSILON);
+
+        // the same corpus with a longer escape requirement keeps nothing
+        assert!(
+            szz_cases(dir.path(), 10, 10, 0.5, 30).is_empty(),
+            "a 9-day escape is below a 30-day floor"
+        );
     }
 
     #[test]
