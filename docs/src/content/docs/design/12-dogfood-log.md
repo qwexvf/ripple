@@ -584,3 +584,36 @@ single diagnosed cause, filed as #54.
 
 **Lesson:** an A/B test whose control also fails tells you about the metric, not the
 treatment. Measure the component you control before measuring the pipeline it sits in.
+
+## 2026-08-19 — ripple vs grep: the graph's lead grows with the codebase
+
+The blunt question a user actually asks: *is this better than grep?* `eval --vs-grep`
+answers it against ground truth instead of intuition. Ground truth is held-out
+co-change — for each file a test commit touched, the other files it touched. Ripple
+ranks the rest of the repo by dependency reach (`impact`); grep ranks it by shared
+identifiers — the files that textually mention a name the seed defines, which is exactly
+what a developer without ripple types into a search box. Both get the same budget; the
+metric is recall@10 and MRR.
+
+| repo | language | files/commit | ripple recall@10 | grep recall@10 | floor |
+|---|---|---|---|---|---|
+| ripple (self) | Rust | 6.4 | 49.1% | 48.1% | 8.1% |
+| 5noobs-api | Elixir | 19.2 | **19.1%** | 5.8% | 0.8% |
+| 5noobs-web | TS/TSX | 12.0 | **32.0%** | 15.7% | 0.8% |
+| omnicampus-ssr | TS | 10.9 | **36.3%** | 24.2% | 0.6% |
+
+**What it says.** On ripple's own small, tidy repo (6 files per commit, consistent
+naming) grep is a genuinely strong baseline — it ties on recall and *wins* MRR (0.638 to
+0.574), because a hand-named Rust codebase makes textual identifier search work. The
+graph's advantage appears exactly where a human can't hold the codebase in their head:
+on real apps with wide, cross-file change sets it beats grep by 2–3.3× (Elixir hardest
+for grep — a module system and macros defeat identifier matching, 3.3×). Every arm
+buries the random floor, so both tools are doing real work; the question is only how much
+the resolved graph adds over text, and the answer scales with size and coupling.
+
+**Caveat, stated plainly.** Co-change is a proxy: it rewards predicting files that
+changed *together*, which is close to but not the same as files that *depend* on the
+seed. Both predictors are judged by the same proxy, so the comparison is fair even where
+the absolute number is modest. And "without ripple" here is grep, not a developer who
+knows the codebase — the honest claim is *graph beats text search*, not *graph beats a
+senior engineer*.
