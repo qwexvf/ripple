@@ -1,0 +1,46 @@
+name: release
+
+# Build prebuilt `ripple` binaries when a version tag is published, so installing
+# is a download, not a `cargo build`. Runs after `git push --tags` / publishing a
+# GitHub release named `vX.Y.Z`.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # upload assets onto the release for this tag
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-13
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo build --release --locked -p ripple-cli --target ${{ matrix.target }}
+      - name: package
+        # no version in the name, so `releases/latest/download/ripple-<target>.tar.gz`
+        # is a stable URL the installer can curl without knowing the tag
+        run: |
+          tar -C target/${{ matrix.target }}/release -czf \
+            ripple-${{ matrix.target }}.tar.gz ripple
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: ripple-${{ matrix.target }}.tar.gz

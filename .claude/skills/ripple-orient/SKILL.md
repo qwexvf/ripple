@@ -13,6 +13,58 @@ ranked, reasoned starting set, so you spend attention (and tokens) where they ma
 It is **not** a grep replacement for "find the string `foo`". Use it when the
 question is structural: entrypoints, callers, blast radius, cross-service reach.
 
+## Install
+
+**One command** (prebuilt binary + this skill + a CLAUDE.md note on when to use
+ripple, patched into the target repo). Re-runnable; add `--mcp` to also register the
+MCP server:
+
+```
+curl -fsSL https://raw.githubusercontent.com/qwexvf/ripple/main/install.sh \
+  | bash -s -- --target /path/to/your/repo --mcp
+```
+
+From a clone it runs offline — uses the local build and skill, no download:
+
+```
+./install.sh --target /path/to/your/repo
+```
+
+**By hand instead:**
+
+```
+# 1. binary — prebuilt, no compile (macOS: aarch64-apple-darwin / x86_64-apple-darwin)
+curl -fsSL https://github.com/qwexvf/ripple/releases/latest/download/ripple-x86_64-unknown-linux-gnu.tar.gz \
+  | tar -xz && install -m755 ripple ~/.local/bin/ripple
+# 2. this skill, available in every repo
+mkdir -p ~/.claude/skills/ripple-orient && curl -fsSL \
+  https://raw.githubusercontent.com/qwexvf/ripple/main/.claude/skills/ripple-orient/SKILL.md \
+  -o ~/.claude/skills/ripple-orient/SKILL.md
+```
+
+Contributors hacking on ripple itself build from a clone instead:
+`cargo install --path crates/cli`.
+
+Then either wire it as an MCP server (an agent calls the tools directly)…
+
+```
+claude mcp add ripple -- ripple mcp --root /path/to/your/repo
+```
+
+…or skip MCP and use the CLI (`ripple locate …`, `ripple impact …`). The MCP server
+**indexes on first tool call**, so pointing it at a never-indexed repo just works; from
+the CLI, run `ripple index <path>` once first.
+
+Make this skill available everywhere (not just inside the ripple repo) by copying it
+into your user skills dir — otherwise it only loads for repos that carry it under
+`.claude/skills/`:
+
+```
+cp -r .claude/skills/ripple-orient ~/.claude/skills/
+```
+
+Verify: `ripple --help` lists `locate`, and `/ripple-orient` is offered as a skill.
+
 ## The one rule
 
 **Start every implement/change task with `locate`, not with reading files.** You are
