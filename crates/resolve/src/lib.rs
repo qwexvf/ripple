@@ -387,7 +387,10 @@ fn parse_one(
         let q = queries
             .get(adapter.id())
             .context("missing compiled queries for adapter")?;
-        parse::extract_file(&source, adapter, module_path, q)
+        // a file may embed another language (a `.vue`/`.html` <script>); hand the
+        // extractor every adapter + its queries so it can parse those regions too
+        let embed = parse::EmbedCtx { registry, queries };
+        parse::extract_file(&source, adapter, module_path, q, Some(&embed))
     };
     let (extract, change) = match cached.get(module_path) {
         Some(c) if c.hash == hash => (c.extract.clone(), Change::Unchanged),

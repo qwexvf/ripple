@@ -1247,3 +1247,41 @@ fn a_nested_root_claims_its_own_files_whatever_the_argument_order() {
         "the innermost root owns its files: {outer_first:?}"
     );
 }
+
+/// A `<script>` block inside a host format (`.html`, and by the same seam `.vue`/
+/// `.svelte`) is TypeScript: its symbols and call edges must resolve exactly as a
+/// plain `.ts` file's would, at line numbers that point into the host file (#46).
+#[test]
+fn a_script_block_resolves_like_the_typescript_it_is() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/embedded_html");
+    let r = resolve::build(&root).unwrap();
+
+    let boot = SymbolId::of("page.html", "boot");
+    let greet = SymbolId::of("util.ts", "greet");
+
+    // the script's function is a node of the host file, at its host-file line
+    let boot_node = r
+        .nodes
+        .iter()
+        .find(|n| n.id == boot)
+        .expect("boot() defined in the <script> block");
+    assert_eq!(
+        boot_node.span.start_line, 8,
+        "the span points into page.html, not a re-based script offset"
+    );
+
+    // boot() calls greet(), imported across the region boundary from a .ts file —
+    // the same Calls edge a plain .ts importer would produce
+    assert!(
+        r.edges
+            .iter()
+            .any(|e| e.src == boot && e.dst == greet && e.kind == EdgeKind::Calls),
+        "boot should call greet across the html→ts import"
+    );
+    assert!(
+        r.edges
+            .iter()
+            .any(|e| e.dst == greet && e.kind == EdgeKind::Imports),
+        "the <script> import of greet should resolve to util.ts"
+    );
+}

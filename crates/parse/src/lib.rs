@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use ir::{Node, NodeKind, Span, SymbolId};
 use lang::LanguageAdapter;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{
@@ -249,11 +250,21 @@ impl Queries {
     }
 }
 
+/// What an embedded region needs to be extracted: the other adapters and their
+/// compiled queries. A file that carries no embedded language never uses this, so
+/// `extract_file` takes it as an `Option`. `parse::build_incremental` already holds
+/// both, so passing them costs nothing.
+pub struct EmbedCtx<'a> {
+    pub registry: &'a [Box<dyn LanguageAdapter>],
+    pub queries: &'a HashMap<&'a str, Queries>,
+}
+
 pub fn extract_file(
     source: &str,
     adapter: &dyn LanguageAdapter,
     module_path: &str,
     queries: &Queries,
+    embed: Option<&EmbedCtx>,
 ) -> Result<FileExtract> {
     let language = adapter.grammar();
     let mut parser = Parser::new();
@@ -265,32 +276,67 @@ pub fn extract_file(
         .context("tree-sitter returned no tree")?;
     let src = source.as_bytes();
 
-    let defs = extract_defs(&tree, &queries.tags, src, module_path, adapter)?;
-    let imports = queries
+    let mut defs = extract_defs(&tree, &queries.tags, src, module_path, adapter)?;
+    let mut imports = queries
         .imports
         .as_ref()
         .map(|q| extract_imports(&tree, q, src))
         .transpose()?
         .unwrap_or_default();
-    let reexports = queries
+    let mut reexports = queries
         .imports
         .as_ref()
         .map(|q| extract_reexports(&tree, q, src))
         .transpose()?
         .unwrap_or_default();
-    let refs = queries
+    let mut refs = queries
         .refs
         .as_ref()
         .map(|q| extract_refs(&tree, q, src))
         .transpose()?
         .unwrap_or_default();
-    let bindings = queries
+    let mut bindings = queries
         .bindings
         .as_ref()
         .map(|q| extract_bindings(&tree, q, src))
         .transpose()?
         .unwrap_or_default();
-    let cross = adapter.extract_cross(tree.root_node(), src);
+    let mut test_scopes = adapter.test_scopes(tree.root_node(), src);
+    let mut cross = adapter.extract_cross(tree.root_node(), src);
+
+    // Embedded regions (a `.vue`/`.svelte`/`.html` `<script>` block). Each is
+    // re-parsed with the named adapter over the *whole* source but with
+    // `included_ranges` pinned to the region, so the sub-tree's node positions are
+    // already in host-file coordinates — the region's symbols and edges land at the
+    // line a human and a language server see, with no offset arithmetic. (#46)
+    if let Some(ctx) = embed {
+        for (id, range) in adapter.embedded_regions(tree.root_node(), src) {
+            let Some(ea) = ctx.registry.iter().find(|a| a.id() == id) else {
+                continue; // the file names an adapter this build doesn't have
+            };
+            let Some(eq) = ctx.queries.get(id) else {
+                continue;
+            };
+            let Some(etree) = parse_region(source, &ea.grammar(), range) else {
+                continue;
+            };
+            let ea = ea.as_ref();
+            let eroot = etree.root_node();
+            defs.extend(extract_defs(&etree, &eq.tags, src, module_path, ea)?);
+            if let Some(q) = eq.imports.as_ref() {
+                imports.extend(extract_imports(&etree, q, src)?);
+                reexports.extend(extract_reexports(&etree, q, src)?);
+            }
+            if let Some(q) = eq.refs.as_ref() {
+                refs.extend(extract_refs(&etree, q, src)?);
+            }
+            if let Some(q) = eq.bindings.as_ref() {
+                bindings.extend(extract_bindings(&etree, q, src)?);
+            }
+            test_scopes.extend(ea.test_scopes(eroot, src));
+            cross.merge(ea.extract_cross(eroot, src));
+        }
+    }
 
     Ok(FileExtract {
         defs,
@@ -298,15 +344,29 @@ pub fn extract_file(
         reexports,
         refs,
         bindings,
-        test_scopes: adapter.test_scopes(tree.root_node(), src),
+        test_scopes,
         cross,
     })
+}
+
+/// Parse just `range` of `source` with `grammar`, using `included_ranges` so the
+/// tree's node positions stay in the host file's coordinates. `None` on any
+/// tree-sitter error (an unusable range, a grammar that won't load).
+fn parse_region(
+    source: &str,
+    grammar: &tree_sitter::Language,
+    range: tree_sitter::Range,
+) -> Option<Tree> {
+    let mut parser = Parser::new();
+    parser.set_language(grammar).ok()?;
+    parser.set_included_ranges(&[range]).ok()?;
+    parser.parse(source, None)
 }
 
 /// Convenience for one-off use (compiles queries each call). Not for hot loops.
 pub fn extract(source: &str, adapter: &dyn LanguageAdapter) -> Result<Vec<Node>> {
     let queries = Queries::compile(adapter)?;
-    Ok(extract_file(source, adapter, "<file>", &queries)?.defs)
+    Ok(extract_file(source, adapter, "<file>", &queries, None)?.defs)
 }
 
 fn extract_defs(
@@ -805,6 +865,7 @@ mod tests {
             &adapter,
             "m.ts",
             &queries,
+            None,
         )
         .unwrap();
         let members: Vec<_> = fx
@@ -835,7 +896,7 @@ mod tests {
         let adapter = lang::rust::Adapter::new();
         let queries = Queries::compile(&adapter).unwrap();
         let scopes = |src: &str| {
-            extract_file(src, &adapter, "lib.rs", &queries)
+            extract_file(src, &adapter, "lib.rs", &queries, None)
                 .unwrap()
                 .test_scopes
                 .len()
@@ -876,6 +937,7 @@ mod tests {
             &adapter,
             "lib.rs",
             &queries,
+            None,
         )
         .unwrap();
         let scope = &fx.test_scopes[0];

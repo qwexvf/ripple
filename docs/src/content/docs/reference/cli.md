@@ -38,6 +38,9 @@ path is given.
 Languages: TypeScript, TSX, Python, Rust, Elixir, Go, Gleam, GraphQL. Go and Gleam
 need `--calls lsp` for their call graph; the rest resolve calls from the source.
 OpenAPI and Swagger documents are read too — as endpoint declarations, not as code.
+An `.html` file's `<script>` block is parsed as TypeScript in place, so its symbols
+and call edges resolve like a `.ts` file's — the seam single-file components
+(`.vue`, `.svelte`) build on.
 
 Pass **several paths** to index separate repositories as one graph — this is how
 cross-repo tracing works, and it is the only way to get it, since git co-change cannot
