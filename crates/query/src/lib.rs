@@ -380,12 +380,19 @@ pub fn review_focus(
     let mut focus = Vec::new();
     let mut untested = Vec::new();
     for sym in &changed_syms {
-        let downstream = impact(graph, &[sym.id], 200).hits;
+        // unbounded on purpose: the diffusion already stops itself at EPSILON, so
+        // this is the true blast radius, not a 200-capped sample of it. A budget
+        // here truncated every hub to exactly "200 downstream" and summed
+        // `down_weight` over the same cut, flattening the ranking precisely among
+        // the widely-depended-on symbols review exists to surface (#57).
+        let imp = impact(graph, &[sym.id], usize::MAX);
+        let downstream = imp.reached;
         // a test that breaks is how you find out, not damage — the same rule
         // `overlay::score_structure` applies to fanout, so the two agree (#42).
         // The hit stays in `impact`'s own answer: "your test will break" is worth
         // knowing, it just isn't reach.
-        let down_weight: f32 = downstream
+        let down_weight: f32 = imp
+            .hits
             .iter()
             .filter(|h| !is_test_side(graph, h.node.id))
             .map(|h| h.weight)
@@ -404,8 +411,8 @@ pub fn review_focus(
         if sym.risk.churn > 0.6 {
             reasons.push(format!("high churn ({:.2})", sym.risk.churn));
         }
-        if !downstream.is_empty() {
-            reasons.push(format!("{} downstream", downstream.len()));
+        if downstream > 0 {
+            reasons.push(format!("{downstream} downstream"));
         }
         if changed_lines > 0 {
             reasons.push(format!("{changed_lines} lines changed"));
@@ -418,7 +425,7 @@ pub fn review_focus(
         focus.push(FocusItem {
             node: sym.clone(),
             review_priority,
-            downstream: downstream.len(),
+            downstream,
             changed_lines,
             reasons,
         });
@@ -911,6 +918,57 @@ mod tests {
         let cut = impact(&graph, &[target.id], 1);
         assert_eq!(cut.hits.len(), 1);
         assert_eq!(cut.reached, 3, "the budget must not hide what was reached");
+    }
+
+    /// review's downstream count is the true blast radius, not a budget-capped
+    /// sample: the old `impact(.., 200)` printed a flat "200 downstream" for every
+    /// hub while `impact <sym>` reported 341, and summed the ranking weight over the
+    /// same cut so a 200-reach symbol and a 2000-reach one scored alike (#57).
+    #[test]
+    fn review_downstream_is_the_untruncated_reach() {
+        let hub = node("hub.ts", "hub");
+        let leaf = node("leaf.ts", "leaf");
+        let d1 = node("d1.ts", "d1");
+        let d2 = node("d2.ts", "d2");
+        let d3 = node("d3.ts", "d3");
+        let graph = InMemoryGraph::from_parts(
+            vec![
+                hub.clone(),
+                leaf.clone(),
+                d1.clone(),
+                d2.clone(),
+                d3.clone(),
+            ],
+            vec![calls(&d1, &hub), calls(&d2, &hub), calls(&d3, &hub)],
+        );
+        let changed: HashMap<String, Vec<(u32, u32)>> = [
+            ("hub.ts".to_owned(), vec![(1, 1)]),
+            ("leaf.ts".to_owned(), vec![(1, 1)]),
+        ]
+        .into_iter()
+        .collect();
+
+        let r = review_focus(&graph, &changed, 10, "");
+        let hub_item = r.focus.iter().find(|f| f.node.name == "hub").expect("hub");
+        let leaf_item = r
+            .focus
+            .iter()
+            .find(|f| f.node.name == "leaf")
+            .expect("leaf");
+        // review's number is exactly impact's own untruncated answer, not a cap
+        assert_eq!(
+            hub_item.downstream,
+            impact(&graph, &[hub.id], usize::MAX).reached
+        );
+        assert_eq!(hub_item.downstream, 3);
+        assert_eq!(leaf_item.downstream, 0);
+        // and the wider blast radius ranks higher, which the flattened sum lost
+        assert!(hub_item.review_priority > leaf_item.review_priority);
+        assert!(
+            hub_item.reasons.iter().any(|s| s == "3 downstream"),
+            "the reason carries the true count: {:?}",
+            hub_item.reasons
+        );
     }
 
     /// Every other term looks backwards, so a function the diff *adds* scored at
