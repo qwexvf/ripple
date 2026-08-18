@@ -34,7 +34,7 @@ fn main() -> Result<()> {
     }
 }
 
-const USAGE: &str = "usage:\n  ripple parse <file> [--json]\n  ripple index <path>... [--calls lsp [--calls-budget 120s]] [--debug]   (--calls lsp: call edges from a language server; --debug: per-phase timings to stderr)\n  ripple neighbors <symbol> [--in|--out] [--depth N] [--in-file <substr>] [--root <path>] [--json]\n  ripple locate <task words...> [--budget N] [--root <path>] [--json] [--debug]   (where do I start for this task?)\n  ripple impact <symbol>... [--budget N] [--in-file <substr>] [--root <path>] [--json] [--verify lsp]\n  ripple review [<base>] [--budget N] [--root <path>] [--json] [--verify lsp]\n    --verify lsp [--verify-budget 2s] [--floor-contradicted|--drop-contradicted]  (upgrade call edges from a language server)\n  ripple path <from> <to> [--depth 6] [--limit 3] [--root <path>] [--json]   (how does A reach B?)\n  ripple risk <symbol|file> [--root <path>] [--json]\n  ripple mcp [--root <path>]   (MCP server over stdio for AI agents)\n  ripple eval [--commits N] [--skip N] [--weights <spec>] [--root <path>]   (held-out co-change recall)\n    --risk                                        (do the risk terms rank the files a later fix touched?)\n    --review [--budget N] [--cases N] [--converge 0.6] [--escape-days 7]   (does review rank the defective symbol within the change that introduced it?)\n    --vs-grep [--budget N] [--commits N]   (does the blast radius beat grep at predicting co-change?)\n    --oracle lsp [--sample N] [--granularity function|file]   (agree with a language server?)\n  ripple lsp doctor [--root <path>] [--budget 10s] [--json]   (are language servers usable here?)\n  ripple lsp trust [--root <path>]   (allow this repo's own .ripple/lsp.json to launch servers)";
+const USAGE: &str = "usage:\n  ripple parse <file> [--json]\n  ripple index <path>... [--calls lsp [--calls-budget 120s]] [--debug]   (--calls lsp: call edges from a language server; --debug: per-phase timings to stderr)\n  ripple neighbors <symbol> [--in|--out] [--depth N] [--in-file <substr>] [--root <path>] [--json]\n  ripple locate <task words...> [--budget N] [--root <path>] [--json] [--debug]   (where do I start for this task?)\n  ripple impact <symbol>... [--budget N] [--in-file <substr>] [--root <path>] [--json] [--verify lsp] [--sync]\n  ripple review [<base>] [--budget N] [--root <path>] [--json] [--verify lsp] [--sync]\n    --sync   (rebuild from the working tree in memory before answering, so edits since the last index are reflected — no re-index, nothing persisted)\n    --verify lsp [--verify-budget 2s] [--floor-contradicted|--drop-contradicted]  (upgrade call edges from a language server)\n  ripple path <from> <to> [--depth 6] [--limit 3] [--root <path>] [--json]   (how does A reach B?)\n  ripple risk <symbol|file> [--root <path>] [--json]\n  ripple mcp [--root <path>]   (MCP server over stdio for AI agents)\n  ripple eval [--commits N] [--skip N] [--weights <spec>] [--root <path>]   (held-out co-change recall)\n    --risk                                        (do the risk terms rank the files a later fix touched?)\n    --review [--budget N] [--cases N] [--converge 0.6] [--escape-days 7]   (does review rank the defective symbol within the change that introduced it?)\n    --vs-grep [--budget N] [--commits N]   (does the blast radius beat grep at predicting co-change?)\n    --oracle lsp [--sample N] [--granularity function|file]   (agree with a language server?)\n  ripple lsp doctor [--root <path>] [--budget 10s] [--json]   (are language servers usable here?)\n  ripple lsp trust [--root <path>]   (allow this repo's own .ripple/lsp.json to launch servers)";
 
 /// Where `root`'s own database would live.
 fn own_db_path(root: &Path) -> PathBuf {
@@ -692,7 +692,7 @@ fn cmd_impact(args: &[String]) -> Result<()> {
     }
 
     let mut store = RedbStore::open(db_path(&root)?);
-    let mut graph = store.load()?;
+    let mut graph = load_current(&store, &root, args.iter().any(|a| a == "--sync"))?;
     let mut seeds: Vec<ir::SymbolId> = Vec::new();
     for s in &symbols {
         let matches = lookup_or_bail(&graph, s, json, args)?;
@@ -709,7 +709,11 @@ fn cmd_impact(args: &[String]) -> Result<()> {
             .filter_map(|id| graph.get(*id))
             .map(|n| n.module_path.as_str()),
     );
-    warn_if_stale(&store, &touched);
+    // --sync already rebuilt from the working tree, so the answer is current — the
+    // "re-run index" warning would contradict it
+    if !args.iter().any(|a| a == "--sync") {
+        warn_if_stale(&store, &touched);
+    }
     if json {
         let out: Vec<_> = hits
             .iter()
@@ -1886,7 +1890,18 @@ fn cmd_eval_risk(args: &[String]) -> Result<()> {
 /// index, so it needs the graph in memory only. `index_project` is the source of
 /// truth for this pipeline; if the order there changes, change it here too.
 fn build_indexed_graph(roots: &[PathBuf]) -> Result<InMemoryGraph> {
-    let indexed = resolve::build_incremental(roots, &HashMap::new())?;
+    build_indexed_graph_incremental(roots, &HashMap::new())
+}
+
+/// `build_indexed_graph`, reusing `cached` extracts for unchanged files (matched by
+/// content hash) and re-extracting only the ones that changed on disk. This is what
+/// makes sync-at-query cheap: pass the store's extract cache and only the working
+/// tree's dirty files pay the parse. See docs/17-keeping-the-graph-in-sync.md.
+fn build_indexed_graph_incremental(
+    roots: &[PathBuf],
+    cached: &HashMap<String, parse::CachedFile>,
+) -> Result<InMemoryGraph> {
+    let indexed = resolve::build_incremental(roots, cached)?;
     let mut nodes = indexed.result.nodes;
     let mut edges = indexed.result.edges;
 
@@ -1926,6 +1941,32 @@ fn build_indexed_graph(roots: &[PathBuf]) -> Result<InMemoryGraph> {
 
     overlay::score_structure(&mut nodes, &edges);
     Ok(InMemoryGraph::from_parts(nodes, edges))
+}
+
+/// The graph a query answers from. Plain: the durable snapshot as last indexed.
+/// With `sync`: an in-memory incremental rebuild over the same roots — the extract
+/// cache is reused for unchanged files and only the working tree's changed/added
+/// files are re-parsed, so the answer reflects the code as it is now, with no manual
+/// `ripple index` and nothing written to disk. See docs/17-keeping-the-graph-in-sync.md.
+///
+/// The rebuild is not persisted on purpose: a read query must not take the index's
+/// write lock. It re-reads and re-links every file, so it costs a warm re-index; the
+/// export-signature propagation in the design doc is the optimisation that makes it
+/// proportional to the edit instead. Ships opt-in behind `--sync` until that lands.
+fn load_current(store: &RedbStore, root: &Path, sync: bool) -> Result<InMemoryGraph> {
+    if !sync {
+        return store.load();
+    }
+    let mut roots = store.read_roots()?;
+    if roots.is_empty() {
+        roots.push((
+            String::new(),
+            root.canonicalize().unwrap_or_else(|_| root.to_path_buf()),
+        ));
+    }
+    let cached = store.read_extracts()?;
+    let root_paths: Vec<PathBuf> = roots.into_iter().map(|(_, p)| p).collect();
+    build_indexed_graph_incremental(&root_paths, &cached)
 }
 
 /// Where `review` ranks the defective symbol of one SZZ case: index the tree at the
@@ -2825,7 +2866,7 @@ fn cmd_review(args: &[String]) -> Result<()> {
         println!("no changes to review (vs {})", base.map_or("HEAD", |s| s));
         return Ok(());
     }
-    let mut graph = store.load()?;
+    let mut graph = load_current(&store, &root, args.iter().any(|a| a == "--sync"))?;
     let seeds: Vec<ir::SymbolId> = changed
         .keys()
         .flat_map(|f| graph.nodes_in_file(f))
@@ -2835,7 +2876,9 @@ fn cmd_review(args: &[String]) -> Result<()> {
     let r = query::review_focus(&graph, &changed, budget, &tag);
     // the spans a diff is attributed to come from the index, so an index older
     // than the edits attributes changed lines to whatever used to be there
-    warn_if_stale(&store, &changed.keys().map(String::as_str).collect());
+    if !args.iter().any(|a| a == "--sync") {
+        warn_if_stale(&store, &changed.keys().map(String::as_str).collect());
+    }
 
     if json {
         println!("{}", serde_json::to_string_pretty(&review_payload(&r))?);
@@ -3369,6 +3412,48 @@ mod tests {
                 .unwrap()
                 .len(),
             2
+        );
+    }
+
+    /// `load_current(sync=true)` answers from the working tree, not the last index:
+    /// a function added after indexing is invisible to a plain load and present under
+    /// sync, with no re-index and nothing written. See docs/17-keeping-the-graph-in-sync.md.
+    #[test]
+    fn sync_reflects_working_tree_edits_without_reindex() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(
+            root.join("util.ts"),
+            "export function helper() { return 1; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("main.ts"),
+            "import { helper } from \"./util\";\nexport function boot() { return helper(); }\n",
+        )
+        .unwrap();
+        index_project(std::slice::from_ref(&root.to_path_buf()), None).expect("index");
+
+        // a new exported function appears on disk, unindexed
+        std::fs::write(
+            root.join("util.ts"),
+            "export function helper() { return 1; }\nexport function newFn() { return 2; }\n",
+        )
+        .unwrap();
+
+        let store = RedbStore::open(db_path(root).unwrap());
+        let newfn = ir::SymbolId::of("util.ts", "newFn");
+
+        let stale = load_current(&store, root, false).unwrap();
+        assert!(
+            stale.get(newfn).is_none(),
+            "a plain load answers from the snapshot, which predates the edit"
+        );
+
+        let synced = load_current(&store, root, true).unwrap();
+        assert!(
+            synced.get(newfn).is_some(),
+            "--sync rebuilds from the working tree and sees the new function"
         );
     }
 }

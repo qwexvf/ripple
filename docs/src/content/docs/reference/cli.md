@@ -94,6 +94,14 @@ and compare against the index, so an answer built from edited code says so on st
 
 — instead of handing you a renamed function with a `0.95` next to it.
 
+`impact` and `review` also accept **`--sync`**: instead of warning, they rebuild the
+graph from the working tree in memory before answering — the extract cache is reused for
+unchanged files, only the changed ones are re-parsed, and nothing is written to disk. So
+`review --sync` reviews your *uncommitted* diff against a graph that already includes it,
+and `impact newThing --sync` finds a symbol you just added without a re-index. It costs a
+warm re-index today; the plan to make it proportional to the edit — and a resident daemon
+that pays it ahead of time — is [17 — Keeping the graph in sync](../design/17-keeping-the-graph-in-sync.md).
+
 Concurrent runs no longer collide either: redb allows a single writer at a time, so any
 process — a second `ripple index`, or a query issued while one is running — waits up to
 30s and then reports which database is held, rather than surfacing `Database already open.
