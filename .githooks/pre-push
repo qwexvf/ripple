@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Fast pre-push gate — mirrors the `rust` CI job so a fmt/clippy/test break is
+# caught before push, not in CI.
+#
+# Enable once per clone:  git config core.hooksPath .githooks
+# Bypass a single push:   git push --no-verify
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+
+echo "pre-push: cargo fmt --check"
+cargo fmt --all -- --check
+
+echo "pre-push: cargo clippy -D warnings"
+cargo clippy --all-targets --locked -- -D warnings
+
+echo "pre-push: cargo test"
+cargo test --workspace --locked
+
+echo "pre-push: ok"
