@@ -452,7 +452,10 @@ mod tests {
         );
 
         // the stdlib import stays local — no external node, no import floor for it
-        assert!(!imports(&graph, "fmt"), "fmt is stdlib, not an external dep");
+        assert!(
+            !imports(&graph, "fmt"),
+            "fmt is stdlib, not an external dep"
+        );
         assert!(
             !graph
                 .nodes()
