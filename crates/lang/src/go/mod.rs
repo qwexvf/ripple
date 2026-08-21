@@ -1,12 +1,14 @@
-//! Go adapter — Tier 0 only, on purpose.
+//! Go adapter — Tier 0 defs plus Tier 1/2 imports and call edges.
 //!
-//! This is the breadth proof of docs/11 phase 4: a language added with `tags.scm`
-//! and nothing else, whose call edges come from `gopls` instead of from a
-//! hand-written refs query. So there is no `refs_query`, no `imports_query` and no
-//! `bindings_query` here, and adding one would defeat the measurement rather than
-//! improve it.
+//! Go started life as the breadth proof of docs/11 phase 4 (tags-only, call
+//! edges from `gopls`). The reachability-engine consolidation (phase 3) needs
+//! the engine to self-seed external reachability without a language server, so
+//! Go now carries its own `imports.scm` and `refs.scm`: an import path is its own
+//! dep-key, and a `pkg.Foo()` selector call binds to the external `pkg.Foo`
+//! symbol. There is still no `bindings_query` — Go's type-based member
+//! resolution is left to the selector/receiver machinery.
 
-use crate::LanguageAdapter;
+use crate::{resolve_import, LanguageAdapter};
 use tree_sitter::Node;
 
 pub struct Adapter;
@@ -42,6 +44,22 @@ impl LanguageAdapter for Adapter {
 
     fn tags_query(&self) -> &'static str {
         include_str!("queries/tags.scm")
+    }
+
+    fn imports_query(&self) -> Option<&'static str> {
+        Some(include_str!("queries/imports.scm"))
+    }
+
+    fn refs_query(&self) -> Option<&'static str> {
+        Some(include_str!("queries/refs.scm"))
+    }
+
+    /// The dep-key of a Go import path is the path itself. A standard-library
+    /// path (no dot in its first segment — `fmt`, `net/http`) is not a
+    /// third-party dependency and normalizes away. Intra-module packages are
+    /// resolved locally by [`LanguageAdapter::resolve_import`] before this runs.
+    fn external_dep_key(&self, spec: &str) -> Option<String> {
+        resolve_import::go_dep_key(spec)
     }
 
     /// Go exports by case: an identifier is visible outside its package iff it
@@ -223,11 +241,31 @@ mod tests {
     }
 
     #[test]
-    fn tier_two_queries_are_absent_on_purpose() {
+    fn imports_and_refs_queries_compile() {
         let adapter = Adapter::new();
-        assert!(adapter.refs_query().is_none(), "go calls come from gopls");
-        assert!(adapter.imports_query().is_none());
+        let lang = adapter.grammar();
+        tree_sitter::Query::new(&lang, adapter.imports_query().expect("imports.scm present"))
+            .expect("imports.scm");
+        tree_sitter::Query::new(&lang, adapter.refs_query().expect("refs.scm present"))
+            .expect("refs.scm");
+        // no bindings query — Go leans on selector/receiver resolution instead
         assert!(adapter.bindings_query().is_none());
+    }
+
+    #[test]
+    fn dep_key_is_the_import_path_and_stdlib_normalizes_away() {
+        let adapter = Adapter::new();
+        assert_eq!(
+            adapter.external_dep_key("github.com/gin-gonic/gin"),
+            Some("github.com/gin-gonic/gin".to_owned())
+        );
+        assert_eq!(
+            adapter.external_dep_key("gopkg.in/yaml.v2"),
+            Some("gopkg.in/yaml.v2".to_owned())
+        );
+        // no dot in the first segment → standard library, not a dependency
+        assert_eq!(adapter.external_dep_key("fmt"), None);
+        assert_eq!(adapter.external_dep_key("net/http"), None);
     }
 
     #[test]

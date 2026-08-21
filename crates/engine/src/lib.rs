@@ -395,6 +395,73 @@ mod tests {
     }
 
     #[test]
+    fn py_dotted_module_import_deep_chain_is_used() {
+        let dir = tempfile::tempdir().unwrap();
+        // `import os.path` + a deep-chain member call `os.path.join(...)`. The
+        // receiver `os.path` is a chained attribute, the documented phase-1 gap.
+        fs::write(
+            dir.path().join("paths.py"),
+            "import os.path\n\n\
+             def build(a, b):\n    return os.path.join(a, b)\n",
+        )
+        .unwrap();
+        let graph = index(dir.path()).unwrap();
+
+        assert!(imports(&graph, "os"), "os is imported (via os.path)");
+        let users = uses(&graph, "os", "join");
+        assert!(
+            users.iter().any(|n| n.name == "build"),
+            "build uses os.join through the os.path deep chain: {:?}",
+            users.iter().map(|n| &n.name).collect::<Vec<_>>()
+        );
+        assert!(
+            !reaches(&graph, "os", "join").is_empty(),
+            "build reaches os.join"
+        );
+    }
+
+    #[test]
+    fn go_external_import_is_imported_used_and_reached() {
+        let dir = tempfile::tempdir().unwrap();
+        // external dep call, plus a local wrapper reached transitively, plus a
+        // stdlib import that must NOT become an external dep node.
+        fs::write(
+            dir.path().join("server.go"),
+            "package main\n\
+             import (\n\t\"fmt\"\n\t\"github.com/gin-gonic/gin\"\n)\n\
+             func NewRouter() { gin.Default() }\n\
+             func Boot() { NewRouter(); fmt.Println(\"up\") }\n",
+        )
+        .unwrap();
+        let graph = index(dir.path()).unwrap();
+
+        let dep = "github.com/gin-gonic/gin";
+        assert!(imports(&graph, dep), "the gin dep is imported");
+
+        let users = uses(&graph, dep, "Default");
+        assert!(
+            users.iter().any(|n| n.name == "NewRouter"),
+            "NewRouter uses gin.Default: {:?}",
+            users.iter().map(|n| &n.name).collect::<Vec<_>>()
+        );
+
+        // Boot → NewRouter → gin.Default is a transitive call route
+        assert!(
+            !reaches(&graph, dep, "Default").is_empty(),
+            "something reaches gin.Default"
+        );
+
+        // the stdlib import stays local — no external node, no import floor for it
+        assert!(!imports(&graph, "fmt"), "fmt is stdlib, not an external dep");
+        assert!(
+            !graph
+                .nodes()
+                .any(|n| n.kind == NodeKind::External && n.module_path == "fmt"),
+            "a stdlib import must not mint an external dep node"
+        );
+    }
+
+    #[test]
     fn ts_namespace_member_call_binds_external_symbol() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(
@@ -501,6 +568,44 @@ mod tests {
         );
         // it binds no symbol, so there is nothing used or reached
         assert!(uses(&graph, "polyfill", "anything").is_empty());
+    }
+
+    #[test]
+    fn php_use_registers_the_import_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("Service.php"),
+            "<?php\nuse GuzzleHttp\\Client;\n\nclass Service {\n  public function run() { return new Client(); }\n}\n",
+        )
+        .unwrap();
+        let graph = index(dir.path()).unwrap();
+
+        assert!(
+            imports(&graph, "GuzzleHttp"),
+            "the GuzzleHttp namespace is imported via `use`"
+        );
+        assert!(
+            !imports(&graph, "Nonexistent"),
+            "a namespace never `use`d is not imported"
+        );
+    }
+
+    #[test]
+    fn ruby_require_registers_the_import_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("app.rb"),
+            "require \"json\"\nrequire \"active_record/base\"\n\ndef parse(s)\n  JSON.parse(s)\nend\n",
+        )
+        .unwrap();
+        let graph = index(dir.path()).unwrap();
+
+        assert!(imports(&graph, "json"), "json is required");
+        assert!(
+            imports(&graph, "active_record"),
+            "active_record is required (keyed by first path segment)"
+        );
+        assert!(!imports(&graph, "sinatra"), "sinatra is never required");
     }
 
     #[test]
