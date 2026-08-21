@@ -119,6 +119,105 @@ pub fn is_reachable(graph: &InMemoryGraph, from: &str, to: &str) -> bool {
     false
 }
 
+// ── external-dependency reachability ───────────────────────────────────────
+//
+// The binding pass in `resolve` mints `NodeKind::External` nodes for symbols
+// that live outside the indexed roots (`urql`, `urql.useQuery`). These three
+// queries read that enrichment directly — the engine seeds itself, with no
+// external symbol list handed in from outside.
+
+/// Call edges — the only edge kinds a reachability walk should follow. `Imports`
+/// makes module nodes look like callers; `References` is a use, not a call.
+const CALL_KINDS: &[EdgeKind] = &[EdgeKind::Calls, EdgeKind::AsyncCall];
+
+/// The external `dep.symbol` node, if the binding pass created one.
+fn external_symbol<'g>(graph: &'g InMemoryGraph, dep: &str, symbol: &str) -> Option<&'g Node> {
+    let qn = format!("{dep}.{symbol}");
+    graph
+        .nodes()
+        .find(|n| n.kind == NodeKind::External && n.module_path == dep && n.qualified_name == qn)
+}
+
+/// Import-level floor: does the project import `dep` at all? True when any
+/// `Imports` edge lands on an external node keyed to `dep`. This is the soundest
+/// signal — it holds even when call resolution can't prove the symbol is used.
+pub fn imports(graph: &InMemoryGraph, dep: &str) -> bool {
+    graph
+        .nodes()
+        .filter(|n| n.kind == NodeKind::External && n.module_path == dep)
+        .any(|n| {
+            graph
+                .in_edges(n.id)
+                .iter()
+                .any(|e| e.kind == EdgeKind::Imports)
+        })
+}
+
+/// Project symbols with a `Calls`/`References` edge to the external `dep.symbol`
+/// node — the symbol is referenced somewhere, whether or not a call chain into
+/// it can be proven. Deduped, in a stable (module path, line) order.
+pub fn uses(graph: &InMemoryGraph, dep: &str, symbol: &str) -> Vec<Node> {
+    let Some(node) = external_symbol(graph, dep, symbol) else {
+        return Vec::new();
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut out: Vec<Node> = Vec::new();
+    for e in graph.in_edges(node.id) {
+        if !matches!(
+            e.kind,
+            EdgeKind::Calls | EdgeKind::AsyncCall | EdgeKind::References
+        ) {
+            continue;
+        }
+        if let Some(src) = graph.get(e.src) {
+            // an external node never "uses" another — only project symbols count
+            if src.kind != NodeKind::External && seen.insert(src.id) {
+                out.push(src.clone());
+            }
+        }
+    }
+    out.sort_by(|a, b| {
+        a.module_path
+            .cmp(&b.module_path)
+            .then(a.span.start_line.cmp(&b.span.start_line))
+    });
+    out
+}
+
+/// Transitive call routes *into* the external `dep.symbol` node — one shortest
+/// call-only route per distinct reaching project symbol, shortest first. Seeds
+/// itself from the external node's incoming call edges and walks callers; no
+/// external seed list required. Empty when nothing reaches it (or it has no
+/// node — never imported).
+pub fn reaches(graph: &InMemoryGraph, dep: &str, symbol: &str) -> Vec<Route> {
+    let Some(node) = external_symbol(graph, dep, symbol) else {
+        return Vec::new();
+    };
+    // every symbol that transitively reaches the external node along call edges
+    let callers = graph.neighbors(node.id, Dir::In, Some(CALL_KINDS), DEFAULT_DEPTH);
+    let mut routes: Vec<Route> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for hop in callers {
+        if !seen.insert(hop.node.id) {
+            continue;
+        }
+        // one shortest route per caller; keep call-edge-only routes so an import
+        // hop can never masquerade as a call path
+        for r in paths(graph, hop.node.id, node.id, DEFAULT_DEPTH, 1) {
+            if r.steps.iter().all(|s| CALL_KINDS.contains(&s.edge.kind)) {
+                routes.push(r);
+            }
+        }
+    }
+    routes.sort_by(|a, b| {
+        a.steps
+            .len()
+            .cmp(&b.steps.len())
+            .then(b.confidence.total_cmp(&a.confidence))
+    });
+    routes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,5 +269,140 @@ mod tests {
             "an unknown target is not reachable"
         );
         assert!(reachable(&graph, "noSuchCaller", "exec").is_empty());
+    }
+
+    // ── external-import binding ────────────────────────────────────────────
+
+    /// A component imports `useQuery` from the external package `urql` and calls
+    /// it directly; another reaches it transitively through a local hook.
+    fn urql_fixture() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        // direct external caller
+        fs::write(
+            dir.path().join("FindingDetailPane.tsx"),
+            "import { useQuery } from 'urql';\n\
+             export function FindingDetailPane() { return useQuery(); }\n",
+        )
+        .unwrap();
+        // local hook that wraps the external symbol
+        fs::write(
+            dir.path().join("useOrgMembers.ts"),
+            "import { useQuery } from 'urql';\n\
+             export function useOrgMembers() { return useQuery(); }\n",
+        )
+        .unwrap();
+        // reaches the external symbol only through the local hook
+        fs::write(
+            dir.path().join("MembersSection.tsx"),
+            "import { useOrgMembers } from './useOrgMembers';\n\
+             export function MembersSection() { return useOrgMembers(); }\n",
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn ts_external_import_is_imported_used_and_reached() {
+        let dir = urql_fixture();
+        let graph = index(dir.path()).unwrap();
+
+        assert!(imports(&graph, "urql"), "urql is imported");
+
+        let users = uses(&graph, "urql", "useQuery");
+        assert!(!users.is_empty(), "useQuery is called directly");
+        let names: Vec<&str> = users.iter().map(|n| n.name.as_str()).collect();
+        assert!(
+            names.contains(&"FindingDetailPane") && names.contains(&"useOrgMembers"),
+            "direct callers of useQuery show up in `uses`: {names:?}"
+        );
+
+        let routes = reaches(&graph, "urql", "useQuery");
+        assert!(!routes.is_empty(), "something reaches urql.useQuery");
+        // the transitive reacher: MembersSection → useOrgMembers → urql.useQuery
+        let membersection_id = graph.find_by_name("MembersSection")[0].id;
+        let ext = external_symbol(&graph, "urql", "useQuery").unwrap().id;
+        let route = paths(&graph, membersection_id, ext, DEFAULT_DEPTH, 1);
+        assert!(
+            !route.is_empty(),
+            "MembersSection reaches urql.useQuery transitively through useOrgMembers"
+        );
+        assert!(
+            route[0].steps.len() >= 2,
+            "MembersSection's route to useQuery is transitive (through the hook), not direct"
+        );
+    }
+
+    #[test]
+    fn ts_path_alias_import_stays_local_not_external() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("tsconfig.json"),
+            "{ \"compilerOptions\": { \"baseUrl\": \".\", \"paths\": { \"~/*\": [\"src/*\"] } } }\n",
+        )
+        .unwrap();
+        fs::create_dir_all(dir.path().join("src/hooks")).unwrap();
+        fs::write(
+            dir.path().join("src/hooks/useThing.ts"),
+            "export function useThing() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("src/Comp.tsx"),
+            "import { useThing } from '~/hooks/useThing';\n\
+             export function Comp() { return useThing(); }\n",
+        )
+        .unwrap();
+
+        let graph = index(dir.path()).unwrap();
+
+        // the aliased import resolved locally: Comp's call reaches the real def
+        assert!(
+            is_reachable(&graph, "Comp", "useThing"),
+            "an aliased local import must resolve as local so its callers are found"
+        );
+        // and it was NOT treated as an external package
+        assert!(
+            !graph
+                .nodes()
+                .any(|n| n.kind == NodeKind::External && n.module_path.starts_with('~')),
+            "a tsconfig path alias is local, not an external dep"
+        );
+        assert!(!imports(&graph, "~/hooks/useThing"));
+    }
+
+    #[test]
+    fn py_external_import_is_used() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("runner.py"),
+            "from subprocess import run\n\n\
+             def launch():\n    return run(['ls'])\n",
+        )
+        .unwrap();
+        let graph = index(dir.path()).unwrap();
+
+        assert!(imports(&graph, "subprocess"), "subprocess is imported");
+        let users = uses(&graph, "subprocess", "run");
+        assert!(
+            users.iter().any(|n| n.name == "launch"),
+            "launch uses subprocess.run: {:?}",
+            users.iter().map(|n| &n.name).collect::<Vec<_>>()
+        );
+        assert!(
+            !reaches(&graph, "subprocess", "run").is_empty(),
+            "launch reaches subprocess.run"
+        );
+    }
+
+    #[test]
+    fn a_never_imported_symbol_is_absent() {
+        let dir = urql_fixture();
+        let graph = index(dir.path()).unwrap();
+        assert!(!imports(&graph, "left-pad"), "left-pad is never imported");
+        assert!(uses(&graph, "left-pad", "leftPad").is_empty());
+        assert!(reaches(&graph, "left-pad", "leftPad").is_empty());
+        // and a real dep queried for a symbol it never exposed here
+        assert!(uses(&graph, "urql", "gql").is_empty());
+        assert!(reaches(&graph, "urql", "gql").is_empty());
     }
 }

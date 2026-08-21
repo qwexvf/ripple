@@ -168,6 +168,10 @@ impl LanguageAdapter for Adapter {
             .or_else(|| resolve_import::workspace_package(spec, ws, globs))
     }
 
+    fn external_dep_key(&self, spec: &str) -> Option<String> {
+        resolve_import::npm_dep_key(spec)
+    }
+
     fn extract_cross(&self, root: tree_sitter::Node, src: &[u8]) -> crate::cross::CrossFacts {
         crate::cross::typescript(root, src)
     }
