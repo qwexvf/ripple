@@ -19,8 +19,11 @@
           alias: (identifier) @import.namespace))
 
 ; Plain `import x` — bind the module name so `x.f()` resolves against it. A single
-; segment (`import os`) binds `os`; a dotted `import x.y` binds `x.y` here, whose
-; deep-chain uses (`x.y.f()`) member resolution still can't follow, but the common
-; single-segment stdlib/package form (`os.system()`, `subprocess.run()`) works.
+; segment (`import os`) binds `os`; a dotted `import x.y` binds the whole `x.y`,
+; and a deep-chain member call `x.y.f()` now resolves too: the receiver `x.y` is
+; read as one dotted name (see `parse::receiver_of`) and looked up against this
+; binding, so `import os.path` + `os.path.join()` links to the `os` dep. Residual:
+; `import os.path` binds `os.path`, not the top-level `os`, so a bare `os.f()` in
+; the same file (Python auto-exposes the parent package) is not linked.
 (import_statement
   name: (dotted_name) @import.namespace @import.source)

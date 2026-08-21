@@ -699,7 +699,34 @@ fn receiver_of(node: Option<TsNode>, src: &[u8]) -> Receiver {
             Some(name) => Receiver::New(name.to_owned()),
             None => Receiver::Other,
         },
+        // A pure dotted chain of identifiers (`os.path`, `a.b`) is treated as one
+        // named receiver so a deep-chain member call like `os.path.join()` can
+        // bind to the module imported as `os.path` (Python `import os.path`). A
+        // chain broken by a call/subscript/`this` is not pinnable, so it stays
+        // `Other` and falls back to candidate resolution.
+        "attribute" => match dotted_ident_chain(node, src) {
+            Some(text) => Receiver::Ident(text),
+            None => Receiver::Other,
+        },
         _ => Receiver::Other,
+    }
+}
+
+/// The full dotted text of a receiver that is a pure chain of identifiers
+/// (`os.path`, `a.b.c`), or `None` if any link is a call/subscript/other. Only
+/// the Python `attribute` node reaches here; other grammars spell member access
+/// differently and are unaffected.
+fn dotted_ident_chain(node: TsNode, src: &[u8]) -> Option<String> {
+    match node.kind() {
+        "identifier" => node.utf8_text(src).ok().map(str::to_owned),
+        "attribute" => {
+            let object = node.child_by_field_name("object")?;
+            let attribute = node.child_by_field_name("attribute")?;
+            let base = dotted_ident_chain(object, src)?;
+            let name = attribute.utf8_text(src).ok()?;
+            Some(format!("{base}.{name}"))
+        }
+        _ => None,
     }
 }
 

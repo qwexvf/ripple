@@ -8,8 +8,10 @@ pub mod gleam;
 pub mod go;
 pub mod graphql;
 pub mod html;
+pub mod php;
 pub mod python;
 pub mod resolve_import;
+pub mod ruby;
 pub mod rust;
 pub mod spec;
 pub mod typescript;
@@ -271,6 +273,8 @@ pub fn registry() -> Vec<Box<dyn LanguageAdapter>> {
         Box::new(gleam::Adapter::new()),
         Box::new(python::Adapter::new()),
         Box::new(html::Adapter::new()),
+        Box::new(php::Adapter::new()),
+        Box::new(ruby::Adapter::new()),
     ]
 }
 

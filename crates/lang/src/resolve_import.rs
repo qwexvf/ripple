@@ -75,6 +75,49 @@ pub fn python_dep_key(spec: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// The dep-key of a Go import path — which *is* the path itself
+/// (`github.com/gin-gonic/gin` → itself, `gopkg.in/yaml.v2` → itself). A
+/// standard-library path has no dot in its first segment (`fmt`, `net/http`) and
+/// normalizes to `None`: it is not a third-party dependency. `None` too for a
+/// relative or absolute path.
+pub fn go_dep_key(spec: &str) -> Option<String> {
+    if spec.is_empty() || spec.starts_with('.') || spec.starts_with('/') {
+        return None;
+    }
+    let first = spec.split('/').next().filter(|s| !s.is_empty())?;
+    // a dot in the first segment marks a hosted module path (a domain); stdlib
+    // packages never have one.
+    first.contains('.').then(|| spec.to_owned())
+}
+
+/// The dep-key of a Ruby `require`/`gem` target: the first path segment.
+/// `require "active_record/base"` → `active_record`, `gem "rails"` → `rails`.
+/// `None` for a relative `require_relative`-style path.
+pub fn ruby_dep_key(spec: &str) -> Option<String> {
+    if spec.is_empty() || spec.starts_with('.') || spec.starts_with('/') {
+        return None;
+    }
+    spec.split('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+}
+
+/// The dep-key of a PHP `use` path: its top namespace segment.
+/// `use GuzzleHttp\Client;` → `GuzzleHttp`. A leading `\` (fully-qualified
+/// marker) is stripped first. Composer maps namespaces to packages, so this is
+/// the import-level floor rather than a package identity.
+pub fn php_dep_key(spec: &str) -> Option<String> {
+    let spec = spec.trim_start_matches('\\');
+    if spec.is_empty() {
+        return None;
+    }
+    spec.split('\\')
+        .next()
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+}
+
 /// Match a tsconfig path pattern against a specifier, returning the `*` capture.
 /// Supports a single trailing-ish `*` wildcard and exact patterns.
 fn match_pattern<'a>(pattern: &str, spec: &'a str) -> Option<&'a str> {
