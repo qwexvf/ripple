@@ -395,6 +395,83 @@ mod tests {
     }
 
     #[test]
+    fn ts_namespace_member_call_binds_external_symbol() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("Counter.tsx"),
+            "import * as React from 'react';\n\
+             export function Counter() { return React.useState(0); }\n",
+        )
+        .unwrap();
+        let graph = index(dir.path()).unwrap();
+
+        assert!(imports(&graph, "react"), "react is imported");
+        let users = uses(&graph, "react", "useState");
+        assert!(
+            users.iter().any(|n| n.name == "Counter"),
+            "Counter uses react.useState via namespace member call: {:?}",
+            users.iter().map(|n| &n.name).collect::<Vec<_>>()
+        );
+        assert!(
+            !reaches(&graph, "react", "useState").is_empty(),
+            "Counter reaches react.useState"
+        );
+    }
+
+    #[test]
+    fn py_namespace_member_calls_bind_external_symbols() {
+        let dir = tempfile::tempdir().unwrap();
+        // plain `import os` + os.system(...)
+        fs::write(
+            dir.path().join("shell.py"),
+            "import os\n\n\
+             def wipe():\n    return os.system('rm -rf /tmp/x')\n",
+        )
+        .unwrap();
+        // aliased `import numpy as np` + np.load()
+        fs::write(
+            dir.path().join("model.py"),
+            "import numpy as np\n\n\
+             def load_weights():\n    return np.load('w.npy')\n",
+        )
+        .unwrap();
+        let graph = index(dir.path()).unwrap();
+
+        assert!(imports(&graph, "os"), "os is imported");
+        let os_users = uses(&graph, "os", "system");
+        assert!(
+            os_users.iter().any(|n| n.name == "wipe"),
+            "wipe uses os.system: {:?}",
+            os_users.iter().map(|n| &n.name).collect::<Vec<_>>()
+        );
+
+        assert!(imports(&graph, "numpy"), "numpy is imported (aliased)");
+        let np_users = uses(&graph, "numpy", "load");
+        assert!(
+            np_users.iter().any(|n| n.name == "load_weights"),
+            "load_weights uses numpy.load via alias: {:?}",
+            np_users.iter().map(|n| &n.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn ts_side_effect_import_is_imported() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("entry.ts"),
+            "import 'polyfill';\nexport function boot() {}\n",
+        )
+        .unwrap();
+        let graph = index(dir.path()).unwrap();
+        assert!(
+            imports(&graph, "polyfill"),
+            "a side-effect-only import still registers the dep"
+        );
+        // it binds no symbol, so there is nothing used or reached
+        assert!(uses(&graph, "polyfill", "anything").is_empty());
+    }
+
+    #[test]
     fn a_never_imported_symbol_is_absent() {
         let dir = urql_fixture();
         let graph = index(dir.path()).unwrap();

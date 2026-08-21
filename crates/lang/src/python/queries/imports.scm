@@ -13,11 +13,14 @@
           alias: (identifier) @import.alias))
 
 ; `import x.y as z` — the whole module is bound to one local name.
-;
-; Plain `import x.y` is deliberately not read: the binding is the top package and
-; every use spells the rest (`x.y.f()`), which member resolution cannot follow.
-; Under-link rather than bind a name nothing will match.
 (import_statement
   name: (aliased_import
           name: (dotted_name) @import.source
           alias: (identifier) @import.namespace))
+
+; Plain `import x` — bind the module name so `x.f()` resolves against it. A single
+; segment (`import os`) binds `os`; a dotted `import x.y` binds `x.y` here, whose
+; deep-chain uses (`x.y.f()`) member resolution still can't follow, but the common
+; single-segment stdlib/package form (`os.system()`, `subprocess.run()`) works.
+(import_statement
+  name: (dotted_name) @import.namespace @import.source)

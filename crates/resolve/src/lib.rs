@@ -568,8 +568,8 @@ fn link(
         files.iter().map(|f| (f.canonical.as_path(), f)).collect();
     for (f, &root) in files.iter().zip(file_root) {
         let module_id = module_symbol(&f.module_path);
-        let (bindings, modules) = resolve_imports(f, root, idx, &by_path, registry, ws, &mut sink);
-        resolve_calls(f, root, idx, module_id, &bindings, &modules, &mut sink.edges);
+        let scope = resolve_imports(f, root, idx, &by_path, registry, ws, &mut sink);
+        resolve_calls(f, root, idx, module_id, &scope, &mut sink);
     }
     // deterministic node order: edge order already is, and the store keys by id,
     // but a stable node list keeps two indexes of one tree comparable
@@ -585,6 +585,34 @@ fn link(
 struct LinkSink {
     edges: Vec<Edge>,
     externals: HashMap<SymbolId, Node>,
+}
+
+impl LinkSink {
+    /// Mint (or reuse) an external `dep.symbol` node and return its id. Deduped
+    /// by id, so every reference to the same external symbol shares one node.
+    fn external_symbol(&mut self, dep: &str, symbol: &str) -> SymbolId {
+        let sym_id = external_symbol_id(dep, symbol);
+        let qn = format!("{dep}.{symbol}");
+        self.externals
+            .entry(sym_id)
+            .or_insert_with(|| external_node(sym_id, symbol, &qn, dep));
+        sym_id
+    }
+}
+
+/// What a file's imports bind, for resolving its call sites. Names bound to a
+/// project symbol, to a local module file (namespace import), or to an external
+/// dependency key (namespace / plain `import pkg`).
+#[derive(Default)]
+struct ImportScope {
+    /// local name → the single project symbol it imports
+    bindings: HashMap<String, SymbolId>,
+    /// local name → the local file it names as a whole (`import * as ns`)
+    modules: HashMap<String, PathBuf>,
+    /// local name → external dep-key, for a namespace/plain import that resolved
+    /// outside the roots (`import * as React from "react"`, `import os`). A member
+    /// call on such a name binds to `dep.method`.
+    ext_modules: HashMap<String, String>,
 }
 
 /// Id of the external module (dep-key) node. Kept in sync with
@@ -620,23 +648,18 @@ fn external_node(id: SymbolId, name: &str, qualified_name: &str, dep: &str) -> N
 }
 
 /// Bind a bare import that resolved outside the indexed roots to `External`
-/// nodes: an `Imports` edge to the dep's module node (the import-level floor),
-/// and — for a named/default binding — an external `dep.symbol` node registered
-/// in `bindings` so a later call to it becomes a `Calls` edge.
-///
-/// A namespace import (`import * as ns from "urql"`) only gets the module node +
-/// import edge; member calls through it into an external dep are a phase-1 gap.
-///
-/// TODO(phase1): side-effect-only imports (`import "polyfill"`) never reach here
-/// — the TS/Python imports.scm only match an import with a clause, so a bare
-/// specifier with no binding produces no `ImportRec` and thus no external module
-/// node. Add a clause-less capture to emit the bare `module_path` node the design
-/// calls for. `imports(dep)` therefore misses side-effect-only deps today.
+/// nodes, minting the dep's module node and an `Imports` edge to it (the
+/// import-level floor) for every kind of import, then:
+/// - side-effect (`import "polyfill"`): nothing more — no name is bound;
+/// - namespace / plain (`import * as ns`, `import os`): record name → dep-key in
+///   `ext_modules`, so a later `ns.f()` / `os.f()` member call binds `dep.f`;
+/// - named / default: mint the `dep.symbol` node and bind the local name, so a
+///   later call to it becomes a `Calls` edge.
 fn bind_external(
     adapter: &dyn LanguageAdapter,
     imp: &parse::ImportRec,
     file_module_id: SymbolId,
-    bindings: &mut HashMap<String, SymbolId>,
+    scope: &mut ImportScope,
     sink: &mut LinkSink,
 ) {
     let Some(dep) = adapter.external_dep_key(&imp.specifier) else {
@@ -654,23 +677,20 @@ fn bind_external(
         site: imp.site,
         source: EdgeSource::Extracted,
     });
-    // a namespace binding names the whole module, not one symbol — no call target.
-    // TODO(phase1): member calls through an external namespace import
-    // (`import * as React from "react"; React.useState()`) get only the module
-    // Imports edge, not a Calls edge to `react.useState`. `modules` maps a local
-    // name to a PathBuf, which an external dep has none of; wiring external
-    // namespace receivers into `resolve_member` is the remaining gap. Named and
-    // default imports (the common React-hooks / stdlib case) are fully bound.
-    if imp.is_namespace() {
+    // a side-effect import (`import "polyfill"`) binds nothing — the module node
+    // and its import edge are the whole story.
+    if imp.is_side_effect() {
         return;
     }
-    let symbol = &imp.imported_name;
-    let sym_id = external_symbol_id(&dep, symbol);
-    let qn = format!("{dep}.{symbol}");
-    sink.externals
-        .entry(sym_id)
-        .or_insert_with(|| external_node(sym_id, symbol, &qn, &dep));
-    bindings.insert(imp.local_name.clone(), sym_id);
+    // a namespace / plain module import (`import * as React`, `import os`) binds the
+    // whole module to one name. Record the name → dep-key so a later `React.f()` /
+    // `os.f()` member call binds to the external `dep.f` symbol (see resolve_calls).
+    if imp.is_namespace() {
+        scope.ext_modules.insert(imp.local_name.clone(), dep);
+        return;
+    }
+    let sym_id = sink.external_symbol(&dep, &imp.imported_name);
+    scope.bindings.insert(imp.local_name.clone(), sym_id);
 }
 
 /// How much a resolution that leaves its repo is worth. The syntax pins the target
@@ -740,7 +760,8 @@ fn resolve_export(
 }
 
 /// Resolve a file's imports to symbols, emit Imports edges, and return the
-/// local-name → symbol binding map used by call resolution.
+/// import scope (local name → symbol / local module / external dep) used by call
+/// resolution.
 fn resolve_imports(
     f: &CachedFile,
     root: usize,
@@ -749,12 +770,10 @@ fn resolve_imports(
     registry: &[Box<dyn LanguageAdapter>],
     ws: &Workspaces,
     sink: &mut LinkSink,
-) -> (HashMap<String, SymbolId>, HashMap<String, PathBuf>) {
+) -> ImportScope {
     let module_id = module_symbol(&f.module_path);
     let adapter = lang::adapter_for(registry, &f.canonical);
-    let mut bindings = HashMap::new();
-    // local name → the file it names as a whole (`import * as ns`)
-    let mut modules: HashMap<String, PathBuf> = HashMap::new();
+    let mut scope = ImportScope::default();
 
     for imp in &f.extract.imports {
         let Some(adapter) = adapter else { continue };
@@ -763,13 +782,13 @@ fn resolve_imports(
         else {
             // bare/unresolved specifier — bind it as an external package so a
             // call to it has a real target node (external-import binding pass)
-            bind_external(adapter, imp, module_id, &mut bindings, sink);
+            bind_external(adapter, imp, module_id, &mut scope, sink);
             continue;
         };
         if imp.is_namespace() {
             // the binding names a module, so there is no single symbol to point at;
             // the file's module node is the honest target
-            modules.insert(imp.local_name.clone(), target.clone());
+            scope.modules.insert(imp.local_name.clone(), target.clone());
             if let Some(m) = by_path.get(target.as_path()) {
                 let dst = module_symbol(&m.module_path);
                 sink.edges.push(Edge {
@@ -797,7 +816,7 @@ fn resolve_imports(
             )
         };
         if let Some(sym) = resolved {
-            bindings.insert(imp.local_name.clone(), sym);
+            scope.bindings.insert(imp.local_name.clone(), sym);
             sink.edges.push(Edge {
                 src: module_id,
                 dst: sym,
@@ -808,7 +827,7 @@ fn resolve_imports(
             });
         }
     }
-    (bindings, modules)
+    scope
 }
 
 /// Resolve a file's call sites (bare + member) into Calls edges.
@@ -817,9 +836,8 @@ fn resolve_calls(
     root: usize,
     idx: &DefIndex,
     module_id: SymbolId,
-    bindings: &HashMap<String, SymbolId>,
-    modules: &HashMap<String, PathBuf>,
-    edges: &mut Vec<Edge>,
+    scope: &ImportScope,
+    sink: &mut LinkSink,
 ) {
     let types = Bindings::new(&f.extract.bindings);
 
@@ -859,16 +877,16 @@ fn resolve_calls(
                     None => match local.get(&r.name) {
                         Some(ids) if !ids.is_empty() => (ids.clone(), CONF_LOCAL_CALL),
                         _ => (
-                            bindings.get(&r.name).into_iter().copied().collect(),
+                            scope.bindings.get(&r.name).into_iter().copied().collect(),
                             CONF_LOCAL_CALL,
                         ),
                     },
                 }
             }
             RefKind::Member => {
-                // a receiver bound to a whole module is pinned by the import, so the
-                // method is whatever that module exports under this name — no guessing
-                if let Some(target) = module_receiver(r.receiver.as_ref(), modules) {
+                // a receiver bound to a whole local module is pinned by the import,
+                // so the method is whatever that module exports under this name
+                if let Some(target) = module_receiver(r.receiver.as_ref(), &scope.modules) {
                     match idx
                         .export_table
                         .get(&(target.clone(), r.name.clone()))
@@ -877,6 +895,13 @@ fn resolve_calls(
                         Some(sym) => (vec![sym], CONF_KNOWN_RECEIVER),
                         None => (Vec::new(), CONF_KNOWN_RECEIVER),
                     }
+                } else if let Some(dep) =
+                    external_module_receiver(r.receiver.as_ref(), &scope.ext_modules)
+                {
+                    // `React.useState()` / `os.system()` — the receiver names an
+                    // external module, so the method is that dep's `dep.method` symbol
+                    let sym = sink.external_symbol(&dep, &r.name);
+                    (vec![sym], CONF_KNOWN_RECEIVER)
                 } else {
                     resolve_member(
                         &r.name,
@@ -907,7 +932,7 @@ fn resolve_calls(
         let n = targets.len() as f32;
         for t in targets.into_iter().filter(|&t| t != src_id) {
             let conf = if n <= 1.0 { base_conf } else { base_conf / n };
-            edges.push(Edge {
+            sink.edges.push(Edge {
                 src: src_id,
                 dst: t,
                 kind: EdgeKind::Calls,
@@ -1088,6 +1113,18 @@ fn module_receiver(
 ) -> Option<PathBuf> {
     match receiver {
         Some(Receiver::Ident(name)) => modules.get(name.as_str()).cloned(),
+        _ => None,
+    }
+}
+
+/// The external dep-key a member call's receiver names, when the receiver is an
+/// external namespace/plain module import (`React.f()` → `react`, `os.f()` → `os`).
+fn external_module_receiver(
+    receiver: Option<&Receiver>,
+    ext_modules: &HashMap<String, String>,
+) -> Option<String> {
+    match receiver {
+        Some(Receiver::Ident(name)) => ext_modules.get(name.as_str()).cloned(),
         _ => None,
     }
 }

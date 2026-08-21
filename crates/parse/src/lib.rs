@@ -54,6 +54,13 @@ impl ImportRec {
     pub fn is_namespace(&self) -> bool {
         self.imported_name == "*"
     }
+
+    /// A module imported purely for its side effects (`import "polyfill"`): it
+    /// binds no local name, so there is nothing to call — only the module-level
+    /// import fact. Signalled by both name fields being empty.
+    pub fn is_side_effect(&self) -> bool {
+        self.local_name.is_empty() && self.imported_name.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -482,6 +489,8 @@ fn extract_imports(tree: &Tree, matcher: &Matcher, src: &[u8]) -> Result<Vec<Imp
         let mut alias: Option<String> = None;
         let mut default: Option<(String, Span)> = None;
         let mut namespace: Option<(String, Span)> = None;
+        // a side-effect import (`import "x"`) captures only the specifier text here
+        let mut bare: Option<(String, Span)> = None;
         for cap in m.captures {
             let text = cap.node.utf8_text(src).unwrap_or("").to_owned();
             match names[cap.index as usize] {
@@ -490,8 +499,19 @@ fn extract_imports(tree: &Tree, matcher: &Matcher, src: &[u8]) -> Result<Vec<Imp
                 "import.alias" => alias = Some(text),
                 "import.default" => default = Some((text, span_of(cap.node))),
                 "import.namespace" => namespace = Some((text, span_of(cap.node))),
+                "import.bare" => bare = Some((text, span_of(cap.node))),
                 _ => {}
             }
+        }
+        // `import "polyfill"` — no clause, so the specifier is the only capture
+        if let Some((spec, site)) = bare {
+            out.push(ImportRec {
+                local_name: String::new(),
+                imported_name: String::new(),
+                specifier: spec,
+                site,
+            });
+            continue;
         }
         let Some(specifier) = specifier else { continue };
         for (n, site) in named {
