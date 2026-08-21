@@ -1,0 +1,16 @@
+[package]
+name = "engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Reusable code-graph engine: index source into a symbol graph (tree-sitter, no build/LSP/git), then answer reachability and blast-radius queries. The language-agnostic core of ripple, minus git overlay, risk scoring, review targeting and MCP."
+
+[dependencies]
+ir = { workspace = true }
+resolve = { workspace = true }
+store = { workspace = true }
+query = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
