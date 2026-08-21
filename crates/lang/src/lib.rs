@@ -240,6 +240,18 @@ pub trait LanguageAdapter: Send + Sync {
     fn resolve_import(&self, spec: &str, from_file: &Path, _ws: &Workspace) -> Option<PathBuf> {
         resolve_import::relative(spec, from_file, self.file_globs())
     }
+
+    /// The dependency key of a specifier that resolves *outside* the indexed
+    /// roots, or `None` for a specifier that could only be local (a relative
+    /// path). This is what lets the resolver mint an `External` node for a bare
+    /// import like `urql` or `react-dom/client` (both keyed `react-dom`/`urql`).
+    ///
+    /// Only called when `resolve_import` returned `None`, so a specifier that
+    /// *did* resolve locally (including a tsconfig path alias) never reaches here.
+    /// Default `None` — a language with no external binding pass is unchanged.
+    fn external_dep_key(&self, _spec: &str) -> Option<String> {
+        None
+    }
 }
 
 /// The GraphQL grammar (for parsing `.gql` operation documents in cross-service linking).

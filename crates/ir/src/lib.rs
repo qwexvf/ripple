@@ -65,6 +65,12 @@ pub enum NodeKind {
     Variable,
     Route,
     Channel,
+    /// A symbol that lives outside the indexed roots — a package or one of its
+    /// exported names (`urql`, `urql.useQuery`). `module_path` is the dep-key,
+    /// `qualified_name` is `dep[.symbol]`, `is_exported` is false. Created by the
+    /// external-import binding pass so a project call to a dependency has a real
+    /// target node instead of resolving to nothing.
+    External,
 }
 
 impl NodeKind {

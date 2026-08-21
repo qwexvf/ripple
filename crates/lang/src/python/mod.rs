@@ -124,6 +124,10 @@ impl LanguageAdapter for Adapter {
         }
         probe_module(&base.join(rest.replace('.', "/")))
     }
+
+    fn external_dep_key(&self, spec: &str) -> Option<String> {
+        resolve_import::python_dep_key(spec)
+    }
 }
 
 /// A module path is either `name.py` or `name/__init__.py`.

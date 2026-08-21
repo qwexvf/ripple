@@ -44,6 +44,37 @@ pub fn workspace_package(spec: &str, ws: &Workspace, globs: &[&str]) -> Option<P
     None
 }
 
+/// The npm dep-key of a bare specifier: `urql` → `urql`, `react-dom/client` →
+/// `react-dom`, `@urql/next` → `@urql/next`, `@org/pkg/sub` → `@org/pkg`.
+/// `None` for a relative or absolute path (those are local, not a package).
+pub fn npm_dep_key(spec: &str) -> Option<String> {
+    if spec.is_empty() || spec.starts_with('.') || spec.starts_with('/') {
+        return None;
+    }
+    if let Some(rest) = spec.strip_prefix('@') {
+        // scoped: the key is the first two segments (`@org/pkg`)
+        let mut it = rest.splitn(3, '/');
+        let org = it.next().filter(|s| !s.is_empty())?;
+        let pkg = it.next().filter(|s| !s.is_empty())?;
+        Some(format!("@{org}/{pkg}"))
+    } else {
+        let top = spec.split('/').next().filter(|s| !s.is_empty())?;
+        Some(top.to_owned())
+    }
+}
+
+/// The top-level package of a Python import specifier: `subprocess` →
+/// `subprocess`, `os.path` → `os`. `None` for a relative import (leading dot).
+pub fn python_dep_key(spec: &str) -> Option<String> {
+    if spec.is_empty() || spec.starts_with('.') {
+        return None;
+    }
+    spec.split('.')
+        .next()
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+}
+
 /// Match a tsconfig path pattern against a specifier, returning the `*` capture.
 /// Supports a single trailing-ish `*` wildcard and exact patterns.
 fn match_pattern<'a>(pattern: &str, spec: &'a str) -> Option<&'a str> {

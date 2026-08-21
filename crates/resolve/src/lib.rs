@@ -198,12 +198,14 @@ pub fn build_incremental(
         Workspaces::discover_all(&used_roots)
     });
     let idx_span = ir::timing::start("index_defs");
-    let (index, nodes) = index_defs(&all_files, &file_root);
+    let (index, mut nodes) = index_defs(&all_files, &file_root);
     idx_span.stop(nodes.len());
 
     let link_span = ir::timing::start("link");
-    let edges = link(&all_files, &file_root, &index, &registry, &ws);
+    let (edges, external_nodes) = link(&all_files, &file_root, &index, &registry, &ws);
     link_span.stop(edges.len());
+    // external-import binding mints nodes for out-of-root symbols during `link`
+    nodes.extend(external_nodes);
 
     // removed = cached entries no longer present in any root
     let seen: HashSet<&str> = all_files.iter().map(|f| f.module_path.as_str()).collect();
@@ -559,17 +561,136 @@ fn link(
     idx: &DefIndex,
     registry: &[Box<dyn LanguageAdapter>],
     ws: &Workspaces,
-) -> Vec<Edge> {
-    let mut edges = Vec::new();
+) -> (Vec<Edge>, Vec<Node>) {
+    let mut sink = LinkSink::default();
     // a barrel file has to be looked up by path when an import lands on it
     let by_path: HashMap<&Path, &CachedFile> =
         files.iter().map(|f| (f.canonical.as_path(), f)).collect();
     for (f, &root) in files.iter().zip(file_root) {
         let module_id = module_symbol(&f.module_path);
-        let (bindings, modules) = resolve_imports(f, root, idx, &by_path, registry, ws, &mut edges);
-        resolve_calls(f, root, idx, module_id, &bindings, &modules, &mut edges);
+        let scope = resolve_imports(f, root, idx, &by_path, registry, ws, &mut sink);
+        resolve_calls(f, root, idx, module_id, &scope, &mut sink);
     }
-    edges
+    // deterministic node order: edge order already is, and the store keys by id,
+    // but a stable node list keeps two indexes of one tree comparable
+    let mut external_nodes: Vec<Node> = sink.externals.into_values().collect();
+    external_nodes.sort_by_key(|n| n.id.0);
+    (sink.edges, external_nodes)
+}
+
+/// The two accumulators `link` fills as it resolves each file: the edge list and
+/// the deduped set of `External` nodes minted by the binding pass. Bundled so
+/// `resolve_imports` stays under the argument limit.
+#[derive(Default)]
+struct LinkSink {
+    edges: Vec<Edge>,
+    externals: HashMap<SymbolId, Node>,
+}
+
+impl LinkSink {
+    /// Mint (or reuse) an external `dep.symbol` node and return its id. Deduped
+    /// by id, so every reference to the same external symbol shares one node.
+    fn external_symbol(&mut self, dep: &str, symbol: &str) -> SymbolId {
+        let sym_id = external_symbol_id(dep, symbol);
+        let qn = format!("{dep}.{symbol}");
+        self.externals
+            .entry(sym_id)
+            .or_insert_with(|| external_node(sym_id, symbol, &qn, dep));
+        sym_id
+    }
+}
+
+/// What a file's imports bind, for resolving its call sites. Names bound to a
+/// project symbol, to a local module file (namespace import), or to an external
+/// dependency key (namespace / plain `import pkg`).
+#[derive(Default)]
+struct ImportScope {
+    /// local name → the single project symbol it imports
+    bindings: HashMap<String, SymbolId>,
+    /// local name → the local file it names as a whole (`import * as ns`)
+    modules: HashMap<String, PathBuf>,
+    /// local name → external dep-key, for a namespace/plain import that resolved
+    /// outside the roots (`import * as React from "react"`, `import os`). A member
+    /// call on such a name binds to `dep.method`.
+    ext_modules: HashMap<String, String>,
+}
+
+/// Id of the external module (dep-key) node. Kept in sync with
+/// [`external_module_node`] so `link` and any consumer agree on identity.
+fn external_module_id(dep: &str) -> SymbolId {
+    SymbolId::of(dep, dep)
+}
+
+/// Id of an external `dep.symbol` node.
+fn external_symbol_id(dep: &str, symbol: &str) -> SymbolId {
+    SymbolId::of(dep, &format!("{dep}.{symbol}"))
+}
+
+fn external_node(id: SymbolId, name: &str, qualified_name: &str, dep: &str) -> Node {
+    Node {
+        id,
+        kind: NodeKind::External,
+        name: name.to_owned(),
+        qualified_name: qualified_name.to_owned(),
+        module_path: dep.to_owned(),
+        span: Span {
+            start_line: 0,
+            start_col: 0,
+            end_line: 0,
+            end_col: 0,
+        },
+        extra_spans: Vec::new(),
+        is_exported: false,
+        risk: ir::RiskScores::default(),
+        doc: None,
+        route_path: None,
+    }
+}
+
+/// Bind a bare import that resolved outside the indexed roots to `External`
+/// nodes, minting the dep's module node and an `Imports` edge to it (the
+/// import-level floor) for every kind of import, then:
+/// - side-effect (`import "polyfill"`): nothing more — no name is bound;
+/// - namespace / plain (`import * as ns`, `import os`): record name → dep-key in
+///   `ext_modules`, so a later `ns.f()` / `os.f()` member call binds `dep.f`;
+/// - named / default: mint the `dep.symbol` node and bind the local name, so a
+///   later call to it becomes a `Calls` edge.
+fn bind_external(
+    adapter: &dyn LanguageAdapter,
+    imp: &parse::ImportRec,
+    file_module_id: SymbolId,
+    scope: &mut ImportScope,
+    sink: &mut LinkSink,
+) {
+    let Some(dep) = adapter.external_dep_key(&imp.specifier) else {
+        return; // relative/unresolvable specifier that is not an external package
+    };
+    let mod_id = external_module_id(&dep);
+    sink.externals
+        .entry(mod_id)
+        .or_insert_with(|| external_node(mod_id, &dep, &dep, &dep));
+    sink.edges.push(Edge {
+        src: file_module_id,
+        dst: mod_id,
+        kind: EdgeKind::Imports,
+        confidence: CONF_IMPORT,
+        site: imp.site,
+        source: EdgeSource::Extracted,
+    });
+    // a side-effect import (`import "polyfill"`) binds nothing — the module node
+    // and its import edge are the whole story.
+    if imp.is_side_effect() {
+        return;
+    }
+    // a namespace / plain module import (`import * as React`, `import os`) binds the
+    // whole module to one name. Record the name → dep-key so a later `React.f()` /
+    // `os.f()` member call binds to the external `dep.f` symbol (see resolve_calls).
+    if imp.is_namespace() {
+        scope.ext_modules.insert(imp.local_name.clone(), dep);
+        return;
+    }
+    let sym_id = sink.external_symbol(&dep, &imp.imported_name);
+    scope.bindings.insert(imp.local_name.clone(), sym_id);
 }
 
 /// How much a resolution that leaves its repo is worth. The syntax pins the target
@@ -639,7 +760,8 @@ fn resolve_export(
 }
 
 /// Resolve a file's imports to symbols, emit Imports edges, and return the
-/// local-name → symbol binding map used by call resolution.
+/// import scope (local name → symbol / local module / external dep) used by call
+/// resolution.
 fn resolve_imports(
     f: &CachedFile,
     root: usize,
@@ -647,28 +769,29 @@ fn resolve_imports(
     by_path: &HashMap<&Path, &CachedFile>,
     registry: &[Box<dyn LanguageAdapter>],
     ws: &Workspaces,
-    edges: &mut Vec<Edge>,
-) -> (HashMap<String, SymbolId>, HashMap<String, PathBuf>) {
+    sink: &mut LinkSink,
+) -> ImportScope {
     let module_id = module_symbol(&f.module_path);
     let adapter = lang::adapter_for(registry, &f.canonical);
-    let mut bindings = HashMap::new();
-    // local name → the file it names as a whole (`import * as ns`)
-    let mut modules: HashMap<String, PathBuf> = HashMap::new();
+    let mut scope = ImportScope::default();
 
     for imp in &f.extract.imports {
         let Some(adapter) = adapter else { continue };
         let Some(target) =
             adapter.resolve_import(&imp.specifier, &f.canonical, ws.for_file(&f.canonical))
         else {
-            continue; // bare/unresolved specifier (external node_modules dep)
+            // bare/unresolved specifier — bind it as an external package so a
+            // call to it has a real target node (external-import binding pass)
+            bind_external(adapter, imp, module_id, &mut scope, sink);
+            continue;
         };
         if imp.is_namespace() {
             // the binding names a module, so there is no single symbol to point at;
             // the file's module node is the honest target
-            modules.insert(imp.local_name.clone(), target.clone());
+            scope.modules.insert(imp.local_name.clone(), target.clone());
             if let Some(m) = by_path.get(target.as_path()) {
                 let dst = module_symbol(&m.module_path);
-                edges.push(Edge {
+                sink.edges.push(Edge {
                     src: module_id,
                     dst,
                     kind: EdgeKind::Imports,
@@ -693,8 +816,8 @@ fn resolve_imports(
             )
         };
         if let Some(sym) = resolved {
-            bindings.insert(imp.local_name.clone(), sym);
-            edges.push(Edge {
+            scope.bindings.insert(imp.local_name.clone(), sym);
+            sink.edges.push(Edge {
                 src: module_id,
                 dst: sym,
                 kind: EdgeKind::Imports,
@@ -704,7 +827,7 @@ fn resolve_imports(
             });
         }
     }
-    (bindings, modules)
+    scope
 }
 
 /// Resolve a file's call sites (bare + member) into Calls edges.
@@ -713,9 +836,8 @@ fn resolve_calls(
     root: usize,
     idx: &DefIndex,
     module_id: SymbolId,
-    bindings: &HashMap<String, SymbolId>,
-    modules: &HashMap<String, PathBuf>,
-    edges: &mut Vec<Edge>,
+    scope: &ImportScope,
+    sink: &mut LinkSink,
 ) {
     let types = Bindings::new(&f.extract.bindings);
 
@@ -755,16 +877,29 @@ fn resolve_calls(
                     None => match local.get(&r.name) {
                         Some(ids) if !ids.is_empty() => (ids.clone(), CONF_LOCAL_CALL),
                         _ => (
-                            bindings.get(&r.name).into_iter().copied().collect(),
+                            scope.bindings.get(&r.name).into_iter().copied().collect(),
                             CONF_LOCAL_CALL,
                         ),
                     },
                 }
             }
             RefKind::Member => {
-                // a receiver bound to a whole module is pinned by the import, so the
-                // method is whatever that module exports under this name — no guessing
-                if let Some(target) = module_receiver(r.receiver.as_ref(), modules) {
+                let type_map = types.at(r.site, enclosing, &defs_by_start);
+                // a local declaration of the receiver name shadows any import of the
+                // same name: `const React = makeFake(); React.foo()` is not the
+                // imported `React`, so it must not bind to an external/module symbol.
+                let shadowed = matches!(
+                    r.receiver.as_ref(),
+                    Some(Receiver::Ident(v)) if type_map.contains_key(v.as_str())
+                );
+                let ext_dep = if shadowed {
+                    None
+                } else {
+                    external_module_receiver(r.receiver.as_ref(), &scope.ext_modules)
+                };
+                // a receiver bound to a whole local module is pinned by the import,
+                // so the method is whatever that module exports under this name
+                if let Some(target) = module_receiver(r.receiver.as_ref(), &scope.modules) {
                     match idx
                         .export_table
                         .get(&(target.clone(), r.name.clone()))
@@ -773,12 +908,17 @@ fn resolve_calls(
                         Some(sym) => (vec![sym], CONF_KNOWN_RECEIVER),
                         None => (Vec::new(), CONF_KNOWN_RECEIVER),
                     }
+                } else if let Some(dep) = ext_dep {
+                    // `React.useState()` / `os.system()` — the receiver names an
+                    // external module, so the method is that dep's `dep.method` symbol
+                    let sym = sink.external_symbol(&dep, &r.name);
+                    (vec![sym], CONF_KNOWN_RECEIVER)
                 } else {
                     resolve_member(
                         &r.name,
                         r.receiver.as_ref(),
                         enclosing,
-                        &types.at(r.site, enclosing, &defs_by_start),
+                        &type_map,
                         idx,
                         root,
                     )
@@ -803,7 +943,7 @@ fn resolve_calls(
         let n = targets.len() as f32;
         for t in targets.into_iter().filter(|&t| t != src_id) {
             let conf = if n <= 1.0 { base_conf } else { base_conf / n };
-            edges.push(Edge {
+            sink.edges.push(Edge {
                 src: src_id,
                 dst: t,
                 kind: EdgeKind::Calls,
@@ -958,7 +1098,12 @@ impl<'a> Bindings<'a> {
         enclosing: Option<&Node>,
         defs: &[&Node],
     ) -> HashMap<&'a str, &'a str> {
-        let mut out: HashMap<&str, &str> = HashMap::new();
+        // name → (declaration site, type). One declarator is captured twice — once
+        // typed (`const b: Bar`/`new Bar()`), once bare — at the same site; the bare
+        // capture carries an empty type. Prefer the non-empty one at a given site so
+        // an untyped record never downgrades a known type, while a genuinely later
+        // (nearest-preceding) redeclaration still shadows an earlier one.
+        let mut out: HashMap<&str, (Span, &str)> = HashMap::new();
         for b in &self.by_site {
             if (b.site.start_line, b.site.start_col) > (site.start_line, site.start_col) {
                 break; // sorted: nothing further can precede the reference
@@ -969,11 +1114,18 @@ impl<'a> Bindings<'a> {
                 Some(d) => d.contains_line(line) || !defs.iter().any(|x| x.contains_line(line)),
                 None => !defs.iter().any(|x| x.contains_line(line)),
             };
-            if visible {
-                out.insert(b.name.as_str(), b.type_name.as_str());
+            if !visible {
+                continue;
+            }
+            match out.get(b.name.as_str()) {
+                // same declarator seen twice: keep whichever pins a type
+                Some((esite, etype)) if *esite == b.site && !etype.is_empty() => {}
+                _ => {
+                    out.insert(b.name.as_str(), (b.site, b.type_name.as_str()));
+                }
             }
         }
-        out
+        out.into_iter().map(|(k, (_, ty))| (k, ty)).collect()
     }
 }
 
@@ -984,6 +1136,18 @@ fn module_receiver(
 ) -> Option<PathBuf> {
     match receiver {
         Some(Receiver::Ident(name)) => modules.get(name.as_str()).cloned(),
+        _ => None,
+    }
+}
+
+/// The external dep-key a member call's receiver names, when the receiver is an
+/// external namespace/plain module import (`React.f()` → `react`, `os.f()` → `os`).
+fn external_module_receiver(
+    receiver: Option<&Receiver>,
+    ext_modules: &HashMap<String, String>,
+) -> Option<String> {
+    match receiver {
+        Some(Receiver::Ident(name)) => ext_modules.get(name.as_str()).cloned(),
         _ => None,
     }
 }

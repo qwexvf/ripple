@@ -44,3 +44,11 @@
   (import_clause
     (namespace_import (identifier) @import.namespace))
   source: (string (string_fragment) @import.source))
+
+; Side-effect import:  import "polyfill"  (no clause, binds nothing)
+;
+; The leading anchor requires the string to be the first named child, so this only
+; matches a clause-less import — `import a from "x"` has an import_clause first.
+; Still worth an External module node so the import-level floor sees the dep.
+(import_statement
+  . (string (string_fragment) @import.bare))

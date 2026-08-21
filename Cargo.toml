@@ -8,6 +8,7 @@ members = [
     "crates/store",
     "crates/overlay",
     "crates/query",
+    "crates/engine",
     "crates/lsp",
     "crates/cli",
 ]
