@@ -31,6 +31,8 @@ cargo run -p ripple-cli -- <cmd>    # parse <file> | index <path> | neighbors <s
 
 cd docs && bun install && bun dev   # docs site at localhost:4321
 cd docs && bun run build            # what CI checks
+
+git config core.hooksPath .githooks # once per clone: pre-push runs fmt+clippy+test
 ```
 
 Writing docs: a new page is a markdown file under `docs/src/content/docs/` with
