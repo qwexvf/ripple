@@ -455,6 +455,38 @@ mod tests {
     }
 
     #[test]
+    fn ts_local_shadow_beats_external_namespace_import() {
+        let dir = tempfile::tempdir().unwrap();
+        // React is imported as a namespace, but a function rebinds it to a local
+        // value and calls .foo() on THAT — the local must win, no external edge.
+        fs::write(
+            dir.path().join("Shadow.tsx"),
+            "import * as React from 'react';\n\
+             function makeFake() { return { foo() {} }; }\n\
+             export function Widget() {\n\
+             \x20 const React = makeFake();\n\
+             \x20 return React.foo();\n\
+             }\n",
+        )
+        .unwrap();
+        let graph = index(dir.path()).unwrap();
+
+        // the import fact still holds (React is imported at module level)
+        assert!(imports(&graph, "react"));
+        // but React.foo() bound to the local shadow, not to react.foo
+        let foo_users = uses(&graph, "react", "foo");
+        assert!(
+            foo_users.iter().all(|n| n.name != "Widget"),
+            "a local `const React` shadows the import — React.foo() must not bind to react.foo: {:?}",
+            foo_users.iter().map(|n| &n.name).collect::<Vec<_>>()
+        );
+        assert!(
+            reaches(&graph, "react", "foo").is_empty(),
+            "nothing reaches react.foo — the only React.foo() call is the shadowed local"
+        );
+    }
+
+    #[test]
     fn ts_side_effect_import_is_imported() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(

@@ -671,10 +671,13 @@ fn extract_bindings(tree: &Tree, matcher: &Matcher, src: &[u8]) -> Result<Vec<Bi
                 _ => {}
             }
         }
-        if let (Some(name), Some(type_name), Some(site)) = (name, ty, site) {
+        // an untyped binding (a plain `const x = …` / bare parameter) still records
+        // the declared name — with an empty type — so a local can be seen to shadow
+        // an import. Call resolution prefers a non-empty type for the same name.
+        if let (Some(name), Some(site)) = (name, site) {
             out.push(BindRec {
                 name,
-                type_name,
+                type_name: ty.unwrap_or_default(),
                 site,
             });
         }

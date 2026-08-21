@@ -884,6 +884,19 @@ fn resolve_calls(
                 }
             }
             RefKind::Member => {
+                let type_map = types.at(r.site, enclosing, &defs_by_start);
+                // a local declaration of the receiver name shadows any import of the
+                // same name: `const React = makeFake(); React.foo()` is not the
+                // imported `React`, so it must not bind to an external/module symbol.
+                let shadowed = matches!(
+                    r.receiver.as_ref(),
+                    Some(Receiver::Ident(v)) if type_map.contains_key(v.as_str())
+                );
+                let ext_dep = if shadowed {
+                    None
+                } else {
+                    external_module_receiver(r.receiver.as_ref(), &scope.ext_modules)
+                };
                 // a receiver bound to a whole local module is pinned by the import,
                 // so the method is whatever that module exports under this name
                 if let Some(target) = module_receiver(r.receiver.as_ref(), &scope.modules) {
@@ -895,9 +908,7 @@ fn resolve_calls(
                         Some(sym) => (vec![sym], CONF_KNOWN_RECEIVER),
                         None => (Vec::new(), CONF_KNOWN_RECEIVER),
                     }
-                } else if let Some(dep) =
-                    external_module_receiver(r.receiver.as_ref(), &scope.ext_modules)
-                {
+                } else if let Some(dep) = ext_dep {
                     // `React.useState()` / `os.system()` — the receiver names an
                     // external module, so the method is that dep's `dep.method` symbol
                     let sym = sink.external_symbol(&dep, &r.name);
@@ -907,7 +918,7 @@ fn resolve_calls(
                         &r.name,
                         r.receiver.as_ref(),
                         enclosing,
-                        &types.at(r.site, enclosing, &defs_by_start),
+                        &type_map,
                         idx,
                         root,
                     )
@@ -1087,7 +1098,12 @@ impl<'a> Bindings<'a> {
         enclosing: Option<&Node>,
         defs: &[&Node],
     ) -> HashMap<&'a str, &'a str> {
-        let mut out: HashMap<&str, &str> = HashMap::new();
+        // name → (declaration site, type). One declarator is captured twice — once
+        // typed (`const b: Bar`/`new Bar()`), once bare — at the same site; the bare
+        // capture carries an empty type. Prefer the non-empty one at a given site so
+        // an untyped record never downgrades a known type, while a genuinely later
+        // (nearest-preceding) redeclaration still shadows an earlier one.
+        let mut out: HashMap<&str, (Span, &str)> = HashMap::new();
         for b in &self.by_site {
             if (b.site.start_line, b.site.start_col) > (site.start_line, site.start_col) {
                 break; // sorted: nothing further can precede the reference
@@ -1098,11 +1114,18 @@ impl<'a> Bindings<'a> {
                 Some(d) => d.contains_line(line) || !defs.iter().any(|x| x.contains_line(line)),
                 None => !defs.iter().any(|x| x.contains_line(line)),
             };
-            if visible {
-                out.insert(b.name.as_str(), b.type_name.as_str());
+            if !visible {
+                continue;
+            }
+            match out.get(b.name.as_str()) {
+                // same declarator seen twice: keep whichever pins a type
+                Some((esite, etype)) if *esite == b.site && !etype.is_empty() => {}
+                _ => {
+                    out.insert(b.name.as_str(), (b.site, b.type_name.as_str()));
+                }
             }
         }
-        out
+        out.into_iter().map(|(k, (_, ty))| (k, ty)).collect()
     }
 }
 
