@@ -1210,7 +1210,13 @@ fn enclosing_def<'a>(defs_by_start: &[&'a Node], site: Span) -> Option<&'a Node>
 fn is_container(kind: NodeKind) -> bool {
     matches!(
         kind,
-        NodeKind::Function | NodeKind::Method | NodeKind::Class | NodeKind::Module
+        NodeKind::Function
+            | NodeKind::Method
+            | NodeKind::Class
+            | NodeKind::Module
+            // a single-file component owns the render calls in its template — a ref
+            // that falls outside every script function belongs to the component
+            | NodeKind::Component
     )
 }
 

@@ -63,6 +63,11 @@ pub enum NodeKind {
     Enum,
     Field,
     Variable,
+    /// A UI component that is a whole file, not a named declaration inside one — a
+    /// Svelte/Vue single-file component. It has no defining AST node carrying its
+    /// name (the name is the file), so it is synthesized by the adapter rather than
+    /// captured by a `tags.scm` query. Rendering it (`<Child />`) is a call.
+    Component,
     Route,
     Channel,
     /// A symbol that lives outside the indexed roots — a package or one of its
@@ -86,6 +91,7 @@ impl NodeKind {
             "def.enum" => NodeKind::Enum,
             "def.field" => NodeKind::Field,
             "def.variable" => NodeKind::Variable,
+            "def.component" => NodeKind::Component,
             _ => return None,
         })
     }
