@@ -31,7 +31,7 @@ interface an agent can actually consume. See [`02-gap.md`](docs/src/content/docs
 
 ## Languages
 
-TypeScript · TSX · Python · Go · Ruby · PHP · Rust · Elixir · Gleam · GraphQL · HTML
+TypeScript · TSX · Python · Go · Ruby · PHP · Rust · Elixir · Gleam · Svelte · GraphQL · HTML
 
 Adding one touches only `crates/lang/` — a module plus `.scm` query files plus one
 registry line. Every layer above the [IR boundary](docs/src/content/docs/design/04-architecture.md)

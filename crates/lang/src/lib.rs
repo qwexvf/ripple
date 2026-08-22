@@ -14,6 +14,7 @@ pub mod resolve_import;
 pub mod ruby;
 pub mod rust;
 pub mod spec;
+pub mod svelte;
 pub mod typescript;
 
 use std::collections::HashMap;
@@ -293,6 +294,7 @@ pub fn registry() -> Vec<Box<dyn LanguageAdapter>> {
         Box::new(html::Adapter::new()),
         Box::new(php::Adapter::new()),
         Box::new(ruby::Adapter::new()),
+        Box::new(svelte::Adapter::new()),
     ]
 }
 

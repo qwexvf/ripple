@@ -1285,3 +1285,44 @@ fn a_script_block_resolves_like_the_typescript_it_is() {
         "the <script> import of greet should resolve to util.ts"
     );
 }
+
+#[test]
+fn svelte_component_render_and_script_call_resolve() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/svelte");
+    let r = resolve::build(&root).unwrap();
+
+    let parent = SymbolId::of("Parent.svelte", "Parent");
+    let child = SymbolId::of("Child.svelte", "Child");
+    let util = SymbolId::of("util.ts", "util");
+
+    // the SFC is a file-named component symbol, minted by the adapter (#47)
+    assert!(
+        r.nodes
+            .iter()
+            .any(|n| n.id == parent && n.kind == ir::NodeKind::Component),
+        "Parent.svelte is a Component symbol"
+    );
+
+    // <Child /> in Parent's markup renders Child.svelte — a call across the import
+    assert!(
+        r.edges
+            .iter()
+            .any(|e| e.src == parent && e.dst == child && e.kind == EdgeKind::Calls),
+        "Parent should render (call) Child across the .svelte import"
+    );
+
+    // util() in Parent's <script> block calls util.ts — the TS region resolves as a
+    // plain .ts importer would, and the call attributes to the component (#46)
+    assert!(
+        r.edges
+            .iter()
+            .any(|e| e.src == parent && e.dst == util && e.kind == EdgeKind::Calls),
+        "Parent's script should call util across the region→ts import"
+    );
+    assert!(
+        r.edges
+            .iter()
+            .any(|e| e.dst == util && e.kind == EdgeKind::Imports),
+        "the <script> import of util should resolve to util.ts"
+    );
+}

@@ -19,6 +19,7 @@ tree-sitter-python = { workspace = true }
 tree-sitter-html = { workspace = true }
 tree-sitter-php = { workspace = true }
 tree-sitter-ruby = { workspace = true }
+tree-sitter-svelte-next = { workspace = true }
 
 [dev-dependencies]
 streaming-iterator = "0.1"
