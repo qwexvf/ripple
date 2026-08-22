@@ -241,6 +241,18 @@ pub struct SzzCase {
     pub convergence: f32,
 }
 
+/// The outcome of an SZZ scan: the kept cases plus how many were dropped because
+/// their introducer was a bulk commit. The count is reported so a shallow clone
+/// whose corpus is eaten by its squashed initial import isn't silently thin — the
+/// same no-silent-caps rule the co-change guard already follows.
+#[derive(Default)]
+pub struct SzzScan {
+    pub cases: Vec<SzzCase>,
+    /// Cases dropped because the introducing commit touched more than
+    /// `max_introducer_files` files — a bulk/initial commit, not a real change.
+    pub skipped_bulk: usize,
+}
+
 /// Mine an SZZ corpus: for each fix commit in the newest `scan`, blame the lines
 /// it removed back to the commit that introduced them, and keep the cases where
 /// blame converges on one commit (`min_convergence`) that is old enough to count
@@ -252,14 +264,28 @@ pub struct SzzCase {
 /// SZZ approximation for "who introduced it". Convergence guards against a fix that
 /// rewrites many unrelated lines: a case is only kept when one commit owns the
 /// majority of them.
+///
+/// A case whose introducer touched more than `max_introducer_files` files is
+/// dropped: that is a bulk or initial commit (a shallow clone's oldest commit
+/// squashes the whole app), and ranking the defective symbol out of its thousand
+/// is not the review-targeting question `review` faces in practice. See #67.
 pub fn szz_cases(
     root: &Path,
     scan: usize,
     max_cases: usize,
     min_convergence: f32,
     min_escape_days: i64,
-) -> Vec<SzzCase> {
-    try_szz(root, scan, max_cases, min_convergence, min_escape_days).unwrap_or_default()
+    max_introducer_files: usize,
+) -> SzzScan {
+    try_szz(
+        root,
+        scan,
+        max_cases,
+        min_convergence,
+        min_escape_days,
+        max_introducer_files,
+    )
+    .unwrap_or_default()
 }
 
 /// Lines the fix removed from its parent, keyed by the file's workdir-relative path
@@ -299,7 +325,8 @@ fn try_szz(
     max_cases: usize,
     min_convergence: f32,
     min_escape_days: i64,
-) -> Result<Vec<SzzCase>, git2::Error> {
+    max_introducer_files: usize,
+) -> Result<SzzScan, git2::Error> {
     let repo = git2::Repository::discover(root)?;
     let workdir = repo
         .workdir()
@@ -316,6 +343,7 @@ fn try_szz(
     revwalk.set_sorting(git2::Sort::TIME)?;
 
     let mut cases = Vec::new();
+    let mut skipped_bulk = 0usize;
     for oid in revwalk.take(scan) {
         if cases.len() >= max_cases {
             break;
@@ -376,6 +404,16 @@ fn try_szz(
         if introducer.parent_count() != 1 {
             continue; // need a single-parent commit to diff for the review
         }
+        // drop bulk/initial introducers: a squashed import touches thousands of
+        // symbols, and ranking the defect out of that isn't the review question (#67)
+        if changed_files(&repo, &introducer, &workdir, &index_root)
+            .files
+            .len()
+            > max_introducer_files
+        {
+            skipped_bulk += 1;
+            continue;
+        }
         let escaped = (fix.time().seconds() - introducer.time().seconds()) / 86_400;
         if escaped < min_escape_days {
             continue;
@@ -397,7 +435,10 @@ fn try_szz(
             convergence,
         });
     }
-    Ok(cases)
+    Ok(SzzScan {
+        cases,
+        skipped_bulk,
+    })
 }
 
 fn try_diff(
@@ -1061,9 +1102,9 @@ mod tests {
             "fn a() {\n  fixed();\n}\n",
         );
 
-        let cases = szz_cases(dir.path(), 10, 10, 0.5, 0);
-        assert_eq!(cases.len(), 1, "one converged fix→introducer pair");
-        let c = &cases[0];
+        let scan = szz_cases(dir.path(), 10, 10, 0.5, 0, 40);
+        assert_eq!(scan.cases.len(), 1, "one converged fix→introducer pair");
+        let c = &scan.cases[0];
         assert_eq!(
             c.introduced_at,
             introducer.to_string(),
@@ -1075,9 +1116,18 @@ mod tests {
 
         // the same corpus with a longer escape requirement keeps nothing
         assert!(
-            szz_cases(dir.path(), 10, 10, 0.5, 30).is_empty(),
+            szz_cases(dir.path(), 10, 10, 0.5, 30, 40).cases.is_empty(),
             "a 9-day escape is below a 30-day floor"
         );
+
+        // the introducer touched one file; a max of 0 makes it bulk and drops the
+        // case, counting it — the #67 guard against squashed initial commits
+        let bulk = szz_cases(dir.path(), 10, 10, 0.5, 0, 0);
+        assert!(
+            bulk.cases.is_empty(),
+            "introducer over the file cap is dropped"
+        );
+        assert_eq!(bulk.skipped_bulk, 1, "the drop is counted, not silent");
     }
 
     #[test]

@@ -34,7 +34,7 @@ fn main() -> Result<()> {
     }
 }
 
-const USAGE: &str = "usage:\n  ripple parse <file> [--json]\n  ripple index <path>... [--calls lsp [--calls-budget 120s]] [--debug]   (--calls lsp: call edges from a language server; --debug: per-phase timings to stderr)\n  ripple neighbors <symbol> [--in|--out] [--depth N] [--in-file <substr>] [--root <path>] [--json]\n  ripple locate <task words...> [--budget N] [--root <path>] [--json] [--debug]   (where do I start for this task?)\n  ripple impact <symbol>... [--budget N] [--in-file <substr>] [--root <path>] [--json] [--verify lsp] [--sync]\n  ripple review [<base>] [--budget N] [--root <path>] [--json] [--verify lsp] [--sync]\n    --sync   (rebuild from the working tree in memory before answering, so edits since the last index are reflected — no re-index, nothing persisted)\n    --verify lsp [--verify-budget 2s] [--floor-contradicted|--drop-contradicted]  (upgrade call edges from a language server)\n  ripple path <from> <to> [--depth 6] [--limit 3] [--root <path>] [--json]   (how does A reach B?)\n  ripple risk <symbol|file> [--root <path>] [--json]\n  ripple mcp [--root <path>]   (MCP server over stdio for AI agents)\n  ripple eval [--commits N] [--skip N] [--weights <spec>] [--root <path>]   (held-out co-change recall)\n    --risk                                        (do the risk terms rank the files a later fix touched?)\n    --review [--budget N] [--cases N] [--converge 0.6] [--escape-days 7]   (does review rank the defective symbol within the change that introduced it?)\n    --vs-grep [--budget N] [--commits N]   (does the blast radius beat grep at predicting co-change?)\n    --oracle lsp [--sample N] [--granularity function|file]   (agree with a language server?)\n  ripple lsp doctor [--root <path>] [--budget 10s] [--json]   (are language servers usable here?)\n  ripple lsp trust [--root <path>]   (allow this repo's own .ripple/lsp.json to launch servers)";
+const USAGE: &str = "usage:\n  ripple parse <file> [--json]\n  ripple index <path>... [--calls lsp [--calls-budget 120s]] [--debug]   (--calls lsp: call edges from a language server; --debug: per-phase timings to stderr)\n  ripple neighbors <symbol> [--in|--out] [--depth N] [--in-file <substr>] [--root <path>] [--json]\n  ripple locate <task words...> [--budget N] [--root <path>] [--json] [--debug]   (where do I start for this task?)\n  ripple impact <symbol>... [--budget N] [--in-file <substr>] [--root <path>] [--json] [--verify lsp] [--sync]\n  ripple review [<base>] [--budget N] [--root <path>] [--json] [--verify lsp] [--sync]\n    --sync   (rebuild from the working tree in memory before answering, so edits since the last index are reflected — no re-index, nothing persisted)\n    --verify lsp [--verify-budget 2s] [--floor-contradicted|--drop-contradicted]  (upgrade call edges from a language server)\n  ripple path <from> <to> [--depth 6] [--limit 3] [--root <path>] [--json]   (how does A reach B?)\n  ripple risk <symbol|file> [--root <path>] [--json]\n  ripple mcp [--root <path>]   (MCP server over stdio for AI agents)\n  ripple eval [--commits N] [--skip N] [--weights <spec>] [--root <path>]   (held-out co-change recall)\n    --risk                                        (do the risk terms rank the files a later fix touched?)\n    --review [--budget N] [--cases N] [--converge 0.6] [--escape-days 7] [--max-introducer-files 40]   (does review rank the defective symbol within the change that introduced it? bulk introducers dropped)\n    --vs-grep [--budget N] [--commits N]   (does the blast radius beat grep at predicting co-change?)\n    --oracle lsp [--sample N] [--granularity function|file]   (agree with a language server?)\n  ripple lsp doctor [--root <path>] [--budget 10s] [--json]   (are language servers usable here?)\n  ripple lsp trust [--root <path>]   (allow this repo's own .ripple/lsp.json to launch servers)";
 
 /// Where `root`'s own database would live.
 fn own_db_path(root: &Path) -> PathBuf {
@@ -2044,14 +2044,35 @@ fn cmd_eval_review(args: &[String]) -> Result<()> {
     let escape_days: i64 = flag_value(args, "--escape-days")
         .and_then(|s| s.parse().ok())
         .unwrap_or(7);
+    // introducers touching more files than this are bulk/initial commits, dropped
+    // from the corpus (a shallow clone's squashed import, #67). 40 matches the
+    // overlay's own co-change bulk guard.
+    let max_introducer_files: usize = flag_value(args, "--max-introducer-files")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(40);
 
-    let cases = overlay::szz_cases(&root, scan, max_cases, converge, escape_days);
+    let scan_out = overlay::szz_cases(
+        &root,
+        scan,
+        max_cases,
+        converge,
+        escape_days,
+        max_introducer_files,
+    );
+    let cases = scan_out.cases;
+    let skipped_bulk = scan_out.skipped_bulk;
     if cases.is_empty() {
         println!(
             "no SZZ cases in the newest {scan} commits (fix commits whose removed lines \
-             converge ≥{converge:.0}% on one introducer that escaped ≥{escape_days}d) — \
-             nothing to measure."
+             converge ≥{converge:.0}% on one introducer that escaped ≥{escape_days}d, \
+             introducer ≤{max_introducer_files} files) — nothing to measure."
         );
+        if skipped_bulk > 0 {
+            println!(
+                "  ({skipped_bulk} case(s) dropped — introducer was a bulk commit \
+                 >{max_introducer_files} files)"
+            );
+        }
         return Ok(());
     }
 
@@ -2080,6 +2101,12 @@ fn cmd_eval_review(args: &[String]) -> Result<()> {
              its defective file mapped to no indexed symbol.",
             cases.len()
         );
+        if skipped_bulk > 0 {
+            println!(
+                "  ({skipped_bulk} case(s) dropped — introducer was a bulk commit \
+                 >{max_introducer_files} files)"
+            );
+        }
         return Ok(());
     }
 
@@ -2103,6 +2130,12 @@ fn cmd_eval_review(args: &[String]) -> Result<()> {
     }
     if unmeasured > 0 {
         println!("  ({unmeasured} case(s) skipped — no indexed symbol at the introducing edit)");
+    }
+    if skipped_bulk > 0 {
+        println!(
+            "  ({skipped_bulk} case(s) dropped — introducer was a bulk commit \
+             >{max_introducer_files} files)"
+        );
     }
     // deterministic: worst rank first, then by fix sha
     rows.sort_by(|a, b| b.2.total_cmp(&a.2).then(a.3.fix.cmp(&b.3.fix)));
