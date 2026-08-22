@@ -13,6 +13,59 @@ the roadmap beforehand. Using the tool finds different bugs than reading it.
 
 ---
 
+## 2026-08-23 — a real urql frontend, and the query file that referenced nothing
+
+**Asked:** index a graphql-codegen `client-preset` frontend (tanstack-urql-example)
+and see which files consume which operations.
+
+**Said:** `0 graphql`. The file that actually runs the queries —
+`const PostsQuery = graphql(`query Posts { … }`)` then `useQuery({ query: PostsQuery })` —
+contributed no GraphQL facts at all.
+
+**True:** `cross::typescript` only recognised codegen's *old* output, a `<Name>Document`
+identifier. The client-preset writes the operation inline in a `graphql(`…`)` tag with
+no such identifier, so the operation name lived only in the generated `graphql.ts`
+(`export const PostsDocument`). That means the consumer edge could only attach to
+*generated code*, and the operation's selected fields — which the cross-service linker
+keys on — were never extracted at all, so a client-preset app with no separate `.gql`
+file could never link to its backend.
+
+**Implies:** [#87](https://github.com/qwexvf/ripple/issues/87), fixed in
+[#88](https://github.com/qwexvf/ripple/pull/88). Parse the inline template body with the
+GraphQL grammar — the same `collect_gql` collector `.gql` files already use — and merge
+its operations, fragments, and spreads. A client-preset consumer now links to its
+Absinthe resolver with the real file as the edge source, fragment masking included. The
+gap only showed up because the flagship use case (a real GraphQL client) was run against
+the *modern* codegen preset, which nothing in the fixtures used.
+
+---
+
+## 2026-08-23 — a Go monorepo whose calls all landed on a stub
+
+**Asked:** `neighbors LoadManifest --in` on a 40-file Go CLI (github.com/qwexvf/apm) —
+who calls the manifest loader?
+
+**Said:** the callee was an `[External]` node, `github.com/qwexvf/apm/internal/config`,
+and three of the sixteen real call sites (`lock.go`, `list.go`, `marketplace.go`) were
+missing entirely.
+
+**True:** a Go module imports its own packages by the full module path
+(`github.com/qwexvf/apm/internal/config`), which the adapter treated as a third-party
+dependency — it minted an External twin and every intra-repo call resolved to the stub,
+splitting the graph between a local def and its external double. `impact`/`review` on the
+*real* function saw none of its callers. The `0 imported` in every Go index summary was
+the tell, sitting unread.
+
+**Implies:** [#85](https://github.com/qwexvf/ripple/issues/85), fixed in
+[#86](https://github.com/qwexvf/ripple/pull/86). Discover the module path from `go.mod`
+into `Workspace`; resolve a self-import to the local package *directory* (not a file — a
+Go package is a directory); and key a new `pkg_exports` index by directory so `pkg.Foo()`
+resolves against every file in the package. Same shape as any language whose import unit
+isn't one file — the file-per-module assumption baked into resolution had never been
+tested against it.
+
+---
+
 ## 2026-07-30 — an agent with the raw diff beat ripple at ripple's own job
 
 **Asked:** review the `v0.1.2..v0.2.0` diff (15 files, +542) two ways — `ripple review`,
