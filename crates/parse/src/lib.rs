@@ -24,7 +24,7 @@ pub fn content_hash(source: &str) -> String {
 /// Unchanged files reuse this across `index` runs, skipping the parse. See
 /// docs/v0-plan.md "incremental".
 mod schema;
-pub use schema::extract_shape;
+pub use schema::{extract_cache_key, extract_shape};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedFile {
