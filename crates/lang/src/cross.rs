@@ -1103,4 +1103,27 @@ mod tests {
         let docs = typescript(t.root_node(), src.as_bytes()).graphql.op_refs;
         assert_eq!(docs, vec!["Feed".to_string()]);
     }
+
+    /// Client-preset fragment masking: fragments and their spreads are the harder
+    /// half of a codegen app — most nested selections live in fragments. An inline
+    /// `graphql(`fragment … `)` must yield the same fragment/spread facts a `.gql`
+    /// file would, so a spread still expands to its resolver at link time (#87).
+    #[test]
+    fn ts_client_preset_fragments_and_spreads() {
+        let src = "const F = graphql(`fragment PlayerFields on Player { id name }`);\n\
+                   const Q = graphql(`query P { currentPlayer { ...PlayerFields } }`);\n";
+        let t = parse(crate::typescript::Adapter::new().grammar(), src);
+        let g = typescript(t.root_node(), src.as_bytes()).graphql;
+        assert!(
+            g.fragments.iter().any(|f| f.name == "PlayerFields"),
+            "fragment extracted: {:?}",
+            g.fragments.iter().map(|f| &f.name).collect::<Vec<_>>()
+        );
+        assert!(g.op_refs.contains(&"P".to_string()), "op: {:?}", g.op_refs);
+        assert_eq!(
+            g.spreads.len(),
+            1,
+            "the fragment spread inside the operation"
+        );
+    }
 }
