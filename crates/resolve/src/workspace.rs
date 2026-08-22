@@ -13,7 +13,28 @@ pub fn discover(root: &Path) -> Workspace {
     let mut ws = Workspace::default();
     read_tsconfig(root, &mut ws);
     read_packages(root, &mut ws);
+    read_go_mod(root, &mut ws);
     ws
+}
+
+/// The module path from `<root>/go.mod`, so the Go adapter can tell a self-import
+/// (`github.com/org/app/internal/x`) from a third-party one. The `module` directive
+/// is the first non-comment line in practice; scan for it and stop. See #85.
+fn read_go_mod(root: &Path, ws: &mut Workspace) {
+    let Ok(text) = std::fs::read_to_string(root.join("go.mod")) else {
+        return;
+    };
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(path) = line.strip_prefix("module ") {
+            let path = path.trim();
+            if !path.is_empty() {
+                let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+                ws.go_module = Some((path.to_owned(), canonical));
+            }
+            return;
+        }
+    }
 }
 
 /// One resolution context per indexed root, because they are not interchangeable:
