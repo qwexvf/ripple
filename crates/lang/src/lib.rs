@@ -13,9 +13,11 @@ pub mod python;
 pub mod resolve_import;
 pub mod ruby;
 pub mod rust;
+pub mod sfc;
 pub mod spec;
 pub mod svelte;
 pub mod typescript;
+pub mod vue;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -295,6 +297,7 @@ pub fn registry() -> Vec<Box<dyn LanguageAdapter>> {
         Box::new(php::Adapter::new()),
         Box::new(ruby::Adapter::new()),
         Box::new(svelte::Adapter::new()),
+        Box::new(vue::Adapter::new()),
     ]
 }
 

@@ -20,6 +20,7 @@ tree-sitter-html = { workspace = true }
 tree-sitter-php = { workspace = true }
 tree-sitter-ruby = { workspace = true }
 tree-sitter-svelte-next = { workspace = true }
+tree-sitter-vue-vendored = { workspace = true }
 
 [dev-dependencies]
 streaming-iterator = "0.1"

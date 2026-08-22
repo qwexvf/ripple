@@ -1,0 +1,36 @@
+This directory vendors the Vue grammar from:
+
+    tree-sitter-vue-updated 0.1.0
+    (generated from https://github.com/c-gamble/tree-sitter-vue)
+    License: MIT
+
+The only modification from upstream is in src/tree_sitter_html/scanner.cc: the five
+exported functions
+
+    tree_sitter_html_external_scanner_{create,destroy,scan,serialize,deserialize}
+
+are renamed to tree_sitter_vue_vendored_html_external_scanner_*. They are dead code
+in this grammar (the Vue scanner in src/scanner.cc uses the bundled `Scanner` class
+directly and never calls them), but as exported symbols they collided at link time
+with the identically named functions in the tree-sitter-html crate, silently
+breaking ripple's HTML adapter. Renaming them removes the collision with no change in
+behavior. See ripple issue #48.
+
+MIT License
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this
+software and associated documentation files (the "Software"), to deal in the Software
+without restriction, including without limitation the rights to use, copy, modify,
+merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+permit persons to whom the Software is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice shall be included in all copies
+or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF
+CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE
+OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
