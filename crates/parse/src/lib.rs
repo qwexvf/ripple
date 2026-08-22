@@ -284,6 +284,9 @@ pub fn extract_file(
     let src = source.as_bytes();
 
     let mut defs = extract_defs(&tree, &queries.tags, src, module_path, adapter)?;
+    // Defs with no defining AST node (a Svelte/Vue single-file component, named by
+    // its file). The adapter mints these directly since no `@name` capture can. #47
+    defs.extend(adapter.synthetic_defs(module_path, tree.root_node(), src));
     let mut imports = queries
         .imports
         .as_ref()
@@ -841,6 +844,76 @@ mod tests {
         assert!(names.contains(&(NodeKind::Interface, "Options")));
         assert!(names.contains(&(NodeKind::Type, "Id")));
         assert!(names.contains(&(NodeKind::Enum, "Color")));
+    }
+
+    /// An adapter can contribute a def that no query produces — one named by the
+    /// file, with no defining AST node (a Svelte/Vue single-file component). The
+    /// synthetic def flows through `extract_file` alongside the query-captured ones.
+    #[test]
+    fn synthetic_defs_reach_the_extract() {
+        struct StubSfc;
+        impl lang::LanguageAdapter for StubSfc {
+            fn id(&self) -> &'static str {
+                "stub-sfc"
+            }
+            fn grammar(&self) -> tree_sitter::Language {
+                ts().grammar()
+            }
+            fn file_globs(&self) -> &'static [&'static str] {
+                &["*.stub"]
+            }
+            fn tags_query(&self) -> &'static str {
+                "" // the component is not a capture; it comes from synthetic_defs
+            }
+            fn synthetic_defs(
+                &self,
+                module_path: &str,
+                _root: tree_sitter::Node,
+                _src: &[u8],
+            ) -> Vec<ir::Node> {
+                let name = std::path::Path::new(module_path)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(module_path)
+                    .to_owned();
+                vec![ir::Node {
+                    id: ir::SymbolId::of(module_path, &name),
+                    kind: NodeKind::Component,
+                    name: name.clone(),
+                    qualified_name: name,
+                    module_path: module_path.to_owned(),
+                    span: ir::Span {
+                        start_line: 1,
+                        start_col: 1,
+                        end_line: 1,
+                        end_col: 1,
+                    },
+                    extra_spans: Vec::new(),
+                    is_exported: true,
+                    risk: ir::RiskScores::default(),
+                    doc: None,
+                    route_path: None,
+                }]
+            }
+        }
+
+        let queries = Queries::compile(&StubSfc).unwrap();
+        let fx = extract_file(
+            "const x = 1;\n",
+            &StubSfc,
+            "src/Widget.stub",
+            &queries,
+            None,
+        )
+        .unwrap();
+        let comp: Vec<_> = fx
+            .defs
+            .iter()
+            .filter(|n| n.kind == NodeKind::Component)
+            .collect();
+        assert_eq!(comp.len(), 1, "the file-named component");
+        assert_eq!(comp[0].name, "Widget");
+        assert!(comp[0].is_exported, "a default import must resolve to it");
     }
 
     /// A module-scope `const` is a symbol; a function-local one is not. Capturing

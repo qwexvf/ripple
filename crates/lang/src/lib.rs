@@ -214,6 +214,24 @@ pub trait LanguageAdapter: Send + Sync {
         None
     }
 
+    /// Definitions this file contributes that no `tags.scm` capture can produce —
+    /// because they have no defining AST node that carries a name. The Svelte/Vue
+    /// single-file component is the case: the component *is* the file, named by the
+    /// file, so there is nothing in the tree for `@name` to read.
+    ///
+    /// `module_path` is the file's module-relative path, so the adapter can derive
+    /// the component name from the file stem and mint a stable `SymbolId`. Runs on
+    /// the host parse only (never inside an embedded region). Default: none, so no
+    /// existing adapter changes. See #47.
+    fn synthetic_defs(
+        &self,
+        _module_path: &str,
+        _root: tree_sitter::Node,
+        _src: &[u8],
+    ) -> Vec<ir::Node> {
+        Vec::new()
+    }
+
     /// Regions of this file written in another language, as `(adapter id, range)`
     /// in this file's own byte+point coordinates. A single-file component (`.vue`,
     /// `.svelte`, `.html` with inline `<script>`) is a template plus a script block
