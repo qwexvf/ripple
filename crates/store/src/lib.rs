@@ -20,12 +20,16 @@ const ROOTS: TableDefinition<u64, &[u8]> = TableDefinition::new("roots");
 const STAMPS: TableDefinition<&str, &[u8]> = TableDefinition::new("stamps");
 /// Verified call verdicts, keyed by the *content hash* of the file they came from.
 const VERIFIED: TableDefinition<&str, &[u8]> = TableDefinition::new("verified");
-/// The shape of a `FileExtract` at the time the cache was written.
+/// The extract-cache validity key at the time the cache was written
+/// (`parse::extract_cache_key`): the `FileExtract` struct shape plus the adapter
+/// extraction inputs (`.scm` sources, grammar, adapter-logic version).
 ///
 /// A cache row is keyed on the file's content hash, which does not change when the
 /// *parser* does. A build whose extract gained a field therefore reads back rows the
 /// current parser never produced, and a `#[serde(default)]` field makes that succeed
-/// silently. Comparing the shape turns a wrong graph into a re-parse. See #56.
+/// silently (#56). Likewise, editing a query changes *what* is extracted without
+/// changing any struct field, so the shape alone stayed stable and the stale cache
+/// was reused (#71). Comparing the whole key turns either into a re-parse.
 const SHAPE: TableDefinition<&str, &str> = TableDefinition::new("extract_shape");
 
 /// Durable graph store. One writer, many readers; query happens after `load`.
@@ -213,7 +217,7 @@ fn put_extracts(wtx: &redb::WriteTransaction, files: &[CachedFile]) -> Result<()
     let _ = wtx.delete_table(STAMPS);
     let _ = wtx.delete_table(SHAPE);
     wtx.open_table(SHAPE)?
-        .insert("extract", parse::extract_shape().as_str())?;
+        .insert("extract", parse::extract_cache_key().as_str())?;
     let mut t = wtx.open_table(EXTRACTS)?;
     let mut s = wtx.open_table(STAMPS)?;
     for f in files {
@@ -238,7 +242,7 @@ fn shape_matches(rtx: &redb::ReadTransaction) -> bool {
     let Ok(t) = rtx.open_table(SHAPE) else {
         return false;
     };
-    matches!(t.get("extract"), Ok(Some(v)) if v.value() == parse::extract_shape())
+    matches!(t.get("extract"), Ok(Some(v)) if v.value() == parse::extract_cache_key())
 }
 
 fn put_roots(wtx: &redb::WriteTransaction, roots: &[(String, PathBuf)]) -> Result<()> {

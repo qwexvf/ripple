@@ -31,6 +31,21 @@ pub fn extract_shape() -> String {
     fields.join("\n")
 }
 
+/// The full extract-cache validity key: the struct shape (this crate) plus the
+/// adapter extraction inputs (`lang::registry_fingerprint` — the `.scm` sources,
+/// grammar, and adapter-logic version). Either changing invalidates a warm cache.
+///
+/// The struct shape alone (`extract_shape`) misses the case where *what* is
+/// extracted changes without the `FileExtract` fields changing — a `tags.scm` edit,
+/// a grammar bump. The store compares this whole string. See #56 and #71.
+pub fn extract_cache_key() -> String {
+    format!(
+        "{}\n===inputs===\n{}",
+        extract_shape(),
+        lang::registry_fingerprint()
+    )
+}
+
 fn walk(v: &serde_json::Value, path: &mut String, out: &mut Vec<String>) {
     use serde_json::Value;
     let kind = match v {

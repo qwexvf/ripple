@@ -278,6 +278,38 @@ pub fn registry() -> Vec<Box<dyn LanguageAdapter>> {
     ]
 }
 
+/// Bump when adapter *logic* changes what gets extracted without any `.scm` edit —
+/// `embedded_regions`, `extract_cross`, `qualified_name`, `test_scopes`, etc. Query
+/// sources and grammar changes are caught automatically by `registry_fingerprint`;
+/// this is the escape hatch for the Rust that isn't a query string. See #71.
+const EXTRACT_LOGIC_VERSION: u32 = 1;
+
+/// A fingerprint of every adapter's extraction *inputs*: the `.scm` query sources,
+/// the grammar identity, and `EXTRACT_LOGIC_VERSION`.
+///
+/// Folded into the extract-cache key (`parse::extract_cache_key`) so a query,
+/// grammar, or adapter-logic change invalidates a warm `.ripple` the same way a
+/// struct-shape change does. Without it, editing a `tags.scm` re-uses stale cached
+/// extracts until the cache is deleted by hand — the whole point of #71.
+pub fn registry_fingerprint() -> String {
+    use std::hash::{Hash, Hasher};
+    let mut adapters = registry();
+    adapters.sort_by_key(|a| a.id());
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    EXTRACT_LOGIC_VERSION.hash(&mut h);
+    for a in &adapters {
+        a.id().hash(&mut h);
+        let g = a.grammar();
+        g.abi_version().hash(&mut h);
+        g.node_kind_count().hash(&mut h);
+        a.tags_query().hash(&mut h);
+        a.imports_query().unwrap_or("").hash(&mut h);
+        a.refs_query().unwrap_or("").hash(&mut h);
+        a.bindings_query().unwrap_or("").hash(&mut h);
+    }
+    format!("{:016x}", h.finish())
+}
+
 /// Pick the adapter whose globs match a path, from an existing registry slice.
 /// Prefer this in hot loops — it borrows instead of rebuilding the registry.
 pub fn adapter_for<'a>(
@@ -304,5 +336,42 @@ fn glob_match(glob: &str, name: &str) -> bool {
     match glob.strip_prefix('*') {
         Some(suffix) => name.ends_with(suffix),
         None => glob == name,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Two builds of the same adapters must agree, or the extract cache is discarded
+    /// on every run and the incremental index stops being incremental.
+    #[test]
+    fn fingerprint_is_stable_across_calls() {
+        assert_eq!(super::registry_fingerprint(), super::registry_fingerprint());
+        assert_eq!(super::registry_fingerprint().len(), 16);
+    }
+
+    /// The fingerprint must actually fold in the query sources — a build with an
+    /// empty tags query hashes differently from the real one. This is the property
+    /// #71 turns on: change a `.scm`, change the key, miss the stale cache.
+    #[test]
+    fn fingerprint_depends_on_query_sources() {
+        use std::hash::{Hash, Hasher};
+        let real = super::registry_fingerprint();
+        // same walk as `registry_fingerprint` but with the tags query blanked, to
+        // prove the query text is an input rather than incidental.
+        let mut adapters = super::registry();
+        adapters.sort_by_key(|a| a.id());
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        super::EXTRACT_LOGIC_VERSION.hash(&mut h);
+        for a in &adapters {
+            a.id().hash(&mut h);
+            let g = a.grammar();
+            g.abi_version().hash(&mut h);
+            g.node_kind_count().hash(&mut h);
+            "".hash(&mut h); // tags query blanked
+            a.imports_query().unwrap_or("").hash(&mut h);
+            a.refs_query().unwrap_or("").hash(&mut h);
+            a.bindings_query().unwrap_or("").hash(&mut h);
+        }
+        assert_ne!(real, format!("{:016x}", h.finish()));
     }
 }
