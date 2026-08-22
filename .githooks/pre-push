@@ -7,6 +7,21 @@
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
+# Git feeds ref updates on stdin as: <local ref> <local sha> <remote ref> <remote sha>.
+# A branch deletion sends the all-zero local sha and pushes no commits, so there is
+# nothing to fmt/clippy/test. Skip the gate when every ref in the push is a delete.
+zero="0000000000000000000000000000000000000000"
+only_deletes=1
+saw_ref=0
+while read -r _local_ref local_sha _remote_ref _remote_sha; do
+  saw_ref=1
+  [ "$local_sha" = "$zero" ] || only_deletes=0
+done
+if [ "$saw_ref" = 1 ] && [ "$only_deletes" = 1 ]; then
+  echo "pre-push: delete-only push, nothing to test"
+  exit 0
+fi
+
 echo "pre-push: cargo fmt --check"
 cargo fmt --all -- --check
 
