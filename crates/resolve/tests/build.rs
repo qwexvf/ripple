@@ -1391,3 +1391,28 @@ fn go_intra_module_package_call_resolves_locally() {
         "run should call config.Load across the intra-module import (#85)"
     );
 }
+
+/// A graphql-codegen client-preset consumer: the operation is an inline
+/// `graphql(`query CurrentPlayer { … }`)` with no `<Name>Document` identifier and
+/// no `.gql` file. It must still link to the Absinthe resolver, with the file that
+/// runs the query as the edge source — not generated code.
+#[test]
+fn client_preset_inline_operation_links_to_resolver() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/gqlpreset");
+    let indexed = resolve::build_incremental(
+        std::slice::from_ref(&root),
+        &std::collections::HashMap::new(),
+    )
+    .unwrap();
+    let r = resolve::link_cross_service(&indexed.files, &indexed.result.nodes);
+
+    let client = SymbolId::module("client.tsx");
+    let me = SymbolId::of("resolver.ex", "me");
+
+    assert!(
+        r.edges
+            .iter()
+            .any(|e| e.src == client && e.dst == me && e.kind == EdgeKind::GraphqlCall),
+        "inline graphql(`query CurrentPlayer`) should link client.tsx → PlayerResolver.me"
+    );
+}

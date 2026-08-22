@@ -290,11 +290,45 @@ fn text<'a>(n: TsNode, src: &'a [u8]) -> &'a str {
     n.utf8_text(src).unwrap_or("")
 }
 
+/// The GraphQL source inside a `graphql(`…`)` / `gql(`…`)` call — the
+/// graphql-codegen client-preset shape. `None` unless the callee is one of those
+/// tags and its first argument is a template string; then the template's inner text
+/// (without the backticks) is returned so it can be parsed as GraphQL.
+fn gql_call_source(call: TsNode, src: &[u8]) -> Option<String> {
+    let func = call.child_by_field_name("function")?;
+    if !matches!(text(func, src), "graphql" | "gql") {
+        return None;
+    }
+    let args = call.child_by_field_name("arguments")?;
+    let mut c = args.walk();
+    let tmpl = args
+        .named_children(&mut c)
+        .find(|a| a.kind() == "template_string")?;
+    Some(text(tmpl, src).trim_matches('`').to_owned())
+}
+
+/// Parse a chunk of GraphQL source (an inline template body) with the GraphQL
+/// grammar and return its operation/fragment facts. Empty on any parse error — a
+/// template with `${…}` interpolation may not parse cleanly, and a partial answer
+/// is better than none. Reuses the same collector `.gql` files go through, so an
+/// inline operation and a codegen `.gql` one produce identical facts.
+fn parse_gql_source(source: &str) -> GraphqlFacts {
+    let mut parser = tree_sitter::Parser::new();
+    if parser.set_language(&crate::graphql_language()).is_err() {
+        return GraphqlFacts::default();
+    }
+    let Some(tree) = parser.parse(source, None) else {
+        return GraphqlFacts::default();
+    };
+    graphql(tree.root_node(), source.as_bytes()).graphql
+}
+
 // ── TypeScript: <Name>Document usages ──
 pub fn typescript(root: TsNode, src: &[u8]) -> CrossFacts {
     let mut docs = std::collections::HashSet::new();
     let mut consumes = Vec::new();
     let mut provides = Vec::new();
+    let mut gql_sources: Vec<String> = Vec::new();
     let mut stack = vec![root];
     while let Some(n) = stack.pop() {
         if n.kind() == "identifier" {
@@ -309,24 +343,48 @@ pub fn typescript(root: TsNode, src: &[u8]) -> CrossFacts {
                 consumes.push(call);
             }
             provides.extend(file_route(n, src));
+            // graphql-codegen client-preset: `graphql(`query Posts { … }`)`. The
+            // operation is inline with no `<Name>Document` identifier, so it must be
+            // parsed out of the template — otherwise the file that actually runs the
+            // query contributes nothing, and a backend change flags the generated
+            // `graphql.ts` instead of the real caller.
+            if let Some(gql) = gql_call_source(n, src) {
+                gql_sources.push(gql);
+            }
         }
         let mut c = n.walk();
         for ch in n.children(&mut c) {
             stack.push(ch);
         }
     }
-    let mut op_refs: Vec<String> = docs.into_iter().collect();
-    op_refs.sort();
+    // inline `graphql(`…`)` operations, parsed with the GraphQL grammar. Merged as
+    // real operations (name + selected fields), and their names added to op_refs, so
+    // this file both *supplies* the operation's fields and *consumes* it — the
+    // linker keys op_refs to op_fields, and a codegen `.gql` file would have given
+    // both halves across two files (#32, client-preset dogfood finding).
+    let mut gql = GraphqlFacts {
+        op_refs: docs.into_iter().collect(),
+        ..Default::default()
+    };
+    for source in &gql_sources {
+        let facts = parse_gql_source(source);
+        for op in &facts.operations {
+            // an anonymous operation has no name to key a cross-service match on
+            if !op.name.is_empty() {
+                gql.op_refs.push(op.name.clone());
+            }
+        }
+        gql.merge(facts);
+    }
+    gql.op_refs.sort();
+    gql.op_refs.dedup();
     consumes.sort_by_key(|c: &Consumes| c.line);
     provides
         .sort_by(|a: &Provides, b: &Provides| format!("{:?}", a.key).cmp(&format!("{:?}", b.key)));
     CrossFacts {
         provides,
         consumes,
-        graphql: GraphqlFacts {
-            op_refs,
-            ..Default::default()
-        },
+        graphql: gql,
         ..Default::default()
     }
 }
@@ -1016,5 +1074,33 @@ mod tests {
         let t = parse(crate::typescript::Adapter::new().grammar(), src);
         let docs = typescript(t.root_node(), src.as_bytes()).graphql.op_refs;
         assert!(docs.contains(&"Player".to_string()) && docs.contains(&"Team".to_string()));
+    }
+
+    /// graphql-codegen client-preset: the operation lives inside a `graphql(`…`)`
+    /// call with no `<Name>Document` identifier, so the file that runs the query
+    /// must still contribute the operation as a consumer fact. See #32 and the
+    /// dogfood finding on a real urql frontend.
+    #[test]
+    fn ts_client_preset_operations() {
+        let src = "const PostsQuery = graphql(`\n  query Posts { posts { id } }\n`);\n\
+                   const M = graphql(`mutation CreatePost($t: String!) { createPost { id } }`);\n\
+                   const Anon = graphql(`query { me { id } }`);\n";
+        let t = parse(crate::typescript::Adapter::new().grammar(), src);
+        let docs = typescript(t.root_node(), src.as_bytes()).graphql.op_refs;
+        assert!(docs.contains(&"Posts".to_string()), "named query: {docs:?}");
+        assert!(
+            docs.contains(&"CreatePost".to_string()),
+            "named mutation: {docs:?}"
+        );
+        // an anonymous operation has no name to key a cross-service match on
+        assert_eq!(docs.len(), 2, "anonymous op is not keyed: {docs:?}");
+    }
+
+    #[test]
+    fn gql_tag_alias_is_also_detected() {
+        let src = "const q = gql(`query Feed { feed { id } }`);\n";
+        let t = parse(crate::typescript::Adapter::new().grammar(), src);
+        let docs = typescript(t.root_node(), src.as_bytes()).graphql.op_refs;
+        assert_eq!(docs, vec!["Feed".to_string()]);
     }
 }
