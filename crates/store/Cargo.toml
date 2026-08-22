@@ -10,7 +10,7 @@ parse = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-redb = "4.1"
+redb = "4.2"
 
 [dev-dependencies]
 ir = { workspace = true }
