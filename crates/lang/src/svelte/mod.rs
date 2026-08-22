@@ -53,57 +53,19 @@ impl LanguageAdapter for Adapter {
     /// call. Capitalised names only — `<div>` and friends are intrinsic elements
     /// that name no symbol (the same filter TSX's JSX refs use, #26/#51).
     fn refs_query(&self) -> Option<&'static str> {
-        Some(include_str!("queries/refs.scm"))
+        Some(include_str!("../sfc_component_refs.scm"))
     }
 
-    /// The component symbol: named by the file, with no defining node for a query to
-    /// read. Exported so a default import resolves to it; its span is the whole file,
-    /// so a render call in the markup attributes to the component.
+    /// The component symbol, named by the file (`sfc::component_def`).
     fn synthetic_defs(&self, module_path: &str, root: Node, _src: &[u8]) -> Vec<ir::Node> {
-        let name = Path::new(module_path)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or(module_path)
-            .to_owned();
-        vec![ir::Node {
-            id: ir::SymbolId::of(module_path, &name),
-            kind: ir::NodeKind::Component,
-            name: name.clone(),
-            qualified_name: name,
-            module_path: module_path.to_owned(),
-            span: span_of(root),
-            extra_spans: Vec::new(),
-            is_exported: true,
-            risk: ir::RiskScores::default(),
-            doc: None,
-            route_path: None,
-        }]
+        vec![crate::sfc::component_def(module_path, root)]
     }
 
-    /// The `<script>` body is TypeScript. Each block's range is handed to the
-    /// TypeScript adapter, which `parse` re-parses with `included_ranges` so its
-    /// symbols and edges land at their real positions in the host file (#46). Svelte
-    /// allows a module block (`<script context="module">`) alongside the instance
-    /// one, so all script bodies are returned.
+    /// Every `<script>` body, handed to the TypeScript adapter (`sfc::script_regions`).
+    /// Svelte allows a `context="module"` block alongside the instance one; both are
+    /// returned.
     fn embedded_regions(&self, root: Node, _src: &[u8]) -> Vec<(&'static str, Range)> {
-        let mut out = Vec::new();
-        let mut stack = vec![root];
-        while let Some(node) = stack.pop() {
-            if node.kind() == "script_element" {
-                let mut c = node.walk();
-                for child in node.children(&mut c) {
-                    if child.kind() == "raw_text" && !child.byte_range().is_empty() {
-                        out.push(("typescript", child.range()));
-                    }
-                }
-            }
-            let mut c = node.walk();
-            for child in node.children(&mut c) {
-                stack.push(child);
-            }
-        }
-        out.sort_by_key(|(_, r)| r.start_byte);
-        out
+        crate::sfc::script_regions(root)
     }
 
     /// A `<script>` import (`import { util } from "./util"`) names a TypeScript file,
@@ -112,17 +74,6 @@ impl LanguageAdapter for Adapter {
     /// delegates: `link` asks the host file's adapter, and the import is TypeScript's.
     fn resolve_import(&self, spec: &str, from_file: &Path, ws: &Workspace) -> Option<PathBuf> {
         crate::typescript::Adapter::new().resolve_import(spec, from_file, ws)
-    }
-}
-
-fn span_of(node: Node) -> ir::Span {
-    let s = node.start_position();
-    let e = node.end_position();
-    ir::Span {
-        start_line: s.row as u32 + 1,
-        start_col: s.column as u32 + 1,
-        end_line: e.row as u32 + 1,
-        end_col: e.column as u32 + 1,
     }
 }
 

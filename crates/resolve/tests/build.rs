@@ -1326,3 +1326,40 @@ fn svelte_component_render_and_script_call_resolve() {
         "the <script> import of util should resolve to util.ts"
     );
 }
+
+#[test]
+fn vue_component_render_and_script_call_resolve() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/vue");
+    let r = resolve::build(&root).unwrap();
+
+    let parent = SymbolId::of("Parent.vue", "Parent");
+    let child = SymbolId::of("Child.vue", "Child");
+    let util = SymbolId::of("util.ts", "util");
+
+    assert!(
+        r.nodes
+            .iter()
+            .any(|n| n.id == parent && n.kind == ir::NodeKind::Component),
+        "Parent.vue is a Component symbol"
+    );
+    // <Child /> in the template renders Child.vue — a call across the .vue import
+    assert!(
+        r.edges
+            .iter()
+            .any(|e| e.src == parent && e.dst == child && e.kind == EdgeKind::Calls),
+        "Parent should render (call) Child across the .vue import"
+    );
+    // util() in <script setup> calls util.ts, and attributes to the component (#46)
+    assert!(
+        r.edges
+            .iter()
+            .any(|e| e.src == parent && e.dst == util && e.kind == EdgeKind::Calls),
+        "Parent's script should call util across the region→ts import"
+    );
+    assert!(
+        r.edges
+            .iter()
+            .any(|e| e.dst == util && e.kind == EdgeKind::Imports),
+        "the <script> import of util should resolve to util.ts"
+    );
+}

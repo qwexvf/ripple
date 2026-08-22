@@ -1,0 +1,16 @@
+[package]
+name = "tree-sitter-vue-vendored"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "MIT"
+description = "Vendored Vue grammar (from c-gamble/tree-sitter-vue), with the bundled HTML scanner's dead exported symbols renamed to avoid a link collision with tree-sitter-html. See NOTICE."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+tree-sitter = { workspace = true }
+
+[build-dependencies]
+cc = "1"
