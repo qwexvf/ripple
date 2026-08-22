@@ -1,73 +1,144 @@
-# ripple — an AI-native code impact & review-targeting engine
+# ripple
 
-> Working codename: **`ripple`** (a change ripples outward through the graph — its blast radius). Final name TBD.
+**An AI-native code impact & review-targeting engine.** Give it a change, get back a
+risk-ranked blast radius. Give it a PR, get back the hunks to review first. Built in Rust,
+language-agnostic core over a thin per-language adapter seam.
+
+```bash
+ripple locate "add a new language adapter"   # where do I start for this task?
+ripple impact <symbol>                        # if I change this, what likely breaks?
+ripple review [<base>]                         # for this PR, what do I read first?
+ripple path <from> <to>                        # how does A reach B?
+```
+
+Ripple runs as a CLI and as an **[MCP server](docs/src/content/docs/reference/mcp.md)**, so
+an AI agent can orient in an unfamiliar codebase before it edits — find the right symbol,
+see the blast radius, and rank the review surface — instead of grepping blind.
 
 ## The two questions
 
-Everything here exists to answer two questions that AI-assisted development actually needs — and that no shipping tool answers well:
+Everything here exists to answer two questions AI-assisted development actually needs, and
+that no shipping tool answers well:
 
-1. **Blast radius** — "If I change `X`, what is likely to break?" — a *risk-ranked* set of impacted code, not a flat reachability dump.
-2. **Review targeting** — "For this PR, where do I look first?" — the risky hunks ordered by how likely they are to hide a defect, each with its downstream impact and a reason.
+1. **Blast radius** — "if I change `X`, what is likely to break?" — a *risk-ranked* set of
+   impacted code, not a flat reachability dump.
+2. **Review targeting** — "for this PR, where do I look first?" — the risky hunks ordered by
+   how likely they are to hide a defect, each with its downstream impact and a reason.
 
-## Why it doesn't exist yet
+The whitespace ripple fills is the **join + ranking function** across a function-level
+static graph, git co-change, and defect-risk scoring — served through a budget-aware
+interface an agent can actually consume. See [`02-gap.md`](docs/src/content/docs/design/02-gap.md).
 
-Four ingredients are each proven in isolation, but nobody has fused them:
+## Languages
 
-| Ingredient | Who has it | Who's missing it |
-|---|---|---|
-| Function-level static graph | Sourcegraph, graphify, codebase-memory-mcp, code-graph-mcp | — |
-| Git co-change / logical coupling | CodeScene, code-maat, *codebase-memory-mcp (partial)* | every static-graph tool |
-| Risk scoring (churn × complexity × bug-density × ownership) | CodeScene, JIT-defect research | every graph tool, every MCP server |
-| Budget-aware LLM/MCP output | code-graph-mcp, codebase-memory-mcp | the risk-scoring tools |
+TypeScript · TSX · Python · Go · Ruby · PHP · Rust · Elixir · Gleam · GraphQL · HTML
 
-The whitespace is the **join + ranking function** across all four, served through an incremental, budget-aware MCP interface. See [`02-gap.md`](docs/src/content/docs/design/02-gap.md).
+Adding one touches only `crates/lang/` — a module plus `.scm` query files plus one
+registry line. Every layer above the [IR boundary](docs/src/content/docs/design/04-architecture.md)
+is blind to which language produced a node, and git-history signals work at *file*
+granularity, so a barely-supported language still gets useful impact/review from day one.
 
-## Design in one breath
+## Install
 
-A **language-agnostic core** (graph model, git overlay, risk scoring, impact/review queries, MCP server) sits above a **thin per-language adapter** seam. Adding a language touches only the adapter layer — the six layers above never change. Git-history signals work at *file* granularity, so a barely-supported new language still gets useful impact/review from day one. Built in **Rust** for safe parallelism and maintainability. See [`04-architecture.md`](docs/src/content/docs/design/04-architecture.md).
+No binary releases yet — build from source. Rust 1.85+ (edition 2021).
+
+```bash
+git clone https://github.com/qwexvf/ripple && cd ripple
+cargo build --release
+# binary at target/release/ripple
+```
+
+## Quick start
+
+```bash
+ripple index .          # build the graph → .ripple/graph.redb  (add .ripple/ to .gitignore)
+```
+
+Indexing ripple's own repo — 130 files, ~2k nodes / 2.6k edges — takes a fraction of a
+second; warm incremental re-index is faster still. Then ask it things:
+
+```bash
+$ ripple locate "add a new language adapter"
+start here for "add a new language adapter" — 5 of 215 candidates:
+  Function new (crates/lang/src/html/mod.rs:18)   26 dependents
+  Function adapter_for (crates/lang/src/lib.rs:283)   9 dependents
+  ...
+
+$ ripple impact registry --budget 5
+blast radius of registry — 5 of 75 hits (ranked):
+  1.40  Calls<0.81> for_path (crates/lang/src/lib.rs:295)
+  0.89  Calls<0.51> cmd_parse (crates/cli/src/main.rs:172)
+  ...
+```
+
+Every ranked line carries a score and a confidence (`Calls<0.81>`) — inferred edges never
+fabricate certainty. Add `--json` to any query for machine output, `--root <path>` to query
+from elsewhere, and `--budget N` to cap the answer to what fits.
+
+### The commands
+
+| Command | Answers |
+|---|---|
+| `ripple locate <task words>` | Where do I start for this task? |
+| `ripple impact <symbol>` | If I change this, what likely breaks? |
+| `ripple review [<base>]` | For this diff, what do I review first? |
+| `ripple path <from> <to>` | How does A reach B? |
+| `ripple neighbors <symbol>` | Direct callers / importers (`--in`/`--out`, `--depth N`) |
+| `ripple risk <symbol\|file>` | Churn / co-change / bug-density / ownership risk terms |
+| `ripple mcp` | MCP server over stdio for AI agents |
+| `ripple index <path>...` | Build/refresh the graph (multi-root, incremental) |
+
+Ripple also cross-links **across repositories** indexed together — an HTTP call site in one
+service matched to the route that serves it in another — and can **upgrade call edges from a
+language server** (`--verify lsp`) when precision matters. See the
+[CLI reference](docs/src/content/docs/reference/cli.md) for the full flag surface.
+
+## How it works
+
+A **language-agnostic core** — graph model, git overlay, risk scoring, impact/review
+queries, MCP server — sits above a **thin per-language adapter** seam. Source parses to a
+normalized IR via tree-sitter; a resolve pass links imports and calls across files; a git
+overlay layers churn / co-change / bug-density / ownership; queries traverse the in-memory
+graph and rank by a risk-weighted score. See
+[`04-architecture.md`](docs/src/content/docs/design/04-architecture.md).
+
+```
+crates/
+  ir/       normalized graph vocabulary — the decoupling seam, zero deps
+  parse/    tree-sitter driver: source → IR + pre-resolution records
+  lang/     LanguageAdapter trait + per-language adapters (queries as .scm data)
+  resolve/  cross-file linking: discover → index_defs → link
+  overlay/  git-history signals (churn, co-change, bug-density, ownership)
+  store/    GraphStore trait + redb snapshot + in-memory graph
+  query/    impact / review / locate / path, budget-aware ranking
+  engine/   the assembled pipeline
+  lsp/      optional language-server verification tier
+  cli/      the `ripple` binary + MCP server
+```
 
 ## Documentation
 
-The prose lives in [`docs/`](docs/), an Astro site — `cd docs && bun install && bun dev`
-to read it locally. Start at **Getting started**
-([`docs/src/content/docs/getting-started.md`](docs/src/content/docs/getting-started.md)),
-then the [CLI](docs/src/content/docs/reference/cli.md) and
-[MCP](docs/src/content/docs/reference/mcp.md) references. The design docs below are the
-same files, served under `/design/`.
+Prose lives in [`docs/`](docs/), an Astro site — `cd docs && bun install && bun dev` to read
+it locally. Start with **[Getting started](docs/src/content/docs/getting-started.md)** (every
+command run against a real repo, output pasted verbatim), then the
+[CLI](docs/src/content/docs/reference/cli.md) and
+[MCP](docs/src/content/docs/reference/mcp.md) references.
 
-### Document map
+The design docs under [`docs/src/content/docs/design/`](docs/src/content/docs/design/) cover
+the reasoning in depth — the [architecture](docs/src/content/docs/design/04-architecture.md)
+and its invariants, [risk scoring and query semantics](docs/src/content/docs/design/06-risk-and-queries.md),
+[cross-service resolution](docs/src/content/docs/design/10-cross-service-resolution.md),
+[LSP integration](docs/src/content/docs/design/11-lsp-integration.md), and the
+[dogfood log](docs/src/content/docs/design/12-dogfood-log.md) — what ripple got wrong when
+used for real, which has produced more committed fixes than the roadmap has.
 
-| Doc | What it covers |
-|---|---|
-| [`01-landscape.md`](docs/src/content/docs/design/01-landscape.md) | What existing tools actually do — verified against real code, binaries, and MCP schemas |
-| [`02-gap.md`](docs/src/content/docs/design/02-gap.md) | The unfilled combination; possibilities and what's still not done |
-| [`03-why-rust.md`](docs/src/content/docs/design/03-why-rust.md) | Rust merits: performance, maintainability vs C, readability, ecosystem, honest trade-offs |
-| [`04-architecture.md`](docs/src/content/docs/design/04-architecture.md) | Clean layered architecture, normalized IR, `LanguageAdapter` trait, crate layout (with Rust skeletons) |
-| [`05-language-support.md`](docs/src/content/docs/design/05-language-support.md) | The Tier system, `.scm` conventions, monorepo handling, the extensibility guarantee |
-| [`06-risk-and-queries.md`](docs/src/content/docs/design/06-risk-and-queries.md) | Risk-scoring formula, `impact()` / `review_focus()`, budget-aware ranking, MCP tool schemas |
-| [`07-ai-integration.md`](docs/src/content/docs/design/07-ai-integration.md) | Optimizing *decisions* not tokens; how LLM agents consume it; AI-native protocol angle |
-| [`08-roadmap.md`](docs/src/content/docs/design/08-roadmap.md) | Phased delivery (v0 TypeScript → v1 git overlay → v2 impact/review MCP → v3 multi-language) |
-| [`09-review-and-corrections.md`](docs/src/content/docs/design/09-review-and-corrections.md) | Architecture review + primary-source fact-check audit trail; every external claim traced, corrections & design fixes logged |
-| [`10-cross-service-resolution.md`](docs/src/content/docs/design/10-cross-service-resolution.md) | Call-site ↔ route matching across services: `RouteKey` normalization, `FrameworkDetector` seam, matching + confidence, co-change safety net |
-| [`11-lsp-integration.md`](docs/src/content/docs/design/11-lsp-integration.md) | LSP as the Tier-2 accuracy tier over the tree-sitter base: layering, reconciliation, how slow servers are kept off the critical path, provenance |
-| [`12-dogfood-log.md`](docs/src/content/docs/design/12-dogfood-log.md) | What ripple got wrong when used for real, and what each mistake turned into — the log that has produced more fixes than the roadmap |
-| [`13-engineering-review.md`](docs/src/content/docs/design/13-engineering-review.md) | 用語監査とロール別の評価（日本語）— which metric names overclaim, what the numbers survive re-measurement, and where the product gaps are |
-| [`16-cross-service-plan.md`](docs/src/content/docs/design/16-cross-service-plan.md) | **Execution plan** for framework-agnostic cross-service resolution: `RouteKey` vocabulary, detector seam, generic linker, HTTP as the proof (issue #32) |
-| [`15-two-tools-two-jobs.md`](docs/src/content/docs/design/15-two-tools-two-jobs.md) | Why tree-sitter **produces** the graph and LSP **grades** it — the measurement that killed the "accuracy tier" framing, and where the headroom actually is |
-| [`14-demo.md`](docs/src/content/docs/design/14-demo.md) | **Walkthrough on a real full-stack app** (TS/React + Elixir, two repos, one graph), with actual output and an honest list of what it still gets wrong |
-| [`v0-plan.md`](docs/src/content/docs/design/v0-plan.md) | **Execution plan** for the first slice (TypeScript, Tier 2): crate build order, the concrete TS reference-resolution algorithm, store spike, testing & done criteria |
+## Contributing
 
-## Status
+`CLAUDE.md` documents the working conventions and the load-bearing architecture invariants —
+read it before writing code. In short: `cargo fmt --all` clean, `cargo clippy --all-targets`
+clean, `cargo test` green; small focused PRs; behavior ships with a test. Run
+`git config core.hooksPath .githooks` once per clone so the pre-push hook mirrors CI.
 
-**v0 complete** (TypeScript, Tier 2 — see [`v0-plan.md`](docs/src/content/docs/design/v0-plan.md)). Indexes a real 1078-file monorepo to 7.5k nodes / 4.7k edges in ~0.5s; warm incremental re-index ~0.2s.
+## License
 
-```
-cargo run -p ripple-cli -- index <path>         # build the graph → .ripple/graph.redb
-cargo run -p ripple-cli -- neighbors <symbol>   # callers/importers (--in|--out, --depth N)
-cargo run -p ripple-cli -- parse <file.ts>      # dump extracted symbols
-cargo test && cargo clippy --all-targets        # golden fixtures + contract tests, lint-clean
-```
-
-Milestones: **M0** parse+symbols ✅ · **M1** index+neighbors (redb) ✅ · **M2** member/candidate resolution ✅ · **M3** incremental + tsconfig/workspace + perf ✅ (Samyama store deferred behind the `GraphStore` trait).
-
-Next: **v1** — git overlay (churn / co-change / bug-density / ownership → risk scoring), where ripple passes the incumbents. See [`08-roadmap.md`](docs/src/content/docs/design/08-roadmap.md).
+[Apache-2.0](LICENSE).
