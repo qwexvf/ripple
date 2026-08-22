@@ -147,6 +147,11 @@ pub struct Workspace {
     pub paths: Vec<(String, Vec<String>)>,
     /// Workspace package name → package directory.
     pub packages: HashMap<String, PathBuf>,
+    /// Go module path and its root, from `go.mod` (`module github.com/org/app`).
+    /// An intra-module import like `github.com/org/app/internal/config` is *local*:
+    /// it names a package directory under the root, not a third-party dependency.
+    /// Without this the Go adapter treats every self-import as external. See #85.
+    pub go_module: Option<(String, PathBuf)>,
 }
 
 /// A language adapter. Tier 0 = grammar + tags query (required). Tier 1 =

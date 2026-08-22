@@ -8,7 +8,8 @@
 //! symbol. There is still no `bindings_query` — Go's type-based member
 //! resolution is left to the selector/receiver machinery.
 
-use crate::{resolve_import, LanguageAdapter};
+use crate::{resolve_import, LanguageAdapter, Workspace};
+use std::path::{Path, PathBuf};
 use tree_sitter::Node;
 
 pub struct Adapter;
@@ -52,6 +53,26 @@ impl LanguageAdapter for Adapter {
 
     fn refs_query(&self) -> Option<&'static str> {
         Some(include_str!("queries/refs.scm"))
+    }
+
+    /// An import under this module's own path names a *local* package directory,
+    /// not a file: `github.com/org/app/internal/config` → `<root>/internal/config`.
+    /// Returning the directory lets the linker resolve `config.Foo()` against the
+    /// package's own defs instead of minting an external stub (#85). A specifier
+    /// that isn't under the module prefix falls through to `external_dep_key`.
+    fn resolve_import(&self, spec: &str, _from: &Path, ws: &Workspace) -> Option<PathBuf> {
+        let (module, root) = ws.go_module.as_ref()?;
+        let rest = if spec == module {
+            ""
+        } else {
+            spec.strip_prefix(module)?.strip_prefix('/')?
+        };
+        let dir = if rest.is_empty() {
+            root.clone()
+        } else {
+            root.join(rest)
+        };
+        dir.is_dir().then_some(dir)
     }
 
     /// The dep-key of a Go import path is the path itself. A standard-library

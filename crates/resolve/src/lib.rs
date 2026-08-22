@@ -427,6 +427,10 @@ struct DefIndex {
     file_defs: HashMap<PathBuf, HashMap<String, Vec<SymbolId>>>,
     /// file → exported symbols (for the single-default-export heuristic)
     file_exports: HashMap<PathBuf, Vec<SymbolId>>,
+    /// (package directory, exported name) → symbols. A Go package is a directory of
+    /// files sharing one namespace, so a `config.Foo()` call resolves against every
+    /// file in `internal/config/`, not one. Keyed by the file's parent dir. See #85.
+    pkg_exports: HashMap<(PathBuf, String), Vec<SymbolId>>,
     /// (root, class, method) → symbols
     methods_by_class: HashMap<(usize, String, String), Vec<SymbolId>>,
     /// (root, method) → symbols (candidate fallback)
@@ -487,6 +491,12 @@ fn index_defs(files: &[CachedFile], file_root: &[usize]) -> (DefIndex, Vec<Node>
                     .entry(f.canonical.clone())
                     .or_default()
                     .push(d.id);
+                if let Some(dir) = f.canonical.parent() {
+                    idx.pkg_exports
+                        .entry((dir.to_path_buf(), d.name.clone()))
+                        .or_default()
+                        .push(d.id);
+                }
             }
             if d.kind == NodeKind::Method {
                 if let Some((class, method)) = d.qualified_name.split_once('.') {
@@ -898,15 +908,17 @@ fn resolve_calls(
                     external_module_receiver(r.receiver.as_ref(), &scope.ext_modules)
                 };
                 // a receiver bound to a whole local module is pinned by the import,
-                // so the method is whatever that module exports under this name
+                // so the method is whatever that module exports under this name. The
+                // target is a single file (a TS `import * as ns`) or a package
+                // directory (a Go import); try the file export table, then the
+                // directory-keyed package exports (#85).
                 if let Some(target) = module_receiver(r.receiver.as_ref(), &scope.modules) {
-                    match idx
-                        .export_table
-                        .get(&(target.clone(), r.name.clone()))
-                        .copied()
-                    {
-                        Some(sym) => (vec![sym], CONF_KNOWN_RECEIVER),
-                        None => (Vec::new(), CONF_KNOWN_RECEIVER),
+                    if let Some(sym) = idx.export_table.get(&(target.clone(), r.name.clone())) {
+                        (vec![*sym], CONF_KNOWN_RECEIVER)
+                    } else if let Some(syms) = idx.pkg_exports.get(&(target, r.name.clone())) {
+                        (syms.clone(), CONF_KNOWN_RECEIVER)
+                    } else {
+                        (Vec::new(), CONF_KNOWN_RECEIVER)
                     }
                 } else if let Some(dep) = ext_dep {
                     // `React.useState()` / `os.system()` — the receiver names an

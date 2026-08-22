@@ -1363,3 +1363,31 @@ fn vue_component_render_and_script_call_resolve() {
         "the <script> import of util should resolve to util.ts"
     );
 }
+
+#[test]
+fn go_intra_module_package_call_resolves_locally() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/gomod");
+    let r = resolve::build(&root).unwrap();
+
+    let run = SymbolId::of("main.go", "run");
+    let load = SymbolId::of("config/manifest.go", "Load");
+
+    // the package's def is a real Function, not an External stub
+    assert!(
+        r.nodes
+            .iter()
+            .any(|n| n.id == load && n.kind == ir::NodeKind::Function),
+        "config.Load is the local def"
+    );
+    assert!(
+        !r.nodes.iter().any(|n| n.kind == ir::NodeKind::External),
+        "no External node minted for the self-import example.com/app/config"
+    );
+    // run() calls config.Load() across the module-path import, resolved to the local def
+    assert!(
+        r.edges
+            .iter()
+            .any(|e| e.src == run && e.dst == load && e.kind == EdgeKind::Calls),
+        "run should call config.Load across the intra-module import (#85)"
+    );
+}
