@@ -1416,3 +1416,36 @@ fn client_preset_inline_operation_links_to_resolver() {
         "inline graphql(`query CurrentPlayer`) should link client.tsx → PlayerResolver.me"
     );
 }
+
+/// A JavaScript (`.js`) ESM file must bind the same External nodes a `.ts` file
+/// does — the TSX grammar is a superset, so JS was only ever invisible because its
+/// extension matched no adapter (#81).
+#[test]
+fn javascript_esm_import_binds_external_nodes() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/jsdep");
+    let r = resolve::build(&root).unwrap();
+
+    let dep = SymbolId::of("urql", "urql");
+    let use_query = SymbolId::of("urql", "urql.useQuery");
+    let app = SymbolId::of("app.js", "app");
+
+    assert!(
+        r.nodes
+            .iter()
+            .any(|n| n.id == dep && n.kind == ir::NodeKind::External),
+        "the package dep node is bound for a .js import"
+    );
+    assert!(
+        r.nodes
+            .iter()
+            .any(|n| n.id == use_query && n.kind == ir::NodeKind::External),
+        "the imported symbol is bound as an External"
+    );
+    // app() calls the imported useQuery — a real Calls edge onto the External symbol
+    assert!(
+        r.edges
+            .iter()
+            .any(|e| e.src == app && e.dst == use_query && e.kind == EdgeKind::Calls),
+        "app should call the imported useQuery"
+    );
+}

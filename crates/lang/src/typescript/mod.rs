@@ -64,7 +64,9 @@ fn names_in_export_clause<'a>(
 
 /// Every extension an import from TypeScript may land on, regardless of which
 /// flavour is doing the importing.
-const TS_FAMILY: &[&str] = &["*.ts", "*.tsx", "*.mts", "*.cts"];
+const TS_FAMILY: &[&str] = &[
+    "*.ts", "*.tsx", "*.mts", "*.cts", "*.js", "*.jsx", "*.mjs", "*.cjs",
+];
 
 /// Which grammar (and therefore which file set) this instance serves.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -85,7 +87,12 @@ impl Adapter {
         }
     }
 
-    /// TSX (`.tsx`) — the grammar that knows JSX.
+    /// TSX and JavaScript (`.tsx`, `.jsx`, `.js`, `.mjs`, `.cjs`). The TSX grammar
+    /// is a superset that parses JS and JSX alike, and a plain `.js` React file
+    /// routinely contains JSX, so all JavaScript is routed here rather than to the
+    /// JSX-blind plain-TypeScript grammar. Without this, `.js` matched no adapter and
+    /// was never parsed — its imports, calls and External deps were all invisible
+    /// (#81).
     pub fn tsx() -> Self {
         Adapter {
             flavour: Flavour::Tsx,
@@ -120,7 +127,7 @@ impl LanguageAdapter for Adapter {
     fn file_globs(&self) -> &'static [&'static str] {
         match self.flavour {
             Flavour::Ts => &["*.ts", "*.mts", "*.cts"],
-            Flavour::Tsx => &["*.tsx"],
+            Flavour::Tsx => &["*.tsx", "*.jsx", "*.js", "*.mjs", "*.cjs"],
         }
     }
 
