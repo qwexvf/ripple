@@ -14,8 +14,9 @@
 //!   worker thread, and a project already queued is not queued again. A burst of
 //!   saves collapses to a single rebuild, so CPU stays near one core no matter
 //!   how many editors are firing events.
-//! * **Watches scoped and filtered** — `.ripple/` and `.git/` are ignored, so the
-//!   daemon's own graph writes don't trigger a rebuild loop.
+//! * **Watches scoped and filtered** — `.ripple/` and `.git/` are ignored, and only
+//!   content-changing events count: a reindex opens every source file, so reacting
+//!   to opens/atime bumps would make the daemon re-index its own reads forever.
 //!
 //! Linux/systemd first: the socket defaults under `$XDG_RUNTIME_DIR`, which a
 //! systemd unit provides via `RuntimeDirectory=`. Other platforms fall back to a
@@ -267,12 +268,16 @@ fn spawn_worker(registry: Arc<Registry>, rx: Receiver<PathBuf>) {
 }
 
 /// Watch a project tree and enqueue a re-index on any relevant change. `.ripple/`
-/// and `.git/` are filtered so the daemon's own graph writes don't loop.
+/// and `.git/` are filtered so the daemon's own graph writes don't loop, and only
+/// content-changing events count — see `is_mutation`.
 fn start_watcher(root: &Path, registry: Arc<Registry>) -> Result<notify::RecommendedWatcher> {
     use notify::{RecursiveMode, Watcher};
     let root_owned = root.to_path_buf();
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         let Ok(event) = res else { return };
+        if !is_mutation(&event.kind) {
+            return;
+        }
         if event.paths.iter().any(|p| is_source_change(p)) {
             registry.enqueue(root_owned.clone());
         }
@@ -282,6 +287,30 @@ fn start_watcher(root: &Path, registry: Arc<Registry>) -> Result<notify::Recomme
         .watch(root, RecursiveMode::Recursive)
         .with_context(|| format!("watch {}", root.display()))?;
     Ok(watcher)
+}
+
+/// Does this event possibly change file content, so the graph needs rebuilding?
+///
+/// A re-index opens and reads every source file, which the recursive watcher
+/// reports back as reads: `Access(Open)`, `Access(Read)`, `Access(Close(Read))`,
+/// plus atime bumps. Reacting to those makes the daemon re-index its own reads
+/// forever, pinning a core — the loop this guards against. So we reject exactly
+/// those inert read/metadata kinds and admit everything else.
+///
+/// A denylist, not an allowlist, on purpose: `EventKind` is `#[non_exhaustive]`
+/// and backends coalesce writes into generic kinds (`Any`, `Modify(Other)`,
+/// `Close(Write)` for mmap writers). Failing toward "reindex" keeps the graph
+/// fresh; only the read kinds above can feed the loop, and the daemon never
+/// close-writes a file it is only reading, so admitting `Close(Write)` is safe.
+fn is_mutation(kind: &notify::EventKind) -> bool {
+    use notify::event::{AccessKind, AccessMode, ModifyKind};
+    use notify::EventKind::{Access, Modify};
+    !matches!(
+        kind,
+        Access(AccessKind::Open(_) | AccessKind::Read)
+            | Access(AccessKind::Close(AccessMode::Read))
+            | Modify(ModifyKind::Metadata(_))
+    )
 }
 
 /// Is this path a source change worth rebuilding for? Ignores the daemon's own
@@ -541,6 +570,48 @@ mod tests {
             "/repo/node_modules/x/y.js"
         )));
         assert!(!is_source_change(&PathBuf::from("/repo/target/debug/foo")));
+    }
+
+    #[test]
+    fn reads_and_metadata_are_not_mutations() {
+        use notify::event::{AccessKind, AccessMode, MetadataKind, ModifyKind};
+        use notify::EventKind;
+        // the daemon's own reindex opens and reads every source file — these must
+        // not rebuild, or it re-indexes its own reads forever and pins a core
+        assert!(!is_mutation(&EventKind::Access(AccessKind::Open(
+            AccessMode::Any
+        ))));
+        assert!(!is_mutation(&EventKind::Access(AccessKind::Read)));
+        assert!(!is_mutation(&EventKind::Access(AccessKind::Close(
+            AccessMode::Read
+        ))));
+        assert!(!is_mutation(&EventKind::Modify(ModifyKind::Metadata(
+            MetadataKind::AccessTime
+        ))));
+    }
+
+    #[test]
+    fn writes_and_ambiguous_events_rebuild() {
+        use notify::event::{AccessKind, AccessMode, DataChange, ModifyKind};
+        use notify::EventKind;
+        // real content changes rebuild
+        assert!(is_mutation(&EventKind::Modify(ModifyKind::Data(
+            DataChange::Any
+        ))));
+        assert!(is_mutation(&EventKind::Create(
+            notify::event::CreateKind::File
+        )));
+        assert!(is_mutation(&EventKind::Remove(
+            notify::event::RemoveKind::File
+        )));
+        // mmap writers signal a finished write as close-write, not Modify(Data)
+        assert!(is_mutation(&EventKind::Access(AccessKind::Close(
+            AccessMode::Write
+        ))));
+        // coalesced/uncertain kinds fail toward reindexing, not staleness
+        assert!(is_mutation(&EventKind::Any));
+        assert!(is_mutation(&EventKind::Modify(ModifyKind::Other)));
+        assert!(is_mutation(&EventKind::Modify(ModifyKind::Any)));
     }
 
     #[test]
