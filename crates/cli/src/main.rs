@@ -2983,6 +2983,7 @@ fn cmd_risk(args: &[String]) -> Result<()> {
                     "name": name, "module": module,
                     "composite": r.composite, "churn": r.churn,
                     "bug_density": r.bug_density, "ownership": r.ownership,
+                    "fanout": r.fanout, "test_proximity": r.test_proximity,
                 })
             })
             .collect();
@@ -2990,8 +2991,8 @@ fn cmd_risk(args: &[String]) -> Result<()> {
     } else {
         for (name, module, r) in &hits {
             println!(
-                "{name} ({module})\n  composite {:.2} | churn {:.2} bug {:.2} ownership {:.2} fanout {:.2}",
-                r.composite, r.churn, r.bug_density, r.ownership, r.fanout
+                "{name} ({module})\n  composite {:.2} | churn {:.2} bug {:.2} ownership {:.2} fanout {:.2} tested {:.2}",
+                r.composite, r.churn, r.bug_density, r.ownership, r.fanout, r.test_proximity
             );
         }
     }
