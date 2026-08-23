@@ -11,9 +11,12 @@ ripple review [<base>]                         # for this PR, what do I read fir
 ripple path <from> <to>                        # how does A reach B?
 ```
 
-Ripple runs as a CLI and as an **[MCP server](docs/src/content/docs/reference/mcp.md)**, so
-an AI agent can orient in an unfamiliar codebase before it edits — find the right symbol,
-see the blast radius, and rank the review surface — instead of grepping blind.
+Ripple runs three ways over the same graph: a **CLI**, an
+**[MCP server](docs/src/content/docs/reference/mcp.md)** so an AI agent can orient in an
+unfamiliar codebase before it edits — find the right symbol, see the blast radius, rank the
+review surface — instead of grepping blind, and a
+**[resident daemon](docs/src/content/docs/reference/daemon.md)** that keeps the graph hot
+and re-indexes on save, turning a query into a sub-millisecond socket round-trip.
 
 ## The two questions
 
@@ -40,12 +43,22 @@ granularity, so a barely-supported language still gets useful impact/review from
 
 ## Install
 
-No binary releases yet — build from source. Rust 1.85+ (edition 2021).
+**Prebuilt binary** — Linux x86_64 and macOS arm64, from the latest release:
+
+```bash
+# Linux x86_64
+curl -L https://github.com/qwexvf/ripple/releases/latest/download/ripple-x86_64-unknown-linux-gnu.tar.gz | tar xz
+# macOS (Apple silicon): …/ripple-aarch64-apple-darwin.tar.gz
+sudo mv ripple /usr/local/bin/            # or anywhere on your PATH
+ripple --help
+```
+
+**From source** — Rust 1.85+ (edition 2021):
 
 ```bash
 git clone https://github.com/qwexvf/ripple && cd ripple
-cargo build --release
-# binary at target/release/ripple
+cargo install --path crates/cli          # installs `ripple` onto PATH
+# …or just: cargo build --release        # binary at target/release/ripple
 ```
 
 ## Quick start
@@ -86,12 +99,46 @@ from elsewhere, and `--budget N` to cap the answer to what fits.
 | `ripple neighbors <symbol>` | Direct callers / importers (`--in`/`--out`, `--depth N`) |
 | `ripple risk <symbol\|file>` | Churn / co-change / bug-density / ownership risk terms |
 | `ripple mcp` | MCP server over stdio for AI agents |
+| `ripple daemon` | Resident, file-watching index server (see below) |
 | `ripple index <path>...` | Build/refresh the graph (multi-root, incremental) |
 
 Ripple also cross-links **across repositories** indexed together — an HTTP call site in one
 service matched to the route that serves it in another — and can **upgrade call edges from a
 language server** (`--verify lsp`) when precision matters. See the
 [CLI reference](docs/src/content/docs/reference/cli.md) for the full flag surface.
+
+## Daemon
+
+The one real cost of a query is *startup* — compiling every language adapter's tree-sitter
+queries (~0.8s) before it can answer. `ripple daemon` pays that once, keeps each project's
+graph resident in RAM, and **re-indexes on save** via a file watcher, so a query is a
+sub-millisecond socket round-trip instead of a cold build. One daemon serves many projects.
+
+```bash
+ripple daemon                     # run it (foreground; a service manager keeps it up)
+ripple daemon register .          # build + start watching this project
+ripple daemon status              # which projects are resident, node/edge counts
+ripple daemon stop
+```
+
+It stays bounded on a machine full of repos: graphs are **demand-loaded and LRU-evicted**
+(RAM capped by `--max-resident`, default 8), every rebuild goes through **one
+de-duplicating queue** (a burst of saves collapses to a single re-index, CPU near one
+core), and watches ignore `.ripple/`/`.git/`/`node_modules/` so the daemon's own writes
+don't loop.
+
+Clients speak newline-delimited JSON over a Unix socket (under `$XDG_RUNTIME_DIR` by
+default), so a **systemd user unit** ([`contrib/systemd/`](contrib/systemd/ripple-daemon.service))
+just works:
+
+```bash
+cp contrib/systemd/ripple-daemon.service ~/.config/systemd/user/
+systemctl --user enable --now ripple-daemon
+ripple daemon register .
+```
+
+Full details in the [daemon reference](docs/src/content/docs/reference/daemon.md).
+(Linux/systemd first; launchd and other-OS wrappers are future work.)
 
 ## How it works
 
