@@ -1475,3 +1475,32 @@ fn commonjs_require_binds_external_nodes() {
     // const lodash = require('lodash'); lodash.map()  → member call on the namespace
     assert!(calls_to("lodash", "map"), "namespace bind + member call");
 }
+
+/// `self.method()` scopes to the enclosing class, not every same-named method in
+/// sibling classes. Needs both the `self`→This receiver classification and a
+/// kind-agnostic `class_of` (a Python method can collapse to Function-kind). Found
+/// dogfooding a Python OOP codebase where `self.request()` sprayed across classes.
+#[test]
+fn python_self_method_scopes_to_enclosing_class() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pyself");
+    let r = resolve::build(&root).unwrap();
+
+    let get = SymbolId::of("m.py", "Client.get");
+    let client_request = SymbolId::of("m.py", "Client.request");
+    let async_request = SymbolId::of("m.py", "AsyncClient.request");
+
+    let calls: Vec<_> = r
+        .edges
+        .iter()
+        .filter(|e| e.src == get && e.kind == EdgeKind::Calls)
+        .map(|e| e.dst)
+        .collect();
+    assert!(
+        calls.contains(&client_request),
+        "self.request() reaches its own class's request"
+    );
+    assert!(
+        !calls.contains(&async_request),
+        "self.request() must NOT reach the sibling class's request"
+    );
+}
