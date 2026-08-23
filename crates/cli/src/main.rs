@@ -2512,10 +2512,17 @@ fn cmd_daemon(args: &[String]) -> Result<()> {
             Ok(())
         }
         Some("register") => {
-            let root = args
+            let arg = args
                 .get(1)
                 .context("usage: ripple daemon register <path>")?;
-            let r = daemon::request(&daemon::Request::Register { root: root.clone() })
+            // resolve the path against the *client's* cwd before sending — the daemon
+            // runs elsewhere (a systemd service under `/`), so a relative `.` would
+            // otherwise be resolved against its cwd, not the user's
+            let root = std::fs::canonicalize(arg)
+                .with_context(|| format!("no such directory: {arg}"))?
+                .to_string_lossy()
+                .into_owned();
+            let r = daemon::request(&daemon::Request::Register { root })
                 .context("no ripple daemon running (start one with `ripple daemon`)")?;
             if r.ok {
                 println!("{}", serde_json::to_string_pretty(&r.data)?);
