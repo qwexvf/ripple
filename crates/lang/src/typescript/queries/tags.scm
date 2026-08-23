@@ -58,6 +58,23 @@
       (variable_declarator
         name: (identifier) @name)) @def.variable))
 
+; Array-destructured module-scope bindings: `const [state, setState] = createStore()`,
+; `export const [now, setNow] = createSignal()`, and the React `const [count, setCount]
+; = useState()` at module scope. Each element is its own symbol, so a call to a Solid
+; signal getter/setter or a store accessor resolves instead of dropping (found
+; dogfooding a SolidJS app — every signal/store binding was invisible). Bare
+; identifiers only; holes and rest elements have nothing to name.
+(program
+  (lexical_declaration
+    (variable_declarator
+      name: (array_pattern (identifier) @name))) @def.variable)
+
+(program
+  (export_statement
+    (lexical_declaration
+      (variable_declarator
+        name: (array_pattern (identifier) @name))) @def.variable))
+
 ; Everything below is appended on purpose: none of these patterns competes with
 ; another for the same node, so their position cannot disturb the arrow-function /
 ; variable ordering above.
