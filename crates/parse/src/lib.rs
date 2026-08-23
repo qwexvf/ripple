@@ -947,6 +947,34 @@ mod tests {
         );
     }
 
+    /// A module-scope array destructure binds each element as its own symbol — the
+    /// React `const [count, setCount] = useState()` / Solid `createSignal` shape.
+    /// Dogfooding a SolidJS app found every such binding invisible, so a call to a
+    /// signal getter/setter dropped its edge.
+    #[test]
+    fn module_scope_array_destructure_binds_each_element() {
+        let nodes = extract(
+            "export const [now, setNow] = createSignal(0);\n\
+             const [state, setState] = createStore({});\n\
+             function comp() {\n\
+               const [local, setLocal] = useState(0);\n\
+               return local;\n\
+             }\n",
+            &ts(),
+        )
+        .unwrap();
+        let names: Vec<_> = nodes.iter().map(|n| n.name.as_str()).collect();
+        for expected in ["now", "setNow", "state", "setState"] {
+            assert!(names.contains(&expected), "{expected} should be a symbol");
+        }
+        // a function-local destructure stays local, like any other function-local const
+        assert!(
+            !names.contains(&"local"),
+            "function-local destructure is not a symbol"
+        );
+        assert!(!names.contains(&"setLocal"));
+    }
+
     #[test]
     fn captures_a_leading_doc_comment() {
         let nodes = extract(
