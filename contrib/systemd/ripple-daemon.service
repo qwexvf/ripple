@@ -1,0 +1,36 @@
+# ripple resident index daemon — a systemd *user* unit.
+#
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp contrib/systemd/ripple-daemon.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now ripple-daemon
+#
+# Then, from any project:  ripple daemon register .    (build + watch it)
+#                          ripple daemon status
+#
+# %t is the runtime dir: for a --user unit that is $XDG_RUNTIME_DIR
+# (/run/user/<uid>), which the daemon already defaults its socket under.
+
+[Unit]
+Description=ripple resident, file-watching index daemon
+Documentation=https://github.com/qwexvf/ripple
+After=default.target
+
+[Service]
+Type=simple
+# adjust to wherever `ripple` is installed
+ExecStart=%h/.cargo/bin/ripple daemon
+# RuntimeDirectory creates and owns %t/ripple; the daemon puts its socket there
+RuntimeDirectory=ripple
+Environment=RIPPLE_SOCKET=%t/ripple/daemon.sock
+Restart=on-failure
+RestartSec=2
+
+# Keep it from inflating: the daemon's own LRU cap bounds resident graphs, and
+# these are a hard ceiling on top. Tune to taste.
+MemoryMax=2G
+CPUQuota=150%
+
+[Install]
+WantedBy=default.target

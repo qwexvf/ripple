@@ -3,6 +3,7 @@
 //!   ripple index <path>            M1: build graph → .ripple/graph.redb
 //!   ripple neighbors <symbol>      M1: traverse the persisted graph
 
+mod daemon;
 mod riskeval;
 mod verify;
 
@@ -27,6 +28,7 @@ fn main() -> Result<()> {
         Some("path") => cmd_path(&args[1..]),
         Some("risk") => cmd_risk(&args[1..]),
         Some("mcp") => cmd_mcp(&args[1..]),
+        Some("daemon") => cmd_daemon(&args[1..]),
         Some("eval") => cmd_eval(&args[1..]),
         Some("lsp") => cmd_lsp(&args[1..]),
         Some(other) => bail!("unknown command: {other}\n{USAGE}"),
@@ -34,7 +36,7 @@ fn main() -> Result<()> {
     }
 }
 
-const USAGE: &str = "usage:\n  ripple parse <file> [--json]\n  ripple index <path>... [--calls lsp [--calls-budget 120s]] [--debug]   (--calls lsp: call edges from a language server; --debug: per-phase timings to stderr)\n  ripple neighbors <symbol> [--in|--out] [--depth N] [--in-file <substr>] [--root <path>] [--json]\n  ripple locate <task words...> [--budget N] [--root <path>] [--json] [--debug]   (where do I start for this task?)\n  ripple impact <symbol>... [--budget N] [--in-file <substr>] [--root <path>] [--json] [--verify lsp] [--sync]\n  ripple review [<base>] [--budget N] [--root <path>] [--json] [--verify lsp] [--sync]\n    --sync   (rebuild from the working tree in memory before answering, so edits since the last index are reflected — no re-index, nothing persisted)\n    --verify lsp [--verify-budget 2s] [--floor-contradicted|--drop-contradicted]  (upgrade call edges from a language server)\n  ripple path <from> <to> [--depth 6] [--limit 3] [--root <path>] [--json]   (how does A reach B?)\n  ripple risk <symbol|file> [--root <path>] [--json]\n  ripple mcp [--root <path>]   (MCP server over stdio for AI agents)\n  ripple eval [--commits N] [--skip N] [--weights <spec>] [--root <path>]   (held-out co-change recall)\n    --risk                                        (do the risk terms rank the files a later fix touched?)\n    --review [--budget N] [--cases N] [--converge 0.6] [--escape-days 7] [--max-introducer-files 40]   (does review rank the defective symbol within the change that introduced it? bulk introducers dropped)\n    --vs-grep [--budget N] [--commits N]   (does the blast radius beat grep at predicting co-change?)\n    --oracle lsp [--sample N] [--granularity function|file]   (agree with a language server?)\n  ripple lsp doctor [--root <path>] [--budget 10s] [--json]   (are language servers usable here?)\n  ripple lsp trust [--root <path>]   (allow this repo's own .ripple/lsp.json to launch servers)";
+const USAGE: &str = "usage:\n  ripple parse <file> [--json]\n  ripple index <path>... [--calls lsp [--calls-budget 120s]] [--debug]   (--calls lsp: call edges from a language server; --debug: per-phase timings to stderr)\n  ripple neighbors <symbol> [--in|--out] [--depth N] [--in-file <substr>] [--root <path>] [--json]\n  ripple locate <task words...> [--budget N] [--root <path>] [--json] [--debug]   (where do I start for this task?)\n  ripple impact <symbol>... [--budget N] [--in-file <substr>] [--root <path>] [--json] [--verify lsp] [--sync]\n  ripple review [<base>] [--budget N] [--root <path>] [--json] [--verify lsp] [--sync]\n    --sync   (rebuild from the working tree in memory before answering, so edits since the last index are reflected — no re-index, nothing persisted)\n    --verify lsp [--verify-budget 2s] [--floor-contradicted|--drop-contradicted]  (upgrade call edges from a language server)\n  ripple path <from> <to> [--depth 6] [--limit 3] [--root <path>] [--json]   (how does A reach B?)\n  ripple risk <symbol|file> [--root <path>] [--json]\n  ripple mcp [--root <path>]   (MCP server over stdio for AI agents)\n  ripple daemon [run] [--max-resident 8]   (resident, file-watching index server; systemd-friendly)\n    ripple daemon register <path> | status | stop   (talk to a running daemon over its socket)\n  ripple eval [--commits N] [--skip N] [--weights <spec>] [--root <path>]   (held-out co-change recall)\n    --risk                                        (do the risk terms rank the files a later fix touched?)\n    --review [--budget N] [--cases N] [--converge 0.6] [--escape-days 7] [--max-introducer-files 40]   (does review rank the defective symbol within the change that introduced it? bulk introducers dropped)\n    --vs-grep [--budget N] [--commits N]   (does the blast radius beat grep at predicting co-change?)\n    --oracle lsp [--sample N] [--granularity function|file]   (agree with a language server?)\n  ripple lsp doctor [--root <path>] [--budget 10s] [--json]   (are language servers usable here?)\n  ripple lsp trust [--root <path>]   (allow this repo's own .ripple/lsp.json to launch servers)";
 
 /// Where `root`'s own database would live.
 fn own_db_path(root: &Path) -> PathBuf {
@@ -2483,6 +2485,51 @@ fn cmd_eval(args: &[String]) -> Result<()> {
 }
 
 // ── MCP server (newline-delimited JSON-RPC over stdio) ──────────────────────
+
+/// The full-index build the daemon (re)runs for a project: index-then-load, the
+/// same pipeline `index`/`mcp` use, so a daemon graph is identical to a cold one.
+fn daemon_build(root: &Path) -> Result<InMemoryGraph> {
+    index_project(std::slice::from_ref(&root.to_path_buf()), None)?;
+    daemon::load_persisted(own_db_path(root))
+}
+
+fn cmd_daemon(args: &[String]) -> Result<()> {
+    match args.first().map(String::as_str) {
+        None | Some("run") => {
+            daemon::set_builder(daemon_build);
+            let cap = flag_value(args, "--max-resident").and_then(|s| s.parse().ok());
+            daemon::run(cap)
+        }
+        Some("status") => {
+            let r = daemon::request(&daemon::Request::Status)
+                .context("no ripple daemon running (start one with `ripple daemon`)")?;
+            println!("{}", serde_json::to_string_pretty(&r.data)?);
+            Ok(())
+        }
+        Some("stop") => {
+            let _ = daemon::request(&daemon::Request::Stop);
+            println!("ripple daemon stopped");
+            Ok(())
+        }
+        Some("register") => {
+            let root = args
+                .get(1)
+                .context("usage: ripple daemon register <path>")?;
+            let r = daemon::request(&daemon::Request::Register { root: root.clone() })
+                .context("no ripple daemon running (start one with `ripple daemon`)")?;
+            if r.ok {
+                println!("{}", serde_json::to_string_pretty(&r.data)?);
+                Ok(())
+            } else {
+                bail!(
+                    "{}",
+                    r.error.unwrap_or_else(|| "register failed".to_owned())
+                )
+            }
+        }
+        Some(other) => bail!("unknown daemon subcommand: {other} (run|status|stop|register)"),
+    }
+}
 
 fn cmd_mcp(args: &[String]) -> Result<()> {
     let root: PathBuf = flag_value(args, "--root").map_or_else(|| ".".into(), PathBuf::from);
