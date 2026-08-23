@@ -13,6 +13,39 @@ the roadmap beforehand. Using the tool finds different bugs than reading it.
 
 ---
 
+## 2026-08-23 — benchmarking ripple against grep, and the lead grows with the repo
+
+**Asked:** run the built-in `eval --vs-grep` (held-out co-change prediction — does the
+blast radius beat a grep for the changed symbol's name at guessing what else moves?) on
+two repos of different sizes, and time a real blast-radius query both ways.
+
+**Said:**
+
+| repo | files | ripple recall@10 | grep recall@10 | ripple lead |
+|---|---|---|---|---|
+| ripple | 145 | 46.2% | 44.5% | +1.6 pts |
+| rtk | 112 (deeper history) | **37.5%** | 27.8% | **+9.7 pts** |
+
+On rtk ripple also won MRR (0.633 vs 0.544); on its own small repo grep edged MRR
+(0.609 vs 0.554). Query latency, `impact classify_command` on rtk: ripple ~23 ms
+returning **11 ranked transitive dependents**; a raw `grep` was faster (~6 ms) but
+returned **83 unranked text hits** — the definition, comments, strings and test names
+mixed in, no transitivity, no ordering.
+
+**True:** all of it. grep is a faster string search answering a weaker question; ripple
+pays ~20 ms to answer the actual one ("what depends on this, ranked"). And the gap over
+grep *widens* with the codebase — +1.6 pts on a 145-file repo, +9.7 on one with more
+history — because co-change and transitive reach are exactly the signal a single-symbol
+text search cannot see. Cold index was 606 ms / warm 442 ms for 112 files, so the graph
+that buys the accuracy is cheap to keep current.
+
+**Implies:** nothing to fix — the benchmark is the product working as designed. The value
+shows up when the repo is bigger than a context window or the answer crosses a boundary
+(the 2026-07-30 and 2026-08-19 entries below say the same thing from the other side).
+Recorded so the next "is it actually better than grep?" has a number instead of an argument.
+
+---
+
 ## 2026-08-23 — a real urql frontend, and the query file that referenced nothing
 
 **Asked:** index a graphql-codegen `client-preset` frontend (tanstack-urql-example)
