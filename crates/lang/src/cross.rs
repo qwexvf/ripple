@@ -423,8 +423,7 @@ fn file_route(call: TsNode, src: &[u8]) -> Vec<Provides> {
         return Vec::new();
     };
     let mut arg_cursor = args.walk();
-    let config: Vec<TsNode> = args.named_children(&mut arg_cursor).collect();
-    let Some(config) = config.into_iter().next() else {
+    let Some(config) = args.named_children(&mut arg_cursor).next() else {
         return Vec::new();
     };
     let Some(handlers) =
@@ -433,9 +432,8 @@ fn file_route(call: TsNode, src: &[u8]) -> Vec<Provides> {
         return Vec::new();
     };
     let mut cursor = handlers.walk();
-    let pairs: Vec<TsNode> = handlers.named_children(&mut cursor).collect();
-    pairs
-        .into_iter()
+    handlers
+        .named_children(&mut cursor)
         .filter_map(|pair| {
             let key = pair.child_by_field_name("key")?;
             let method = text(key, src).trim_matches(['"', '\'']);
@@ -465,12 +463,14 @@ fn object_value<'a>(object: TsNode<'a>, name: &str, src: &[u8]) -> Option<TsNode
         return None;
     }
     let mut cursor = object.walk();
-    let pairs: Vec<TsNode> = object.named_children(&mut cursor).collect();
-    pairs.into_iter().find_map(|pair| {
+    // bound to a local so the child iterator (which borrows `cursor`) drops before
+    // `cursor` does — a bare tail expression would extend its borrow past the block
+    let found = object.named_children(&mut cursor).find_map(|pair| {
         let key = pair.child_by_field_name("key")?;
         (text(key, src).trim_matches(['"', '\'']) == name)
             .then(|| pair.child_by_field_name("value"))?
-    })
+    });
+    found
 }
 
 fn http_call(call: TsNode, src: &[u8]) -> Option<Consumes> {
@@ -542,12 +542,14 @@ fn object_string<'a>(object: TsNode<'a>, name: &str, src: &[u8]) -> Option<TsNod
         return None;
     }
     let mut cursor = object.walk();
-    let pairs: Vec<TsNode> = object.named_children(&mut cursor).collect();
-    pairs.into_iter().find_map(|pair| {
+    // bound to a local so the child iterator (which borrows `cursor`) drops before
+    // `cursor` does — a bare tail expression would extend its borrow past the block
+    let found = object.named_children(&mut cursor).find_map(|pair| {
         let key = pair.child_by_field_name("key")?;
         (text(key, src).trim_matches(['"', '\'']) == name)
             .then(|| pair.child_by_field_name("value"))?
-    })
+    });
+    found
 }
 
 /// A `fetch`'s method: GET unless its options object says otherwise in a literal.
