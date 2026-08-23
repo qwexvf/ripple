@@ -1449,3 +1449,29 @@ fn javascript_esm_import_binds_external_nodes() {
         "app should call the imported useQuery"
     );
 }
+
+/// CommonJS `require` binds the same External nodes ESM `import` does — named
+/// destructure, aliased destructure, and a whole-module namespace bind (#93).
+#[test]
+fn commonjs_require_binds_external_nodes() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cjsdep");
+    let r = resolve::build(&root).unwrap();
+    let app = SymbolId::of("app.js", "app");
+
+    let calls_to = |dep: &str, sym: &str| {
+        let dst = SymbolId::of(dep, &format!("{dep}.{sym}"));
+        r.edges
+            .iter()
+            .any(|e| e.src == app && e.dst == dst && e.kind == EdgeKind::Calls)
+    };
+
+    // const { useQuery } = require('urql')  → useQuery() calls urql.useQuery
+    assert!(calls_to("urql", "useQuery"), "named destructure require");
+    // const { render: renderIt } = require('react-dom')  → renderIt() calls react-dom.render
+    assert!(
+        calls_to("react-dom", "render"),
+        "aliased destructure binds the source name"
+    );
+    // const lodash = require('lodash'); lodash.map()  → member call on the namespace
+    assert!(calls_to("lodash", "map"), "namespace bind + member call");
+}

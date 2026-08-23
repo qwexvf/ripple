@@ -52,3 +52,38 @@
 ; Still worth an External module node so the import-level floor sees the dep.
 (import_statement
   . (string (string_fragment) @import.bare))
+
+; --- CommonJS require ---------------------------------------------------------
+;
+; `.js`/`.cjs` still lean on CommonJS. `require("x")` is a call, and the destructure
+; or binding beside it names the locals — the same shapes ESM `import` produces, so
+; these reuse the `@import.*` captures and bind identically (#93). The `#eq?` guard
+; keeps this from matching any other one-arg call.
+
+; Namespace bind:  const ns = require("x")   → ns.foo() is a member call on the module
+(variable_declarator
+  name: (identifier) @import.namespace
+  value: (call_expression
+    function: (identifier) @_req
+    arguments: (arguments (string (string_fragment) @import.source)))
+  (#eq? @_req "require"))
+
+; Named destructure:  const { a, b } = require("x")
+(variable_declarator
+  name: (object_pattern
+    (shorthand_property_identifier_pattern) @import.name)
+  value: (call_expression
+    function: (identifier) @_req
+    arguments: (arguments (string (string_fragment) @import.source)))
+  (#eq? @_req "require"))
+
+; Aliased destructure:  const { a: b } = require("x")   → local `b`, source knows `a`
+(variable_declarator
+  name: (object_pattern
+    (pair_pattern
+      key: (property_identifier) @import.name
+      value: (identifier) @import.alias))
+  value: (call_expression
+    function: (identifier) @_req
+    arguments: (arguments (string (string_fragment) @import.source)))
+  (#eq? @_req "require"))
