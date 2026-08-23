@@ -442,12 +442,14 @@ The three false starts are the finding as much as the number is:
 - **`alias A.B.C, as: X` was ignored.** Aliases were keyed by last segment, so every
   call through a renamed alias was unresolvable and its edges silently missing.
   Fixed; 87.3% and +5 edges on this repo.
-- **Elixir `import` is not handled at all** (open). `import FiveNoobs.PlayersFixtures`
+- **Elixir `import` is not handled at all** (~~open~~ **resolved**, see the
+  2026-07-25 "elixir `import`" entry above). `import FiveNoobs.PlayersFixtures`
   then a bare `player_fixture(...)` is a cross-module call with no qualifier, and
-  ripple resolves unqualified calls only against same-file definitions. This is the
+  ripple resolved unqualified calls only against same-file definitions. This was the
   dominant remaining class — test, fixture and Phoenix code lean on `import` heavily.
-  Needs `import` recorded as a fact and unqualified calls resolved against the
-  imported modules' exports.
+  Fixed: `import` is recorded as a `star_imports` fact (`elixir/dsl.rs`) and
+  unqualified calls resolve against the imported modules' exports (+31 edges;
+  regression test `resolves_bare_calls_through_an_elixir_import`).
 
 **Lesson:** most of the work in building an oracle is proving the two sides are
 talking about the same thing. Every one of the three false starts *looked* like a
@@ -506,16 +508,19 @@ does not exist. In Rust nearly every interesting call crosses a module or crate,
 `--in`/`impact` are close to useless there. (`neighbors resolve_calls --in` was
 right, because that call happens to be in the same file.)
 
-**Implication (open).** Two ways out, and dogfooding makes the trade concrete:
+**Implication (~~open~~ **resolved**, see the 2026-07-25 "rust path calls" entry
+above).** Two ways out, and dogfooding made the trade concrete:
 - resolve path calls by *qualified* name: `Client::new` should match a definition
   whose qualified name is `Client::new`, and `resolve::link_cross_service` should
   match `link_cross_service` exported from the `resolve` crate. Precise because the
   path prefix disambiguates — unlike a bare last-segment lookup, which would link
-  every `new()` in the graph to every `new`. Needs a qualified-name index in
-  `DefIndex` (today's `methods_by_class` splits on `.`, so `::` names never land in
-  it).
+  every `new()` in the graph to every `new`. **This is what shipped**: `DefIndex`
+  gained the `by_owner` qualified-name index, so `Client::new` and `resolve::link`
+  resolve by their path prefix (confirmed against rtk's 112-file Rust tree — exact
+  caller counts, no over-linking).
 - or let the LSP tier answer it: `rust-analyzer` resolves this correctly and for
-  free, at the cost of a server that builds its cache first.
+  free, at the cost of a server that builds its cache first — kept as the Tier-2
+  upgrade (`impact --verify lsp`), not the base.
 
 **Lesson:** the "add a language = one folder" claim holds for *symbols* and stops at
 Tier 2. A new language's `tags.scm` costs an hour; making its call graph useful is
