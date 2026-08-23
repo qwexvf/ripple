@@ -1164,13 +1164,22 @@ fn external_module_receiver(
     }
 }
 
-/// Class name of a member node (`Class.method` → `Class`).
+/// Owner (class/type) of a member node: `Client.get` → `Client`.
+///
+/// Derived from the qualified name, not the `NodeKind`. A Python method matches both
+/// the method and the general-function `tags.scm` pattern; the two captures collapse
+/// to one node whose kind is whichever the query engine emitted first, so a method
+/// can end up `Function`-kinded — but its qualified name is stably `Class.method`.
+/// Keying on kind meant `self.request()` inside such a method lost its class scope
+/// and sprayed across every same-named method in sibling classes (found dogfooding a
+/// Python OOP codebase). Splitting on the first `.` matches how `methods_by_class` is
+/// keyed in `index_defs`.
 fn class_of(node: &Node) -> Option<&str> {
-    if node.kind == NodeKind::Method {
-        node.qualified_name.split_once('.').map(|(c, _)| c)
-    } else {
-        None
-    }
+    let (owner, method) = node.qualified_name.split_once('.')?;
+    // guard: the qualified name is genuinely `Owner.<this node's name>`, not some
+    // other dotted string — so a plain function is never mistaken for a member
+    (!owner.is_empty() && node.qualified_name.ends_with(&node.name) && method.ends_with(&node.name))
+        .then_some(owner)
 }
 
 fn module_symbol(module_path: &str) -> SymbolId {

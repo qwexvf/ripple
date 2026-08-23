@@ -694,7 +694,15 @@ fn receiver_of(node: Option<TsNode>, src: &[u8]) -> Receiver {
     };
     match node.kind() {
         "this" => Receiver::This,
-        "identifier" => Receiver::Ident(node.utf8_text(src).unwrap_or("").to_owned()),
+        // `self`/`cls` are the self-reference convention in Python, Rust, Swift and
+        // others the way `this` (its own node kind) is in JS/TS — the receiver is the
+        // enclosing type's instance. Classifying them as `This` scopes `self.method()`
+        // to the enclosing class instead of spraying across every same-named method in
+        // sibling classes (found dogfooding a Python OOP codebase).
+        "identifier" => match node.utf8_text(src).unwrap_or("") {
+            "self" | "cls" => Receiver::This,
+            other => Receiver::Ident(other.to_owned()),
+        },
         "new_expression" => match node
             .child_by_field_name("constructor")
             .and_then(|c| c.utf8_text(src).ok())
