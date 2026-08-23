@@ -45,6 +45,24 @@ pub const W_OWN: f32 = 0.0;
 /// Structural dependents ∪ co-change dependents — the one term that ranked
 /// fix-touched files well on every corpus measured.
 pub const W_FANOUT: f32 = 1.0;
+/// Test coverage: a symbol many tests cover is safer to change, so it *lowers*
+/// review priority (the term blended is `1 - test_proximity`).
+///
+/// Held at 0 by measurement, not by omission (#45). `eval --review` on this repo,
+/// SZZ corpus, budget 15, 7 measurable cases:
+///
+///   W_TEST   mean normalized rank   lift over chance
+///   0.0            0.027               18.69×   (fanout-only, ships)
+///   0.3            0.030               16.84×
+///   1.0            0.030               16.58×
+///
+/// Every non-zero weight ranked the defective symbol *worse*: "safer because tested"
+/// and "defect-prone enough to get fixed" are not the same axis, and blending the
+/// first in dilutes the reach signal that actually predicts the fix. The field is
+/// still populated and reported by `risk` — a reviewer wants to see coverage — but it
+/// stays out of the composite. Same standard as the git terms above: populating is
+/// unconditional, weighting needs the number to improve.
+pub const W_TEST: f32 = 0.0;
 
 #[derive(Default)]
 struct RawMetrics {
@@ -823,6 +841,21 @@ pub fn score_structure(nodes: &mut [Node], edges: &[Edge]) -> usize {
         .map(|n| dependents.get(&n.id).map_or(0, HashSet::len) as f32)
         .collect();
 
+    // Test proximity: how many tests cover each symbol (incoming `Tests` edges). A
+    // well-tested symbol is safer to change, so this later blends as `1 - percentile`
+    // to *lower* its risk. Graded rather than binary — three tests cover more than
+    // one — and percentile-ranked within the corpus like every other term (#45).
+    let tested_counts: Vec<f32> = {
+        let mut by_dst: HashMap<SymbolId, u32> = HashMap::new();
+        for e in edges.iter().filter(|e| e.kind == EdgeKind::Tests) {
+            *by_dst.entry(e.dst).or_default() += 1;
+        }
+        nodes
+            .iter()
+            .map(|n| by_dst.get(&n.id).copied().unwrap_or(0) as f32)
+            .collect()
+    };
+
     // whether a term carries signal is a property of the corpus, not of one node:
     // a percentile of 0.0 is a real measurement for the least-changed file, and
     // must not be mistaken for "this metric is missing"
@@ -836,10 +869,17 @@ pub fn score_structure(nodes: &mut [Node], edges: &[Edge]) -> usize {
             informative(&column(|r| r.ownership)),
         )
     };
+    // percentile-ranked test proximity, and whether the corpus has any tests at all
+    let tested_pcts: Vec<f32> = tested_counts
+        .iter()
+        .map(|c| percentile(&tested_counts, *c))
+        .collect();
+    let test_varies = informative(&tested_pcts);
 
     let mut scored = 0;
-    for (node, count) in nodes.iter_mut().zip(&counts) {
+    for ((node, count), tested_pct) in nodes.iter_mut().zip(&counts).zip(&tested_pcts) {
         node.risk.fanout = percentile(&counts, *count);
+        node.risk.test_proximity = *tested_pct;
         if *count > 0.0 {
             scored += 1;
         }
@@ -849,6 +889,8 @@ pub fn score_structure(nodes: &mut [Node], edges: &[Edge]) -> usize {
             (W_BUG, r.bug_density, bug_varies),
             (W_OWN, r.ownership, own_varies),
             (W_FANOUT, r.fanout, fanout_varies),
+            // safer-when-tested: higher proximity → lower risk
+            (W_TEST, 1.0 - r.test_proximity, test_varies),
         ]);
     }
     scored
@@ -974,6 +1016,13 @@ mod tests {
             of(untested).fanout > of(tested).fanout,
             "a real dependent still outranks a test one"
         );
+        // the same Tests edge populates test_proximity — the field is real now, not a
+        // documented 0.0 (#45). The tested symbol ranks above the untested ones.
+        assert!(
+            of(tested).test_proximity > of(untested).test_proximity,
+            "a covered symbol has higher test proximity"
+        );
+        assert_eq!(of(untested).test_proximity, 0.0, "nothing tests it");
     }
 
     #[test]
