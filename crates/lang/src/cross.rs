@@ -1128,4 +1128,42 @@ mod tests {
             "the fragment spread inside the operation"
         );
     }
+
+    /// `operation_key` is the casing bridge between a `.gql` document and codegen's
+    /// `<Name>Document`; keying on the raw name lost 11 of 242 operations on one real
+    /// frontend, so its edge cases are worth pinning directly.
+    #[test]
+    fn operation_key_uppercases_the_first_char_only() {
+        assert_eq!(operation_key("currentPlayer"), "CurrentPlayer");
+        assert_eq!(
+            operation_key("CurrentPlayer"),
+            "CurrentPlayer",
+            "idempotent"
+        );
+        assert_eq!(operation_key("x"), "X", "single char");
+        assert_eq!(operation_key(""), "", "empty stays empty");
+        assert_eq!(operation_key("a_b"), "A_b", "only the first char moves");
+    }
+
+    /// `http_path` normalizes three frameworks' parameter spellings into one wire
+    /// vocabulary; a matcher on the other side of a service depends on it.
+    #[test]
+    fn http_path_normalizes_params_wildcards_and_slashes() {
+        use Segment::{Literal, Param, Wildcard};
+        let lit = |s: &str| Literal(s.to_owned());
+
+        // Phoenix/Rails `:id` and OpenAPI `{id}` both become one Param
+        assert_eq!(
+            http_path("/users/:id/posts"),
+            vec![lit("users"), Param, lit("posts")]
+        );
+        assert_eq!(http_path("/users/{id}"), vec![lit("users"), Param]);
+        // `*rest` is a catch-all
+        assert_eq!(http_path("/files/*rest"), vec![lit("files"), Wildcard]);
+        // empty segments (leading, trailing, double slash) drop out
+        assert_eq!(http_path("/"), Vec::<Segment>::new());
+        assert_eq!(http_path("/a//b/"), vec![lit("a"), lit("b")]);
+        // a missing brace is not a parameter — it stays a literal
+        assert_eq!(http_path("/x/{id"), vec![lit("x"), lit("{id")]);
+    }
 }
