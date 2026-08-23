@@ -185,6 +185,17 @@ impl Registry {
     /// Build a project's graph, start watching it, insert it, and evict the LRU
     /// project if that pushes the resident set over the cap.
     fn register(self: &Arc<Self>, root: &Path) -> Result<(), String> {
+        // guard demand-load: a root with no project marker (querying `~/projects`, or
+        // a source subdir whose repo root is elsewhere) would recursively walk an
+        // unrelated tree, write a stray `.ripple/`, and surface a deep private path in
+        // any walk error. Require a recognizable project root instead.
+        if !is_project_root(root) {
+            return Err(format!(
+                "{} is not a project root (no .git / Cargo.toml / go.mod / package.json / …); \
+                 point at a project directory",
+                root.display()
+            ));
+        }
         let graph = build_graph(root).map_err(|e| e.to_string())?;
         let watcher = start_watcher(root, Arc::clone(self)).map_err(|e| e.to_string())?;
         let project = Arc::new(Project {
@@ -293,6 +304,26 @@ fn canonical(root: &Path) -> PathBuf {
     root.canonicalize().unwrap_or_else(|_| root.to_path_buf())
 }
 
+/// A directory ripple should treat as a project to index. Any one of the common
+/// per-ecosystem markers is enough; without one, the daemon refuses rather than
+/// recursively walk (and write a `.ripple/` into) an arbitrary tree.
+fn is_project_root(root: &Path) -> bool {
+    const MARKERS: &[&str] = &[
+        ".git",
+        "Cargo.toml",
+        "go.mod",
+        "package.json",
+        "tsconfig.json",
+        "mix.exs",
+        "pyproject.toml",
+        "setup.py",
+        "composer.json",
+        "Gemfile",
+        "gleam.toml",
+    ];
+    MARKERS.iter().any(|m| root.join(m).exists())
+}
+
 // ── the build hook: injected so the daemon module stays independent of the CLI's
 //    full index pipeline (which lives in `main`) ─────────────────────────────
 
@@ -365,19 +396,25 @@ fn handle(registry: &Arc<Registry>, stream: UnixStream) -> Control {
         Err(_) => return Control::Continue,
     });
     let mut line = String::new();
-    if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
+    if reader.read_line(&mut line).is_err() {
         return Control::Continue;
     }
-    let (response, control) = match serde_json::from_str::<Request>(line.trim()) {
-        Ok(Request::Stop) => (
-            Response::ok(serde_json::json!({"stopping": true})),
-            Control::Stop,
-        ),
-        Ok(req) => (dispatch(registry, req), Control::Continue),
-        Err(e) => (
-            Response::err(format!("bad request: {e}")),
-            Control::Continue,
-        ),
+    // every input gets a structured reply, including an empty line — a silent close
+    // there was the one inconsistency a client couldn't tell from a crash
+    let (response, control) = if line.trim().is_empty() {
+        (Response::err("empty request"), Control::Continue)
+    } else {
+        match serde_json::from_str::<Request>(line.trim()) {
+            Ok(Request::Stop) => (
+                Response::ok(serde_json::json!({"stopping": true})),
+                Control::Stop,
+            ),
+            Ok(req) => (dispatch(registry, req), Control::Continue),
+            Err(e) => (
+                Response::err(format!("bad request: {e}")),
+                Control::Continue,
+            ),
+        }
     };
     let mut stream = stream;
     if let Ok(body) = serde_json::to_string(&response) {
@@ -442,15 +479,26 @@ fn dispatch(registry: &Arc<Registry>, req: Request) -> Response {
             };
             let inbound = !matches!(dir.as_deref(), Some("out"));
             let direction = if inbound { Dir::In } else { Dir::Out };
+            // match the CLI exactly: the same edge-kind filter (so a `Tests` edge
+            // isn't reported as a caller), and dedup across the ambiguous seed set so
+            // one neighbor of two same-named matches isn't listed twice (#101 parity)
+            let mut seen = HashSet::new();
             let mut rows = Vec::new();
             for start in seeds.iter().map(|n| n.id) {
-                for hop in graph.neighbors(start, direction, None, depth.unwrap_or(1)) {
-                    rows.push(serde_json::json!({
-                        "symbol": hop.node.name,
-                        "module": hop.node.module_path,
-                        "kind": format!("{:?}", hop.edge.kind),
-                        "confidence": hop.edge.confidence,
-                    }));
+                for hop in graph.neighbors(
+                    start,
+                    direction,
+                    Some(&crate::NEIGHBOR_KINDS),
+                    depth.unwrap_or(1),
+                ) {
+                    if seen.insert((hop.node.id, hop.edge.kind as u8)) {
+                        rows.push(serde_json::json!({
+                            "symbol": hop.node.name,
+                            "module": hop.node.module_path,
+                            "kind": format!("{:?}", hop.edge.kind),
+                            "confidence": hop.edge.confidence,
+                        }));
+                    }
                 }
             }
             Response::ok(
@@ -512,6 +560,14 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn project_root_requires_a_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!is_project_root(dir.path()), "bare dir is not a project");
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]").unwrap();
+        assert!(is_project_root(dir.path()), "a marker makes it a project");
     }
 
     #[test]

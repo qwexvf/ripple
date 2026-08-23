@@ -2,8 +2,10 @@
 **/*.rs.bk
 .DS_Store
 
-# ripple indexes itself now (see .claude/skills/use-ripple)
+# ripple indexes itself now (see .claude/skills/use-ripple). `**` so a stray index
+# under a crate subdir (e.g. a daemon demand-load) is ignored too.
 /.ripple/
+**/.ripple/
 
 # docs site build artifacts
 /docs/node_modules/
