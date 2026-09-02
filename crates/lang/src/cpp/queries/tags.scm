@@ -1,0 +1,100 @@
+; C++ Tier-0 definition captures. tree-sitter-cpp is a superset of the C grammar:
+; a member function is a `function_declarator` whose inner declarator is a
+; `field_identifier` (defined inline) or a `qualified_identifier` (`Foo::bar`,
+; defined out-of-line); a free function's is a plain `identifier`. That inner
+; shape is the only thing separating @def.function from @def.method.
+
+; --- types ------------------------------------------------------------------
+
+(class_specifier
+  name: (type_identifier) @name) @def.class
+
+(struct_specifier
+  name: (type_identifier) @name) @def.class
+
+(enum_specifier
+  name: (type_identifier) @name) @def.enum
+
+; `typedef int myint;`
+(type_definition
+  declarator: (type_identifier) @name) @def.type
+
+; `using X = int;`
+(alias_declaration
+  name: (type_identifier) @name) @def.type
+
+; --- free functions ---------------------------------------------------------
+; Inner declarator is a bare identifier. A pointer/reference return type wraps
+; the function_declarator, so those get their own patterns.
+
+(function_definition
+  declarator: (function_declarator
+    declarator: (identifier) @name)) @def.function
+
+(function_definition
+  declarator: (pointer_declarator
+    declarator: (function_declarator
+      declarator: (identifier) @name))) @def.function
+
+(function_definition
+  declarator: (reference_declarator
+    (function_declarator
+      declarator: (identifier) @name))) @def.function
+
+; --- member functions -------------------------------------------------------
+; Inline definition inside a class/struct body: inner declarator is a
+; field_identifier. Out-of-line definition (`void Foo::bar(){}`): inner
+; declarator is a qualified_identifier whose `name` is the method identifier —
+; qualified_name digs the owner off the `::` scope.
+
+(function_definition
+  declarator: (function_declarator
+    declarator: (field_identifier) @name)) @def.method
+
+(function_definition
+  declarator: (function_declarator
+    declarator: (qualified_identifier
+      name: (identifier) @name))) @def.method
+
+; Member function *declaration* (prototype) inside a class body — no body, so it
+; parses as a field_declaration whose declarator is a function_declarator.
+(field_declaration
+  declarator: (function_declarator
+    declarator: (field_identifier) @name)) @def.method
+
+; --- data members -----------------------------------------------------------
+; A data member is a field_declaration whose declarator is the field_identifier
+; directly (a function member's declarator is a function_declarator, matched
+; above, so the two never both fire). qualified_name owns it by its class.
+
+(field_declaration
+  declarator: (field_identifier) @name) @def.field
+
+(field_declaration
+  declarator: (pointer_declarator
+    declarator: (field_identifier) @name)) @def.field
+
+; --- file-scope variables ---------------------------------------------------
+; Anchored on translation_unit: a local inside a function body is not a symbol
+; another file can reach. A function prototype is also a `declaration` but its
+; declarator is a function_declarator, so it is not caught here.
+
+(translation_unit
+  (declaration
+    declarator: (init_declarator
+      declarator: (identifier) @name)) @def.variable)
+
+(translation_unit
+  (declaration
+    declarator: (identifier) @name) @def.variable)
+
+(translation_unit
+  (declaration
+    declarator: (init_declarator
+      declarator: (pointer_declarator
+        declarator: (identifier) @name))) @def.variable)
+
+(translation_unit
+  (declaration
+    declarator: (pointer_declarator
+      declarator: (identifier) @name)) @def.variable)

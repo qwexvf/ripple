@@ -2,17 +2,23 @@
 //! `.scm` query data files). Adding a language = a new module + a registry line;
 //! nothing above `ir` changes. See docs/05-language-support.md.
 
+pub mod c;
+pub mod cpp;
 pub mod cross;
+pub mod csharp;
 pub mod elixir;
 pub mod gleam;
 pub mod go;
 pub mod graphql;
 pub mod html;
+pub mod java;
+pub mod kotlin;
 pub mod php;
 pub mod python;
 pub mod resolve_import;
 pub mod ruby;
 pub mod rust;
+pub mod scala;
 pub mod sfc;
 pub mod spec;
 pub mod svelte;
@@ -301,6 +307,12 @@ pub fn registry() -> Vec<Box<dyn LanguageAdapter>> {
         Box::new(html::Adapter::new()),
         Box::new(php::Adapter::new()),
         Box::new(ruby::Adapter::new()),
+        Box::new(java::Adapter::new()),
+        Box::new(scala::Adapter::new()),
+        Box::new(kotlin::Adapter::new()),
+        Box::new(csharp::Adapter::new()),
+        Box::new(c::Adapter::new()),
+        Box::new(cpp::Adapter::new()),
         Box::new(svelte::Adapter::new()),
         Box::new(vue::Adapter::new()),
     ]
