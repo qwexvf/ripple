@@ -34,9 +34,28 @@
   "interface"
   name: (identifier) @name) @def.interface
 
+; A real enum always declares at least one `enum_entry`. Requiring one matters
+; because the grammar *misparses a single-line class body* as an `enum_class_body`
+; wrapping an `ERROR` (`class C { fun m() {} }` →
+; `(class_declaration name: (identifier) (enum_class_body (ERROR …)))`, see #109).
+; Without the `enum_entry` requirement such a class was labelled `Enum`, and a
+; single-line `interface` matched here *as well as* the interface pattern below —
+; two nodes with one name in one module, so their `SymbolId`s collided and one
+; silently clobbered the other. The cost of the requirement is that a pointlessly
+; empty `enum class E {}` goes uncaptured, which beats mislabelling a real class.
 (class_declaration
   name: (identifier) @name
-  (enum_class_body)) @def.enum
+  (enum_class_body (enum_entry))) @def.enum
+
+; The other half of that misparse: a single-line class body arrives as an
+; `enum_class_body` holding an `ERROR`, so neither class pattern above matches it
+; (both expect a `class_body` or a bodyless declaration). Match the broken shape
+; explicitly so the type itself is still indexed — its members are inside the
+; `ERROR` and stay unreachable until the grammar is fixed upstream.
+(class_declaration
+  "class"
+  name: (identifier) @name
+  (enum_class_body (ERROR))) @def.class
 
 (object_declaration
   name: (identifier) @name) @def.class

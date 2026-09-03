@@ -267,6 +267,29 @@ mod tests {
         assert_eq!(color, [&("enum".to_owned(), "Color".to_owned())]);
     }
 
+    /// The grammar misparses a single-line class body as an `enum_class_body`
+    /// wrapping an `ERROR` (#109). That used to label the class `Enum`, and made a
+    /// single-line `interface` match the enum pattern *as well as* the interface
+    /// one — two nodes with one name in one module, colliding `SymbolId`s. The
+    /// type must come back with its real kind, exactly once. Its members are
+    /// inside the `ERROR` and remain unreachable until the grammar is fixed.
+    #[test]
+    fn a_single_line_body_keeps_the_declaration_kind() {
+        assert_eq!(
+            captured("class One { fun m() {} }\n"),
+            [("class".to_owned(), "One".to_owned())]
+        );
+        assert_eq!(
+            captured("interface Doer { fun go() }\n"),
+            [("interface".to_owned(), "Doer".to_owned())]
+        );
+        // a real enum still needs an `enum_entry`, and still reads as an enum
+        assert_eq!(
+            captured("enum class Color { RED, GREEN }\n"),
+            [("enum".to_owned(), "Color".to_owned())]
+        );
+    }
+
     /// A class with a primary constructor, a body, generics or a supertype is
     /// still a class captured once — the enum end-anchor must not exclude these.
     #[test]
