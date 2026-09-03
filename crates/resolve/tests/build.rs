@@ -1643,10 +1643,11 @@ fn csharp_using_is_external_and_a_qualified_call_still_crosses_files() {
 /// directory and against an `include/` root above it, a system `<stdio.h>` mints
 /// an external node, and a struct field is qualified by its struct.
 ///
-/// Note what is *not* asserted: `main.c` calls `util_helper()`, defined in
-/// `util.c` and declared in the header it includes, and no `Calls` edge is
-/// produced. An `#include` binds a module, never the names inside it, so a bare
-/// cross-file call in C/C++ has nothing to bind to.
+/// Also the C linkage model (#116): `main.c` calls `util_helper()`, defined in
+/// `util.c`, with nothing but an `#include` in between — an include binds a file,
+/// not the names in it, so the edge comes from the project-wide file-scope lookup
+/// the C adapter opts into via `bare_calls_resolve_globally`. `bump()` is `static`
+/// in `util.c`, so the same call from `main.c` must resolve to nothing.
 #[test]
 fn c_includes_resolve_locally_and_to_an_include_root() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/c");
@@ -1657,6 +1658,7 @@ fn c_includes_resolve_locally_and_to_an_include_root() {
     let api_h = SymbolId::module("include/lib/api.h");
     let util_helper = SymbolId::of("src/util.c", "util_helper");
     let bump = SymbolId::of("src/util.c", "bump");
+    let main = SymbolId::of("src/main.c", "main");
 
     let imports_from_main = |dst: SymbolId| {
         r.edges
@@ -1684,6 +1686,24 @@ fn c_includes_resolve_locally_and_to_an_include_root() {
         "a bare call should reach a file-local function"
     );
 
+    let cross_file: Vec<f32> = r
+        .edges
+        .iter()
+        .filter(|e| e.src == main && e.dst == util_helper && e.kind == EdgeKind::Calls)
+        .map(|e| e.confidence)
+        .collect();
+    assert_eq!(
+        cross_file,
+        [0.8],
+        "a bare cross-file call binds to the one non-static definition of the name"
+    );
+    assert!(
+        !r.edges
+            .iter()
+            .any(|e| e.src == main && e.dst == bump && e.kind == EdgeKind::Calls),
+        "a `static` definition in another file has internal linkage — never a target"
+    );
+
     let external: Vec<&str> = r
         .nodes
         .iter()
@@ -1699,6 +1719,12 @@ fn c_includes_resolve_locally_and_to_an_include_root() {
 /// C++, Tier 0–2: a quoted `#include` of a local header resolves, an out-of-line
 /// `void Foo::bar()` is qualified `Foo.bar` off its `::` scope, and a member call
 /// on a local `Foo` reaches that definition in the other file.
+///
+/// Plus the two halves of #116. A bare `free_helper(n)` reaches the definition in
+/// `app.cc` through the flat linkage namespace, not through the `#include`. And
+/// `f.bar()` lands on exactly one node: the header's `void bar();` prototype is a
+/// declaration, so it is not captured as a method and cannot split the call 1/N
+/// with the definition that implements it.
 #[test]
 fn cpp_include_and_member_call_resolve_across_files() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cpp");
@@ -1721,15 +1747,38 @@ fn cpp_include_and_member_call_resolve_across_files() {
         "`#include \"app.hpp\"` should resolve to the local header"
     );
     assert!(
-        r.edges
+        !r.nodes
             .iter()
-            .any(|e| e.src == run && e.dst == bar_def && e.kind == EdgeKind::Calls),
-        "`f.bar()` should reach the out-of-line Foo::bar in the other file"
+            .any(|n| n.id == SymbolId::of("src/app.hpp", "Foo.bar")),
+        "`void bar();` in the header is a declaration, not a second definition"
+    );
+    let to_bar: Vec<f32> = r
+        .edges
+        .iter()
+        .filter(|e| e.src == run && e.dst == bar_def && e.kind == EdgeKind::Calls)
+        .map(|e| e.confidence)
+        .collect();
+    assert_eq!(
+        to_bar,
+        [0.6],
+        "`f.bar()` pins the one Foo::bar definition instead of splitting 1/N with a prototype"
     );
     assert!(
         r.edges
             .iter()
             .any(|e| e.src == bar_def && e.dst == free_helper && e.kind == EdgeKind::Calls),
         "a member should reach a free function in its own file"
+    );
+
+    let to_helper: Vec<f32> = r
+        .edges
+        .iter()
+        .filter(|e| e.src == run && e.dst == free_helper && e.kind == EdgeKind::Calls)
+        .map(|e| e.confidence)
+        .collect();
+    assert_eq!(
+        to_helper,
+        [0.8],
+        "a bare `free_helper(n)` reaches the definition in the other file by linkage"
     );
 }

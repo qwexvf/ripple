@@ -76,6 +76,16 @@ const CONF_TYPED_RECEIVER: f32 = 0.85; // typed param x: X → x.m() → X.m
 const CONF_CANDIDATE: f32 = 0.6; // by-name member fallback (before the 1/N split)
 const CONF_QUALIFIED_OWNER: f32 = 0.9; // `Client::new()` → a `new` defined on `Client`
 const CONF_QUALIFIED_NAME: f32 = 0.75; // `resolve::link()` → a `link` defined elsewhere
+/// A bare call matched against the whole project's file-scope names, in a language
+/// whose adapter says unqualified calls resolve globally (C/C++ external linkage —
+/// see `LanguageAdapter::bare_calls_resolve_globally`). Priced below
+/// `CONF_LOCAL_CALL`: the language guarantees the linker picks *a* definition of
+/// this name, but ripple runs no preprocessor, so it cannot confirm the
+/// declaration was visible at the call site, and it cannot see which translation
+/// units are actually linked together. Above `CONF_QUALIFIED_NAME` because that
+/// one is a guess from a path segment, while this is the language's own lookup
+/// rule. Genuine ambiguity is still divided `1/N` by the caller.
+const CONF_GLOBAL_LINKAGE: f32 = 0.8;
 /// Above this many same-named candidates for a path call, the answer is noise
 /// rather than a blast radius (`Vec::new`-style names match everywhere).
 const MAX_PATH_CANDIDATES: usize = 4;
@@ -446,6 +456,14 @@ struct DefIndex {
     /// which root each symbol came from, so an edge that leaves one can be priced
     /// for it
     root_of: HashMap<SymbolId, usize>,
+    /// (root, name) → definitions a *bare* name can reach from any file in a
+    /// language with one flat linkage namespace. Restricted to exported
+    /// definitions — internal linkage (`static`) is invisible outside its own
+    /// file — and to definitions whose qualified name *is* the bare name, so a
+    /// class member (`Foo.bar`) never enters: it lives in its class's namespace,
+    /// not the linker's. Only consulted when the calling file's adapter answers
+    /// `bare_calls_resolve_globally`. See #116.
+    global_linkage: HashMap<(usize, String), Vec<SymbolId>>,
     /// symbols a bare call can never name. A struct field and a getter routinely
     /// share a name (`Config.path` and `fn path(&self)`), so once fields became
     /// symbols every such call split its confidence across both — 26 call edges in
@@ -494,6 +512,12 @@ fn index_defs(files: &[CachedFile], file_root: &[usize]) -> (DefIndex, Vec<Node>
                 if let Some(dir) = f.canonical.parent() {
                     idx.pkg_exports
                         .entry((dir.to_path_buf(), d.name.clone()))
+                        .or_default()
+                        .push(d.id);
+                }
+                if d.qualified_name == d.name {
+                    idx.global_linkage
+                        .entry((root, d.name.clone()))
                         .or_default()
                         .push(d.id);
                 }
@@ -579,7 +603,10 @@ fn link(
     for (f, &root) in files.iter().zip(file_root) {
         let module_id = module_symbol(&f.module_path);
         let scope = resolve_imports(f, root, idx, &by_path, registry, ws, &mut sink);
-        resolve_calls(f, root, idx, module_id, &scope, &mut sink);
+        // the adapter decides, so `resolve` never learns which language this is
+        let global_linkage = lang::adapter_for(registry, &f.canonical)
+            .is_some_and(|a| a.bare_calls_resolve_globally());
+        resolve_calls(f, root, idx, module_id, &scope, global_linkage, &mut sink);
     }
     // deterministic node order: edge order already is, and the store keys by id,
     // but a stable node list keeps two indexes of one tree comparable
@@ -841,12 +868,18 @@ fn resolve_imports(
 }
 
 /// Resolve a file's call sites (bare + member) into Calls edges.
+///
+/// `global_linkage` is the calling file's adapter answering
+/// [`lang::LanguageAdapter::bare_calls_resolve_globally`]: with it, an unqualified
+/// call that binds to nothing in scope falls back to the project's file-scope
+/// names instead of dropping.
 fn resolve_calls(
     f: &CachedFile,
     root: usize,
     idx: &DefIndex,
     module_id: SymbolId,
     scope: &ImportScope,
+    global_linkage: bool,
     sink: &mut LinkSink,
 ) {
     let types = Bindings::new(&f.extract.bindings);
@@ -884,13 +917,7 @@ fn resolve_calls(
                     // deciding that nothing here matches. Consulting same-file names
                     // first made `Client::new()` resolve to whatever local `new` existed.
                     Some(resolved) => resolved,
-                    None => match local.get(&r.name) {
-                        Some(ids) if !ids.is_empty() => (ids.clone(), CONF_LOCAL_CALL),
-                        _ => (
-                            scope.bindings.get(&r.name).into_iter().copied().collect(),
-                            CONF_LOCAL_CALL,
-                        ),
-                    },
+                    None => resolve_bare(&r.name, local, scope, idx, root, global_linkage),
                 }
             }
             RefKind::Member => {
@@ -965,6 +992,56 @@ fn resolve_calls(
             });
         }
     }
+}
+
+/// Unqualified-call resolution ladder. Returns (targets, base confidence).
+///
+/// Same-file definitions first, then what the file's imports bound by name. Both
+/// are path- or syntax-evidenced, so they are the whole ladder for every language
+/// whose names live in modules.
+///
+/// `global_linkage` adds a third rung for C and C++, where a bare call really does
+/// resolve against the whole program (see
+/// [`lang::LanguageAdapter::bare_calls_resolve_globally`]) — an `#include` binds a
+/// file, not the names in it, so without this rung a `.h`/`.c` split project has no
+/// cross-file call graph at all (#116). Guarded three ways so it finds edges rather
+/// than inventing them: only *exported* file-scope definitions are candidates (a
+/// `static` function has internal linkage and is unreachable from another file), a
+/// name matching more candidates than `MAX_PATH_CANDIDATES` drops instead of
+/// spraying, and the caller divides confidence by the number that survive.
+fn resolve_bare(
+    name: &str,
+    local: &HashMap<String, Vec<SymbolId>>,
+    scope: &ImportScope,
+    idx: &DefIndex,
+    root: usize,
+    global_linkage: bool,
+) -> (Vec<SymbolId>, f32) {
+    if let Some(ids) = local.get(name) {
+        if !ids.is_empty() {
+            return (ids.clone(), CONF_LOCAL_CALL);
+        }
+    }
+    if let Some(&sym) = scope.bindings.get(name) {
+        return (vec![sym], CONF_LOCAL_CALL);
+    }
+    if !global_linkage {
+        return (Vec::new(), CONF_LOCAL_CALL);
+    }
+    let mut candidates: Vec<SymbolId> = idx
+        .global_linkage
+        .get(&(root, name.to_owned()))
+        .cloned()
+        .unwrap_or_default();
+    // one id can be pushed per definition site (a repeated declaration, an
+    // overload); collapse before counting or `MAX_PATH_CANDIDATES` rejects a name
+    // that has exactly one target
+    candidates.sort_unstable();
+    candidates.dedup();
+    if candidates.len() > MAX_PATH_CANDIDATES {
+        return (Vec::new(), CONF_GLOBAL_LINKAGE);
+    }
+    (prefer_local(&candidates, name, local), CONF_GLOBAL_LINKAGE)
 }
 
 /// Qualified-call resolution ladder. Returns (targets, base confidence).

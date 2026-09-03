@@ -98,6 +98,15 @@ impl LanguageAdapter for Adapter {
         !has_static_storage(def, src)
     }
 
+    /// C has one flat namespace for external linkage: `util_helper(1)` in
+    /// `main.c` binds to the single non-`static` `util_helper` anywhere in the
+    /// program. The `#include` that made its prototype visible names the header
+    /// file, not the names in it, so file scope + imports alone can never link a
+    /// cross-file bare call (#116).
+    fn bare_calls_resolve_globally(&self) -> bool {
+        true
+    }
+
     /// Struct and union fields are qualified by their owning specifier's name —
     /// `Point.x` and `Rect.x` stay distinct and neither collides with a
     /// file-scope `x`. Everything else keeps its bare name.

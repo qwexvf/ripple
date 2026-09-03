@@ -191,6 +191,30 @@ pub trait LanguageAdapter: Send + Sync {
         false
     }
 
+    /// Does an *unqualified* call in this language resolve against every
+    /// file-scope name in the project, rather than only what the calling file
+    /// defines or imports? Default: no.
+    ///
+    /// Answer `true` only for a language with a single flat namespace for
+    /// external linkage — C and C++ are the cases. There, `foo(1)` in one
+    /// translation unit binds to the one non-`static` `foo` anywhere in the
+    /// program; the linker performs exactly this project-wide name lookup, and
+    /// the `#include` that made the prototype visible names a *file*, never the
+    /// names inside it. Without this signal a `.h`/`.c` split project gets a
+    /// same-file-only call graph (#116).
+    ///
+    /// Every other language ripple indexes answers `false`, and must: in a
+    /// language where names live in modules, classes, or packages, matching a bare
+    /// name across the project fabricates edges rather than finding them — the
+    /// `Vec::new()` problem that `resolve_qualified` already guards against.
+    ///
+    /// The resolver still only consults *exported* definitions (`is_exported`),
+    /// so a `static` function in another file is correctly unreachable, and it
+    /// still splits confidence `1/N` across genuine ambiguity.
+    fn bare_calls_resolve_globally(&self) -> bool {
+        false
+    }
+
     /// Qualified name for a definition (e.g. TS methods → `Class.method` so
     /// same-named methods don't collide). Default: the bare name.
     fn qualified_name(

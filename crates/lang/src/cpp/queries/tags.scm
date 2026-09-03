@@ -61,11 +61,15 @@
     declarator: (qualified_identifier
       name: (identifier) @name))) @def.method
 
-; Member function *declaration* (prototype) inside a class body — no body, so it
-; parses as a field_declaration whose declarator is a function_declarator.
-(field_declaration
-  declarator: (function_declarator
-    declarator: (field_identifier) @name)) @def.method
+; A member function *declaration* (prototype) inside a class body is deliberately
+; NOT captured. A prototype is a declaration, not a definition: `void bar();` in
+; `app.hpp` and `void Foo::bar() {}` in `app.cc` are one function, but `SymbolId`
+; is keyed by (module_path, qualified_name), so capturing both made them two nodes
+; that then *competed* — a cross-file `f.bar()` split 1/N across the header and the
+; source (0.3 each) instead of pinning the definition. The grammar makes them easy
+; to keep apart: a definition is a `function_definition` (matched above), a
+; prototype a bodyless `field_declaration`. A pure-virtual or never-defined member
+; therefore contributes no symbol, which is correct — there is no code to reach.
 
 ; --- data members -----------------------------------------------------------
 ; A data member is a field_declaration whose declarator is the field_identifier
