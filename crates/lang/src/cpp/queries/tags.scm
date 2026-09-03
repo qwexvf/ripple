@@ -12,6 +12,11 @@
 (struct_specifier
   name: (type_identifier) @name) @def.class
 
+; A union is a type with fields, same as a struct. Captured here because this
+; adapter also owns `.h` (#119), so a plain C header's unions must not be lost.
+(union_specifier
+  name: (type_identifier) @name) @def.class
+
 (enum_specifier
   name: (type_identifier) @name) @def.enum
 

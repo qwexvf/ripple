@@ -389,6 +389,24 @@ mod tests {
         assert_eq!(super::registry_fingerprint().len(), 16);
     }
 
+    /// `.h` must reach the C++ adapter, not the C one. The convention for C++
+    /// headers is overwhelmingly `.h`, and the C grammar cannot parse a
+    /// `namespace`/`template` — when C claimed the glob, a C++ header extracted
+    /// zero symbols (#119). Registration order decides this, so pin it.
+    #[test]
+    fn a_dot_h_header_belongs_to_the_cpp_adapter() {
+        let reg = super::registry();
+        let id = |p: &str| {
+            super::adapter_for(&reg, std::path::Path::new(p))
+                .map(super::LanguageAdapter::id)
+                .unwrap_or("none")
+        };
+        assert_eq!(id("include/fmt/format.h"), "cpp");
+        assert_eq!(id("src/jv.c"), "c");
+        assert_eq!(id("src/app.cc"), "cpp");
+        assert_eq!(id("src/app.hpp"), "cpp");
+    }
+
     /// The fingerprint must actually fold in the query sources — a build with an
     /// empty tags query hashes differently from the real one. This is the property
     /// #71 turns on: change a `.scm`, change the key, miss the stale cache.

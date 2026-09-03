@@ -32,8 +32,13 @@ impl LanguageAdapter for Adapter {
         tree_sitter_c::LANGUAGE.into()
     }
 
+    /// `.c` only. A `.h` is ambiguous — the dominant C++ convention names headers
+    /// `.h` too — and tree-sitter-c cannot parse a `namespace`/`template`, so
+    /// claiming it here extracted *nothing* from a C++ header (#119). The C++
+    /// grammar is very nearly a superset of C, so it reads a C header correctly;
+    /// `.h` belongs to that adapter instead.
     fn file_globs(&self) -> &'static [&'static str] {
-        &["*.c", "*.h"]
+        &["*.c"]
     }
 
     /// Keep it simple: a file under a `test`/`tests` path segment is a test.

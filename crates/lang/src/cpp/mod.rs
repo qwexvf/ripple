@@ -35,8 +35,12 @@ impl LanguageAdapter for Adapter {
         tree_sitter_cpp::LANGUAGE.into()
     }
 
+    /// `.h` is claimed here rather than by the C adapter: the convention for C++
+    /// headers is overwhelmingly `.h`, and parsing one with the C grammar yields
+    /// zero symbols (#119). This grammar is nearly a superset of C, so a genuine
+    /// C header still extracts correctly.
     fn file_globs(&self) -> &'static [&'static str] {
-        &["*.cpp", "*.cc", "*.cxx", "*.hpp", "*.hh", "*.hxx"]
+        &["*.cpp", "*.cc", "*.cxx", "*.hpp", "*.hh", "*.hxx", "*.h"]
     }
 
     fn is_test_path(&self, rel: &str) -> bool {
