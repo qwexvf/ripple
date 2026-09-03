@@ -67,9 +67,14 @@ impl LanguageAdapter for Adapter {
     /// plain dotted paths resolve here — selector (`{…}`) and wildcard (`_`/`*`)
     /// forms carry punctuation and are left to [`external_dep_key`].
     ///
-    /// Scala does not enforce package==directory, so the path is probed against a
-    /// bounded run of the source file's ancestors and a miss just falls through to
-    /// an external node — no attempt is made to be exhaustive.
+    /// Scala does not enforce package==directory and Mill does not even put the
+    /// package in the path — os-lib's `package os` lives at `os/src/`, so no ancestor
+    /// of an importing file ever spells `.../os/Path.scala`. So the roots come from
+    /// the build ([`crate::java::source_roots::resolve`]: sbt's `src/main/scala`,
+    /// Mill's `<module>/src`, `<module>/src-jvm`, `<module>/test/src`), and a hit
+    /// under a package-less Mill root is confirmed against the candidate file's own
+    /// `package` declaration before it is believed. A miss falls through to an
+    /// external node — no attempt is made to be exhaustive.
     ///
     /// [`external_dep_key`]: LanguageAdapter::external_dep_key
     fn resolve_import(&self, spec: &str, from: &Path, _ws: &Workspace) -> Option<PathBuf> {
@@ -83,21 +88,7 @@ impl LanguageAdapter for Adapter {
         {
             return None;
         }
-        let rel: PathBuf = segments.iter().collect();
-        let mut dir = from.parent();
-        for _ in 0..8 {
-            let Some(base) = dir else { break };
-            for ext in [".scala", ".sc"] {
-                let mut candidate = base.join(&rel).into_os_string();
-                candidate.push(ext);
-                let candidate = PathBuf::from(candidate);
-                if candidate.is_file() {
-                    return candidate.canonicalize().ok();
-                }
-            }
-            dir = base.parent();
-        }
-        None
+        crate::java::source_roots::resolve(path, from, &["scala", "sc"])
     }
 
     /// The dep-key of a Scala import is its normalized dotted path: the `import`
@@ -409,6 +400,122 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A throwaway tree of `(relative path, contents)`, cleaned up on drop. The
+    /// contents matter here: a Mill root does not encode the package in the path, so
+    /// resolution is confirmed against the candidate file's `package` declaration.
+    struct Fixture {
+        root: PathBuf,
+    }
+
+    impl Fixture {
+        fn new(files: &[(&str, &str)]) -> Fixture {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static N: AtomicU32 = AtomicU32::new(0);
+            let id = N.fetch_add(1, Ordering::Relaxed);
+            let root =
+                std::env::temp_dir().join(format!("ripple-scala-fx-{}-{id}", std::process::id()));
+            for (rel, body) in files {
+                let p = root.join(rel);
+                std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+                std::fs::write(&p, body).unwrap();
+            }
+            Fixture { root }
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// The os-lib case. Mill puts module `os`'s sources at `os/src/`, so `package os`
+    /// is nowhere in the path and `import os.Path` names `os/src/Path.scala`. The
+    /// leading FQN segments are stripped to find it and the hit is confirmed against
+    /// the file's own `package` line — which is what keeps `scala.util.Try` from
+    /// binding to the unrelated `Try.scala` sitting in the same root.
+    #[test]
+    fn resolve_import_finds_mill_module_source_root() {
+        let fx = Fixture::new(&[
+            ("build.sc", "import mill._\nobject os extends ScalaModule\n"),
+            ("os/src/Path.scala", "package os\n\nclass Path\n"),
+            ("os/src/Try.scala", "package os\n\nclass Try\n"),
+            ("os/src/FileOps.scala", "package os\n\nimport os.Path\n"),
+        ]);
+        let adapter = Adapter::new();
+        let ws = Workspace::default();
+        let from = fx.root.join("os/src/FileOps.scala");
+        assert_eq!(
+            adapter.resolve_import("import os.Path", &from, &ws),
+            fx.root.join("os/src/Path.scala").canonicalize().ok()
+        );
+        // `os/src/Try.scala` exists but declares `package os`, not `scala.util`
+        assert_eq!(
+            adapter.resolve_import("import scala.util.Try", &from, &ws),
+            None
+        );
+        assert_eq!(
+            adapter.resolve_import("import java.io.File", &from, &ws),
+            None
+        );
+    }
+
+    /// Mill's test sources hang off `<module>/test/src`, and os-lib's live in
+    /// `package test.os` — two leading segments to strip against a two-deep root.
+    #[test]
+    fn resolve_import_finds_mill_test_source_root() {
+        let fx = Fixture::new(&[
+            ("build.mill", "package build\n"),
+            ("os/src/Path.scala", "package os\n\nclass Path\n"),
+            (
+                "os/test/src/TestUtil.scala",
+                "package test.os\n\nobject TestUtil { def prep = () }\n",
+            ),
+            (
+                "os/test/src/PathTests.scala",
+                "package test.os\n\nimport test.os.TestUtil.prep\n",
+            ),
+        ]);
+        let adapter = Adapter::new();
+        let from = fx.root.join("os/test/src/PathTests.scala");
+        assert_eq!(
+            adapter.resolve_import("import test.os.TestUtil.prep", &from, &Workspace::default()),
+            fx.root
+                .join("os/test/src/TestUtil.scala")
+                .canonicalize()
+                .ok()
+        );
+    }
+
+    /// sbt's `src/main/scala` convention, discovered from `build.sbt`, across two
+    /// subprojects so no ancestor of the importer covers the target.
+    #[test]
+    fn resolve_import_uses_sbt_source_roots_across_subprojects() {
+        let fx = Fixture::new(&[
+            (
+                "build.sbt",
+                "lazy val core = project\nlazy val app = project\n",
+            ),
+            (
+                "core/src/main/scala/com/example/Util.scala",
+                "package com.example\n\nobject Util\n",
+            ),
+            (
+                "app/src/main/scala/com/other/App.scala",
+                "package com.other\n\nimport com.example.Util\n",
+            ),
+        ]);
+        let adapter = Adapter::new();
+        let from = fx.root.join("app/src/main/scala/com/other/App.scala");
+        assert_eq!(
+            adapter.resolve_import("import com.example.Util", &from, &Workspace::default()),
+            fx.root
+                .join("core/src/main/scala/com/example/Util.scala")
+                .canonicalize()
+                .ok()
+        );
     }
 
     #[test]

@@ -82,31 +82,20 @@ impl LanguageAdapter for Adapter {
     }
 
     /// Kotlin fuses the package and the type in one dotted import path
-    /// (`import com.example.Foo`). Kotlin does not *enforce* package == directory,
-    /// but the convention holds often enough to be worth probing: map the dotted
-    /// path to `com/example/Foo` and look for `<ancestor>/com/example/Foo.kt`,
-    /// walking up a bounded number of ancestors from the importing file (source
-    /// roots like `src/main/kotlin/` sit above the package dirs). First hit wins;
-    /// anything else falls through to [`external_dep_key`]. A file whose name
-    /// differs from the class it declares won't be found this way — that's fine,
-    /// we resolve what we can.
+    /// (`import com.example.Foo`), so the import names `com/example/Foo.kt` *below
+    /// some source root*. Which root that is comes from the build:
+    /// [`crate::java::source_roots::resolve`] reads `build.gradle[.kts]` and
+    /// probes `src/main/kotlin` alongside the Kotlin-Multiplatform variants
+    /// (`src/commonMain/kotlin`, `src/androidMain/kotlin`, …) of this module *and*
+    /// its sibling modules, which is how a cross-module `timber.log.Timber` resolves
+    /// at all. The old ancestor walk stays as a fallback; a miss falls through to
+    /// [`external_dep_key`]. A file whose name differs from the class it declares
+    /// still won't be found — that's fine, we resolve what we can.
     fn resolve_import(&self, spec: &str, from: &Path, _ws: &crate::Workspace) -> Option<PathBuf> {
         if spec.is_empty() {
             return None;
         }
-        let rel = spec.replace('.', "/");
-        let mut dir = from.parent();
-        for _ in 0..8 {
-            let Some(base) = dir else { break };
-            for ext in ["kt", "kts"] {
-                let cand = base.join(format!("{rel}.{ext}"));
-                if cand.is_file() {
-                    return cand.canonicalize().ok();
-                }
-            }
-            dir = base.parent();
-        }
-        None
+        crate::java::source_roots::resolve(spec, from, &["kt", "kts"])
     }
 
     /// A Kotlin import that didn't resolve to an indexed file is a third-party or
@@ -441,5 +430,88 @@ mod tests {
             Some("android.util.Log".to_owned())
         );
         assert_eq!(adapter.external_dep_key(""), None);
+    }
+
+    /// The timber case. A Kotlin-Multiplatform module keeps its sources under
+    /// `src/androidMain/kotlin`, which no ancestor of the importing file spells, and
+    /// the importer sits in a *different* Gradle subproject. Only reading
+    /// `settings.gradle.kts` for the subproject list and enumerating each one's
+    /// `src/*/kotlin` variants gets `timber.log.Timber` to a local file.
+    #[test]
+    fn resolve_import_finds_kmp_target_source_set_across_gradle_modules() {
+        let fx = Fixture::new(&[
+            "settings.gradle.kts",
+            "build.gradle.kts",
+            "timber/build.gradle.kts",
+            "timber-sample/build.gradle.kts",
+            "timber/src/androidMain/kotlin/timber/log/Timber.kt",
+            "timber-sample/src/main/java/com/example/timber/ui/App.kt",
+        ]);
+        std::fs::write(
+            fx.root.join("settings.gradle.kts"),
+            "include(\":timber\")\ninclude(\":timber-sample\")\n",
+        )
+        .unwrap();
+
+        let adapter = Adapter::new();
+        let from = fx
+            .root
+            .join("timber-sample/src/main/java/com/example/timber/ui/App.kt");
+        assert_eq!(
+            adapter.resolve_import("timber.log.Timber", &from, &crate::Workspace::default()),
+            fx.root
+                .join("timber/src/androidMain/kotlin/timber/log/Timber.kt")
+                .canonicalize()
+                .ok()
+        );
+        // third-party imports from the same file still mint external nodes
+        for spec in ["android.util.Log", "org.junit.Test"] {
+            assert_eq!(
+                adapter.resolve_import(spec, &from, &crate::Workspace::default()),
+                None,
+                "{spec} should not resolve locally"
+            );
+        }
+    }
+
+    /// `import a.b.Foo.Companion.bar` names a member of a member of `a.b.Foo`, so
+    /// the type path is the FQN minus up to two trailing segments.
+    #[test]
+    fn resolve_import_of_a_member_resolves_to_its_owning_file() {
+        let fx = Fixture::new(&[
+            "build.gradle.kts",
+            "src/main/kotlin/timber/lint/WrongTimberUsageDetector.kt",
+            "src/main/kotlin/timber/lint/TimberIssueRegistry.kt",
+        ]);
+        let adapter = Adapter::new();
+        let from = fx
+            .root
+            .join("src/main/kotlin/timber/lint/TimberIssueRegistry.kt");
+        let want = fx
+            .root
+            .join("src/main/kotlin/timber/lint/WrongTimberUsageDetector.kt")
+            .canonicalize()
+            .ok();
+        for spec in [
+            "timber.lint.WrongTimberUsageDetector",
+            "timber.lint.WrongTimberUsageDetector.issues",
+            "timber.lint.WrongTimberUsageDetector.Companion.issues",
+        ] {
+            assert_eq!(
+                adapter.resolve_import(spec, &from, &crate::Workspace::default()),
+                want,
+                "{spec}"
+            );
+        }
+        // three trailing segments is past the cap — a package path must not be
+        // mistaken for a type
+        assert_eq!(
+            adapter.resolve_import(
+                "timber.lint.WrongTimberUsageDetector.Companion.issues.first",
+                &from,
+                &crate::Workspace::default()
+            ),
+            None
+        );
     }
 }
