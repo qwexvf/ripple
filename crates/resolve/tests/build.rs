@@ -1504,3 +1504,232 @@ fn python_self_method_scopes_to_enclosing_class() {
         "self.request() must NOT reach the sibling class's request"
     );
 }
+
+/// Java, Tier 0–2: a dotted `import com.example.Util` resolves to the class file
+/// under the conventional source root, and the static call `Util.helper(n)`
+/// through that import reaches `Util.helper` — a method qualified by its class.
+#[test]
+fn java_import_and_static_call_resolve_across_files() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/java");
+    let r = resolve::build(&root).unwrap();
+
+    let util = SymbolId::of("src/main/java/com/example/Util.java", "Util");
+    let helper = SymbolId::of("src/main/java/com/example/Util.java", "Util.helper");
+    let run = SymbolId::of("src/main/java/com/example/App.java", "App.run");
+
+    assert!(
+        r.nodes.iter().any(|n| n.id == helper && n.name == "helper"),
+        "a method is qualified by its declaring class"
+    );
+    assert!(
+        r.edges
+            .iter()
+            .any(|e| e.dst == util && e.kind == EdgeKind::Imports),
+        "`import com.example.Util` should resolve to the class under the source root"
+    );
+    assert!(
+        r.edges
+            .iter()
+            .any(|e| e.src == run && e.dst == helper && e.kind == EdgeKind::Calls),
+        "`Util.helper(n)` should reach Util.helper across files"
+    );
+}
+
+/// Kotlin, Tier 0–2: `import com.example.Util` maps the dotted path to
+/// `com/example/Util.kt` under the source root, and a member call on an instance
+/// of the imported class reaches `Util.send` in that file.
+#[test]
+fn kotlin_import_and_member_call_resolve_across_files() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/kotlin");
+    let r = resolve::build(&root).unwrap();
+
+    let util = SymbolId::of("src/main/kotlin/com/example/Util.kt", "Util");
+    let send = SymbolId::of("src/main/kotlin/com/example/Util.kt", "Util.send");
+    let helper = SymbolId::of("src/main/kotlin/com/example/Util.kt", "helper");
+    let run = SymbolId::of("src/main/kotlin/com/example/App.kt", "run");
+
+    assert!(
+        r.edges
+            .iter()
+            .any(|e| e.dst == util && e.kind == EdgeKind::Imports),
+        "`import com.example.Util` should resolve to com/example/Util.kt"
+    );
+    assert!(
+        r.edges
+            .iter()
+            .any(|e| e.src == run && e.dst == send && e.kind == EdgeKind::Calls),
+        "`u.send(n)` should reach Util.send across files"
+    );
+    assert!(
+        r.edges
+            .iter()
+            .any(|e| e.src == send && e.dst == helper && e.kind == EdgeKind::Calls),
+        "a method should reach a top-level function in its own file"
+    );
+}
+
+/// Scala, Tier 0–2: `import a.b.C` maps the dotted path to `a/b/C.scala`, and the
+/// selector call `C.helper(n)` through that import reaches `C.helper` — a method
+/// qualified by the object it lives in.
+#[test]
+fn scala_import_and_selector_call_resolve_across_files() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/scala");
+    let r = resolve::build(&root).unwrap();
+
+    let c = SymbolId::of("a/b/C.scala", "C");
+    let helper = SymbolId::of("a/b/C.scala", "C.helper");
+    let free = SymbolId::of("a/b/C.scala", "free");
+    let run = SymbolId::of("x/Main.scala", "Main.run");
+
+    assert_ne!(
+        helper, free,
+        "a method is qualified by its owner, a def is not"
+    );
+    assert!(
+        r.edges
+            .iter()
+            .any(|e| e.dst == c && e.kind == EdgeKind::Imports),
+        "`import a.b.C` should resolve to a/b/C.scala"
+    );
+    assert!(
+        r.edges
+            .iter()
+            .any(|e| e.src == run && e.dst == helper && e.kind == EdgeKind::Calls),
+        "`C.helper(n)` should reach C.helper across files"
+    );
+}
+
+/// C#, Tier 0–2. A `using` names a *namespace*, not a file, so the adapter
+/// deliberately resolves no local path and mints an external namespace node
+/// instead — that is the honest import target. Calls still cross files: the
+/// type-qualified `Util.Helper(n)` binds by owner.
+#[test]
+fn csharp_using_is_external_and_a_qualified_call_still_crosses_files() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/csharp");
+    let r = resolve::build(&root).unwrap();
+
+    let helper = SymbolId::of("Util.cs", "Util.Helper");
+    let send = SymbolId::of("Util.cs", "Util.Send");
+    let run = SymbolId::of("App.cs", "App.Run");
+
+    let ns_imports: Vec<&str> = r
+        .edges
+        .iter()
+        .filter(|e| e.kind == EdgeKind::Imports)
+        .filter_map(|e| r.nodes.iter().find(|n| n.id == e.dst))
+        .filter(|n| n.kind == ir::NodeKind::External)
+        .map(|n| n.name.as_str())
+        .collect();
+    assert!(
+        ns_imports.contains(&"Demo") && ns_imports.contains(&"System.Text"),
+        "a `using` imports an external namespace node: {ns_imports:?}"
+    );
+
+    assert!(
+        r.edges
+            .iter()
+            .any(|e| e.src == run && e.dst == helper && e.kind == EdgeKind::Calls),
+        "`Util.Helper(n)` should reach Util.Helper across files"
+    );
+    assert!(
+        r.edges
+            .iter()
+            .any(|e| e.src == send && e.dst == helper && e.kind == EdgeKind::Calls),
+        "a bare call inside the type should reach its sibling method"
+    );
+}
+
+/// C, Tier 0–2: a quoted `#include` resolves against the including file's own
+/// directory and against an `include/` root above it, a system `<stdio.h>` mints
+/// an external node, and a struct field is qualified by its struct.
+///
+/// Note what is *not* asserted: `main.c` calls `util_helper()`, defined in
+/// `util.c` and declared in the header it includes, and no `Calls` edge is
+/// produced. An `#include` binds a module, never the names inside it, so a bare
+/// cross-file call in C/C++ has nothing to bind to.
+#[test]
+fn c_includes_resolve_locally_and_to_an_include_root() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/c");
+    let r = resolve::build(&root).unwrap();
+
+    let main_mod = SymbolId::module("src/main.c");
+    let util_h = SymbolId::module("src/util.h");
+    let api_h = SymbolId::module("include/lib/api.h");
+    let util_helper = SymbolId::of("src/util.c", "util_helper");
+    let bump = SymbolId::of("src/util.c", "bump");
+
+    let imports_from_main = |dst: SymbolId| {
+        r.edges
+            .iter()
+            .any(|e| e.src == main_mod && e.dst == dst && e.kind == EdgeKind::Imports)
+    };
+    assert!(
+        imports_from_main(util_h),
+        "`#include \"util.h\"` should resolve beside the including file"
+    );
+    assert!(
+        imports_from_main(api_h),
+        "`#include \"lib/api.h\"` should resolve under an `include/` root above the file"
+    );
+    assert!(
+        r.nodes
+            .iter()
+            .any(|n| n.id == SymbolId::of("src/util.h", "Point.x")),
+        "a struct field is qualified by its struct"
+    );
+    assert!(
+        r.edges
+            .iter()
+            .any(|e| e.src == util_helper && e.dst == bump && e.kind == EdgeKind::Calls),
+        "a bare call should reach a file-local function"
+    );
+
+    let external: Vec<&str> = r
+        .nodes
+        .iter()
+        .filter(|n| n.kind == ir::NodeKind::External)
+        .map(|n| n.name.as_str())
+        .collect();
+    assert!(
+        external.contains(&"stdio.h"),
+        "a system include mints an external node: {external:?}"
+    );
+}
+
+/// C++, Tier 0–2: a quoted `#include` of a local header resolves, an out-of-line
+/// `void Foo::bar()` is qualified `Foo.bar` off its `::` scope, and a member call
+/// on a local `Foo` reaches that definition in the other file.
+#[test]
+fn cpp_include_and_member_call_resolve_across_files() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cpp");
+    let r = resolve::build(&root).unwrap();
+
+    let main_mod = SymbolId::module("src/main.cc");
+    let header = SymbolId::module("src/app.hpp");
+    let bar_def = SymbolId::of("src/app.cc", "Foo.bar");
+    let free_helper = SymbolId::of("src/app.cc", "free_helper");
+    let run = SymbolId::of("src/main.cc", "run");
+
+    assert!(
+        r.nodes.iter().any(|n| n.id == bar_def && n.name == "bar"),
+        "`void Foo::bar()` is qualified by the owner in its `::` scope"
+    );
+    assert!(
+        r.edges
+            .iter()
+            .any(|e| e.src == main_mod && e.dst == header && e.kind == EdgeKind::Imports),
+        "`#include \"app.hpp\"` should resolve to the local header"
+    );
+    assert!(
+        r.edges
+            .iter()
+            .any(|e| e.src == run && e.dst == bar_def && e.kind == EdgeKind::Calls),
+        "`f.bar()` should reach the out-of-line Foo::bar in the other file"
+    );
+    assert!(
+        r.edges
+            .iter()
+            .any(|e| e.src == bar_def && e.dst == free_helper && e.kind == EdgeKind::Calls),
+        "a member should reach a free function in its own file"
+    );
+}
