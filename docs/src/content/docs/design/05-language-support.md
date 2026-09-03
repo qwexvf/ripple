@@ -44,11 +44,18 @@ receiver-type blindness tracked for Go and Rust in
 | **Scala** (`tree-sitter-scala`) | `*.scala`, `*.sc` | 2 | plain `import a.b.C` → `a/b/C.{scala,sc}`, same ancestor walk; selector/wildcard forms go external | `src/test/` |
 | **Kotlin** (`tree-sitter-kotlin-ng`) | `*.kt`, `*.kts` | 2 | dotted path → `com/example/Foo.{kt,kts}`, same ancestor walk; `import … as X` binds the alias | `src/test/`, `src/androidTest/` |
 | **C#** (`tree-sitter-c-sharp`) | `*.cs` | 2 | **none by design** — a `using` names a namespace, which spans many files, so it always binds an external namespace node | `*Test.cs`, `*Tests.cs`, a `test`/`tests` path segment |
-| **C** (`tree-sitter-c`) | `*.c`, `*.h` | 2 | quoted `#include "foo.h"` relative to the including file, also probing `<ancestor>/include/foo.h`; `<stdio.h>` is always external | a `test`/`tests` path segment |
-| **C++** (`tree-sitter-cpp`) | `*.cpp`, `*.cc`, `*.cxx`, `*.hpp`, `*.hh`, `*.hxx` | 2 | as C | a `test`/`tests` path segment |
+| **C** (`tree-sitter-c`) | `*.c` | 2 | quoted `#include "foo.h"` relative to the including file, also probing `<ancestor>/include/foo.h`; `<stdio.h>` is always external | a `test`/`tests` path segment |
+| **C++** (`tree-sitter-cpp`) | `*.cpp`, `*.cc`, `*.cxx`, `*.hpp`, `*.hh`, `*.hxx`, `*.h` | 2 | as C | a `test`/`tests` path segment |
 
 Notes worth the line:
 
+- **`.h` belongs to the C++ adapter, not the C one.** The extension is ambiguous and the
+  dominant C++ convention uses it, while `tree-sitter-c` cannot parse a `namespace` or a
+  `template` — so with C claiming the glob, a C++ header extracted *nothing*: identical
+  content yielded 0 symbols as `.h` and 5 as `.hpp`, and fmt's `basic_format_arg` was
+  absent from the index entirely
+  ([#119](https://github.com/qwexvf/ripple/issues/119)). The C++ grammar is very nearly a
+  superset of C, so a genuine C header still extracts correctly under it.
 - **Members are qualified by their owner.** Java, Kotlin and C# prefix a method or field
   with its enclosing type declaration, and Scala prefixes a method or `val` with its
   owning `class`/`trait`/`object`/`enum`, so `Widget.Name` and `Order.Name` are
