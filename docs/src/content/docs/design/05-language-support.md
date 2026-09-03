@@ -66,6 +66,24 @@ Notes worth the line:
   `protected` for Kotlin; and for C/C++ *linkage* stands in — a top-level symbol is
   exported unless it is `static`. C++ class access specifiers (`private:`) are not
   tracked; a member defaults to visible.
+- **C and C++ bare calls resolve against the whole program.** An `#include` binds a
+  *file*, never the names in it, so file scope plus imports left a `.h`/`.c` split
+  project with a same-file-only call graph — in jq, all 68 callers of `jv_free` sat in
+  `src/jv.c` while `src/execute.c` called it 59 times
+  ([#116](https://github.com/qwexvf/ripple/issues/116)). C and C++ have one flat
+  namespace for external linkage, so the C/C++ adapters answer `true` to
+  `LanguageAdapter::bare_calls_resolve_globally` and an unqualified call that binds to
+  nothing in scope falls back to a project-wide lookup over exported file-scope names,
+  at confidence 0.8 divided by the number of candidates. Only *exported* definitions
+  qualify, so a `static` function keeps its internal linkage and is unreachable from
+  another file; a class member is excluded too, since its qualified name (`Foo.bar`)
+  is not a linker name. Every other adapter answers `false`, and must: matching a bare
+  name project-wide in a language whose names live in modules fabricates edges.
+- **A C++ member prototype is not a definition.** `void bar();` in a header is a
+  declaration, so it is not captured. It used to be, and because `SymbolId` is keyed by
+  `(module_path, qualified_name)` the header's prototype and the source's
+  `void Foo::bar(){}` became two rival nodes — a cross-file `f.bar()` split 1/N across
+  them instead of pinning the definition.
 - **Build-tool source roots are not discovered.** `resolve_import` walks up a bounded run
   of ancestor directories and probes for the file, which implicitly finds
   `src/main/java`-style roots when package == directory. A Maven/Gradle/CMake layout that

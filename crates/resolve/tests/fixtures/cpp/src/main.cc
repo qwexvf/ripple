@@ -4,5 +4,5 @@ int run(int n) {
     Foo f;
     f.count = n;
     f.bar();
-    return f.count;
+    return f.count + free_helper(n);
 }

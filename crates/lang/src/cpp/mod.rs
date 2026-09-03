@@ -100,6 +100,15 @@ impl LanguageAdapter for Adapter {
         !has_static(def, src)
     }
 
+    /// Like C: a free function with external linkage lives in one flat
+    /// program-wide namespace, so an unqualified `free_helper(n)` binds to the
+    /// non-`static` `free_helper` wherever it is defined. An `#include` names the
+    /// header, not the names in it (#116). This only opens up *file-scope* names —
+    /// a class member's qualified name is `Foo.bar`, which no bare call reaches.
+    fn bare_calls_resolve_globally(&self) -> bool {
+        true
+    }
+
     /// Qualify a member by its owning type so `Foo::bar` and `Bar::bar` stay
     /// distinct, and so a field `count` and a free function `count` don't hash to
     /// the same `SymbolId`. An out-of-line definition names its owner inline
@@ -252,7 +261,8 @@ mod tests {
     }
 
     /// The core shapes: class, struct, enum, free fn, member fn, field, typedef,
-    /// using-alias.
+    /// using-alias. `void bar();` is a prototype, so only the defined `baz`
+    /// appears as a method — see `a_member_prototype_is_not_a_definition`.
     #[test]
     fn captured_covers_every_def_form() {
         let caps = captured(
@@ -267,10 +277,27 @@ mod tests {
                 ("field".to_owned(), "count".to_owned()),
                 ("field".to_owned(), "x".to_owned()),
                 ("function".to_owned(), "add".to_owned()),
-                ("method".to_owned(), "bar".to_owned()),
                 ("method".to_owned(), "baz".to_owned()),
                 ("type".to_owned(), "Alias".to_owned()),
                 ("type".to_owned(), "myint".to_owned()),
+            ]
+        );
+    }
+
+    /// A bodyless member declaration is a *declaration*. Capturing it as a method
+    /// gave the out-of-line definition a rival node under the same qualified name
+    /// in a different module, and a cross-file `f.bar()` then split 1/N across the
+    /// two instead of pinning the definition (#116).
+    #[test]
+    fn a_member_prototype_is_not_a_definition() {
+        let caps = captured(
+            "class Foo {\n public:\n void bar();\n virtual int pure() = 0;\n int inline_ok() { return 1; }\n};\n",
+        );
+        assert_eq!(
+            caps,
+            [
+                ("class".to_owned(), "Foo".to_owned()),
+                ("method".to_owned(), "inline_ok".to_owned()),
             ]
         );
     }
