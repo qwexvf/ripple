@@ -6,6 +6,8 @@
 //! and a field never collides with a same-named method. Imports capture the
 //! dotted qualified name; refs capture bare and receiver-qualified method calls.
 
+pub mod source_roots;
+
 use crate::{LanguageAdapter, Workspace};
 use std::path::{Path, PathBuf};
 use tree_sitter::Node;
@@ -58,24 +60,14 @@ impl LanguageAdapter for Adapter {
     /// Resolve a dotted FQN import to a source file inside the indexed tree.
     ///
     /// `com.google.gson.Gson` names the class `com/google/gson/Gson.java`, but the
-    /// source root it sits under (`src/main/java`, `src/`, a bare module dir) isn't
-    /// known up front. Rather than hunt for it, walk from the importing file's
-    /// directory up through its ancestors and, at each, probe for the class file at
-    /// the FQN's relative path. The first hit implicitly discovers the source root.
-    /// A JDK or third-party class won't be in the tree and returns `None`, falling
-    /// through to `external_dep_key`.
+    /// source root it sits under is a property of the build, not of the import — and
+    /// in a multi-module build it is not below the importing file at all. So
+    /// [`source_roots::resolve`] reads the surrounding `pom.xml`/`build.gradle` for
+    /// the real roots and probes those, falling back to the old ancestor walk. A JDK
+    /// or third-party class isn't in the tree and returns `None`, falling through to
+    /// `external_dep_key`.
     fn resolve_import(&self, spec: &str, from: &Path, _ws: &Workspace) -> Option<PathBuf> {
-        let rel = spec.replace('.', "/");
-        let mut dir = from.parent();
-        for _ in 0..8 {
-            let ancestor = dir?;
-            let candidate = ancestor.join(&rel).with_extension("java");
-            if candidate.is_file() {
-                return candidate.canonicalize().ok();
-            }
-            dir = ancestor.parent();
-        }
-        None
+        source_roots::resolve(spec, from, &["java"])
     }
 
     /// A dotted import that didn't resolve locally (JDK, a third-party jar) keys an
@@ -374,6 +366,123 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A throwaway tree of `(relative path, contents)`, cleaned up on drop.
+    struct Fixture {
+        root: std::path::PathBuf,
+    }
+
+    impl Fixture {
+        fn new(files: &[(&str, &str)]) -> Fixture {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static N: AtomicU32 = AtomicU32::new(0);
+            let id = N.fetch_add(1, Ordering::Relaxed);
+            let root =
+                std::env::temp_dir().join(format!("ripple-java-fx-{}-{id}", std::process::id()));
+            for (rel, body) in files {
+                let p = root.join(rel);
+                std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+                std::fs::write(&p, body).unwrap();
+            }
+            Fixture { root }
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// The Maven convention: a `pom.xml` makes `src/main/java` a source root.
+    #[test]
+    fn resolve_import_uses_maven_source_root() {
+        let fx = Fixture::new(&[
+            ("pom.xml", "<project><modules></modules></project>"),
+            (
+                "src/main/java/com/example/Util.java",
+                "package com.example;\npublic class Util {}\n",
+            ),
+            (
+                "src/main/java/com/example/App.java",
+                "package com.example;\nimport com.example.Util;\n",
+            ),
+        ]);
+        let adapter = Adapter::new();
+        let from = fx.root.join("src/main/java/com/example/App.java");
+        assert_eq!(
+            adapter.resolve_import("com.example.Util", &from, &Workspace::default()),
+            fx.root
+                .join("src/main/java/com/example/Util.java")
+                .canonicalize()
+                .ok()
+        );
+    }
+
+    /// A multi-module Maven build: the class lives in a *sibling* module, so no
+    /// ancestor of the importing file spells its path. Only the `<modules>` list
+    /// gets us there.
+    #[test]
+    fn resolve_import_crosses_maven_modules() {
+        let fx = Fixture::new(&[
+            (
+                "pom.xml",
+                "<project><modules><module>core</module><module>app</module></modules></project>",
+            ),
+            ("core/pom.xml", "<project/>"),
+            ("app/pom.xml", "<project/>"),
+            (
+                "core/src/main/java/com/example/Util.java",
+                "package com.example;\npublic class Util {}\n",
+            ),
+            (
+                "app/src/main/java/com/other/App.java",
+                "package com.other;\nimport com.example.Util;\n",
+            ),
+        ]);
+        let adapter = Adapter::new();
+        let from = fx.root.join("app/src/main/java/com/other/App.java");
+        assert_eq!(
+            adapter.resolve_import("com.example.Util", &from, &Workspace::default()),
+            fx.root
+                .join("core/src/main/java/com/example/Util.java")
+                .canonicalize()
+                .ok()
+        );
+        // a genuine third-party FQN still has no local file
+        assert_eq!(
+            adapter.resolve_import("com.google.gson.Gson", &from, &Workspace::default()),
+            None
+        );
+    }
+
+    /// An explicit `<sourceDirectory>` is honored on top of the conventions.
+    #[test]
+    fn resolve_import_honors_explicit_maven_source_directory() {
+        let fx = Fixture::new(&[
+            (
+                "pom.xml",
+                "<project><build><sourceDirectory>${project.basedir}/gen</sourceDirectory></build></project>",
+            ),
+            (
+                "gen/com/example/Util.java",
+                "package com.example;\npublic class Util {}\n",
+            ),
+            (
+                "src/main/java/com/other/App.java",
+                "package com.other;\nimport com.example.Util;\n",
+            ),
+        ]);
+        let adapter = Adapter::new();
+        let from = fx.root.join("src/main/java/com/other/App.java");
+        assert_eq!(
+            adapter.resolve_import("com.example.Util", &from, &Workspace::default()),
+            fx.root
+                .join("gen/com/example/Util.java")
+                .canonicalize()
+                .ok()
+        );
     }
 
     #[test]
