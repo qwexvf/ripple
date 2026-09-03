@@ -29,6 +29,52 @@ This is the decisive design synergy. The git overlay — churn, co-change, bug-d
 
 Contrast with every other tool, which is worthless for a language until someone writes a full resolver. Here, dropping in a tree-sitter grammar + a `tags.scm` gives same-day value, and precision improves as the language climbs tiers. The shallow-static-analysis gap is covered by the git signal — exactly the bet in [`02-gap.md`](02-gap.md).
 
+## The JVM and C-family adapters
+
+Six adapters landed together — Java, Scala, Kotlin, C#, C and C++. All six are **Tier 2**:
+`tags.scm` + `imports.scm` + `refs.scm`, with `resolve_import`/`external_dep_key` in Rust.
+None of them has a `bindings_query`, so a receiver's *type* is never inferred: a
+`recv.method()` call is resolved by name, not by what `recv` holds. That is the same
+receiver-type blindness tracked for Go and Rust in
+[#105](https://github.com/qwexvf/ripple/issues/105), not a per-language gap.
+
+| Language | Globs | Tier | Import resolution | Test convention |
+|---|---|---|---|---|
+| **Java** (`tree-sitter-java`) | `*.java` | 2 | dotted FQN → `com/example/Foo.java`, probed against 8 ancestor dirs | `src/test/`, `*Test.java`, `*Tests.java` |
+| **Scala** (`tree-sitter-scala`) | `*.scala`, `*.sc` | 2 | plain `import a.b.C` → `a/b/C.{scala,sc}`, same ancestor walk; selector/wildcard forms go external | `src/test/` |
+| **Kotlin** (`tree-sitter-kotlin-ng`) | `*.kt`, `*.kts` | 2 | dotted path → `com/example/Foo.{kt,kts}`, same ancestor walk; `import … as X` binds the alias | `src/test/`, `src/androidTest/` |
+| **C#** (`tree-sitter-c-sharp`) | `*.cs` | 2 | **none by design** — a `using` names a namespace, which spans many files, so it always binds an external namespace node | `*Test.cs`, `*Tests.cs`, a `test`/`tests` path segment |
+| **C** (`tree-sitter-c`) | `*.c`, `*.h` | 2 | quoted `#include "foo.h"` relative to the including file, also probing `<ancestor>/include/foo.h`; `<stdio.h>` is always external | a `test`/`tests` path segment |
+| **C++** (`tree-sitter-cpp`) | `*.cpp`, `*.cc`, `*.cxx`, `*.hpp`, `*.hh`, `*.hxx` | 2 | as C | a `test`/`tests` path segment |
+
+Notes worth the line:
+
+- **Members are qualified by their owner.** Java, Kotlin and C# prefix a method or field
+  with its enclosing type declaration, and Scala prefixes a method or `val` with its
+  owning `class`/`trait`/`object`/`enum`, so `Widget.Name` and `Order.Name` are
+  distinct symbols and a field never hashes to the same `SymbolId` as a same-named
+  function. C has no methods, so only struct/union fields are qualified (`Point.x`). C++
+  reads the owner off the declarator: an out-of-line `void Foo::bar(){}` names it inline,
+  an inline member takes the enclosing `class_specifier`.
+- **The grammars force the tags query to do the sorting.** Scala shares
+  `function_definition` between free functions and methods; Kotlin has no method or field
+  node at all (a member is a `function_declaration` that happens to sit in a
+  `class_body`); tree-sitter-cpp inherits C's `function_definition` for both free and
+  member functions. In each case the split is by scope inside `tags.scm`, not by node kind.
+- **Visibility maps to whatever the language actually has.** `public` for Java and C#;
+  public-unless-`private`/`protected` for Scala; public-unless-`private`/`internal`/
+  `protected` for Kotlin; and for C/C++ *linkage* stands in — a top-level symbol is
+  exported unless it is `static`. C++ class access specifiers (`private:`) are not
+  tracked; a member defaults to visible.
+- **Build-tool source roots are not discovered.** `resolve_import` walks up a bounded run
+  of ancestor directories and probes for the file, which implicitly finds
+  `src/main/java`-style roots when package == directory. A Maven/Gradle/CMake layout that
+  breaks that assumption resolves to nothing and falls back to an external node —
+  [#114](https://github.com/qwexvf/ripple/issues/114).
+- **The Kotlin grammar errors on single-line class bodies.** `class Foo { fun bar() {} }`
+  on one line parses with an error and under-captures its members —
+  [#109](https://github.com/qwexvf/ripple/issues/109).
+
 ## `.scm` query conventions
 
 Adapters are mostly **data**. A `tags.scm` maps tree-sitter captures to IR node kinds by capture name:
