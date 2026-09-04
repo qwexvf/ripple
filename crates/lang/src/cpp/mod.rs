@@ -59,27 +59,15 @@ impl LanguageAdapter for Adapter {
         Some(include_str!("queries/refs.scm"))
     }
 
-    /// A quoted `#include "foo.h"` names a local header, relative to the
-    /// including file's directory or a project include root above it — probe the
-    /// file's own directory first, then walk up a bounded number of ancestors,
-    /// trying both `<ancestor>/foo.h` and the very common `<ancestor>/include/foo.h`
-    /// layout. A system `<vector>` include (specifier starts with `<`) is never
-    /// local: return `None` so it binds as an external dependency.
+    /// A quoted `#include "foo.h"` names a local header, but where that header
+    /// lives is a property of the build. Shared with the C adapter: probe the
+    /// including file's own directory, then the include dirs the build declares
+    /// (`compile_commands.json`, else a `CMakeLists.txt` scan), then the legacy
+    /// ancestor + `<ancestor>/include/` walk. A system `<vector>` include
+    /// (specifier starts with `<`) is never local: `None` binds it as an external
+    /// dependency. See [`crate::c::include_dirs`].
     fn resolve_import(&self, spec: &str, from: &Path, _ws: &Workspace) -> Option<PathBuf> {
-        if spec.starts_with('<') {
-            return None;
-        }
-        let mut dir = from.parent();
-        for _ in 0..8 {
-            let base = dir?;
-            for cand in [base.join(spec), base.join("include").join(spec)] {
-                if cand.is_file() {
-                    return cand.canonicalize().ok();
-                }
-            }
-            dir = base.parent();
-        }
-        None
+        crate::c::include_dirs::resolve(spec, from)
     }
 
     /// The dep-key of a header that didn't resolve locally: the header path with
