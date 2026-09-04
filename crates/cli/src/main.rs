@@ -2538,13 +2538,69 @@ fn cmd_daemon(args: &[String]) -> Result<()> {
     }
 }
 
-fn cmd_mcp(args: &[String]) -> Result<()> {
-    let root: PathBuf = flag_value(args, "--root").map_or_else(|| ".".into(), PathBuf::from);
-    // index-if-missing so an agent can point at a repo that was never indexed
-    if !db_path(&root)?.exists() {
-        index_project(std::slice::from_ref(&root), None)?;
+/// The projects one `ripple mcp` process answers for.
+///
+/// A tool call may name any `root`, so the server is no longer pinned to the
+/// project it was launched in (#118). Each project's graph is loaded once and
+/// kept, so an agent spanning an API repo and a web repo pays the load per
+/// project rather than per call. Omitting `root` answers from the launch root —
+/// the behavior every existing client already depends on.
+struct McpSession {
+    default_root: PathBuf,
+    graphs: HashMap<PathBuf, InMemoryGraph>,
+}
+
+impl McpSession {
+    /// Load the launch root eagerly, so a broken `--root` fails at startup
+    /// rather than on the first tool call.
+    fn new(default_root: PathBuf) -> Result<Self> {
+        let mut session = Self {
+            default_root: default_root.clone(),
+            graphs: HashMap::new(),
+        };
+        session.load(&default_root)?;
+        Ok(session)
     }
-    let mut graph = RedbStore::open(db_path(&root)?).load()?;
+
+    /// The root a call targets: its `root` argument if given, else the launch root.
+    ///
+    /// A relative path resolves against the server's cwd. A path that isn't there
+    /// is an error naming it — never an empty graph answering "no symbol".
+    fn resolve_root(&self, arg: Option<&str>) -> Result<PathBuf, String> {
+        let Some(arg) = arg else {
+            return Ok(self.default_root.clone());
+        };
+        std::fs::canonicalize(arg).map_err(|e| format!("no such project root '{arg}': {e}"))
+    }
+
+    fn graph(&mut self, root: &Path) -> Result<&mut InMemoryGraph, String> {
+        if !self.graphs.contains_key(root) {
+            self.load(root).map_err(|e| format!("{e:#}"))?;
+        }
+        self.graphs
+            .get_mut(root)
+            .ok_or_else(|| format!("no graph for {}", root.display()))
+    }
+
+    /// (Re)load `root`'s graph, indexing it first if it was never indexed — so an
+    /// agent can point at a repo ripple has not seen before.
+    fn load(&mut self, root: &Path) -> Result<()> {
+        if !db_path(root)?.exists() {
+            index_project(&[root.to_path_buf()], None)?;
+        }
+        let graph = RedbStore::open(db_path(root)?).load()?;
+        self.graphs.insert(root.to_path_buf(), graph);
+        Ok(())
+    }
+}
+
+fn cmd_mcp(args: &[String]) -> Result<()> {
+    let root_arg = flag_value(args, "--root").unwrap_or(".");
+    // canonical from the start: the same path spelled two ways must not load two
+    // graphs, and `root_tag` compares against canonical indexed roots anyway
+    let root = std::fs::canonicalize(root_arg)
+        .with_context(|| format!("no such directory: {root_arg}"))?;
+    let mut session = McpSession::new(root)?;
 
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
@@ -2569,7 +2625,7 @@ fn cmd_mcp(args: &[String]) -> Result<()> {
             })),
             "ping" => Ok(json!({})),
             "tools/list" => Ok(json!({ "tools": mcp_tools() })),
-            "tools/call" => mcp_call(&mut graph, &root, req.get("params")),
+            "tools/call" => mcp_call(&mut session, req.get("params")),
             other => Err(format!("method not found: {other}")),
         };
         let resp = match result {
@@ -2584,8 +2640,23 @@ fn cmd_mcp(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// The `root` argument every tool accepts, so an agent can span projects instead
+/// of being stuck with the one the server was launched in (#118).
+const ROOT_DESC: &str = "project root to answer from — an absolute path, or one relative to the server's working directory. Omit to use the root `ripple mcp` was launched with.";
+
 fn mcp_tools() -> Value {
-    let obj = |props: Value, req: Value| json!({ "type": "object", "properties": props, "required": req });
+    // every tool takes `root`; declaring it once keeps the description identical
+    // across the nine schemas an agent reads
+    let obj = |props: Value, req: Value| {
+        let mut props = props;
+        if let Some(map) = props.as_object_mut() {
+            map.insert(
+                "root".to_owned(),
+                json!({ "type": "string", "description": ROOT_DESC }),
+            );
+        }
+        json!({ "type": "object", "properties": props, "required": req })
+    };
     json!([
         {
             "name": "locate",
@@ -2657,6 +2728,51 @@ fn mcp_tools() -> Value {
     ])
 }
 
+/// The argument names a tool accepts, read off its own `inputSchema`.
+///
+/// Derived rather than declared so the check can never disagree with the schema
+/// the agent read out of `tools/list`.
+fn tool_arg_names(tool: &str) -> Option<Vec<String>> {
+    let tools = mcp_tools();
+    let schema = tools
+        .as_array()?
+        .iter()
+        .find(|t| t.get("name").and_then(Value::as_str) == Some(tool))?;
+    let props = schema.get("inputSchema")?.get("properties")?.as_object()?;
+    let mut names: Vec<String> = props.keys().cloned().collect();
+    names.sort();
+    Some(names)
+}
+
+/// Reject arguments a tool does not accept.
+///
+/// A silently dropped key reads as an answer: `impact` with a misspelled `root`
+/// queried the launch project and replied "no symbol 'x'", which invites the
+/// caller to conclude the code isn't there (#118).
+fn check_args(tool: &str, args: &Value) -> Result<(), String> {
+    let (Some(accepted), Some(given)) = (tool_arg_names(tool), args.as_object()) else {
+        return Ok(()); // an unknown tool is the dispatch's error to report, not ours
+    };
+    let unknown: Vec<String> = given
+        .keys()
+        .filter(|k| !accepted.contains(k))
+        .map(|k| format!("'{k}'"))
+        .collect();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    let plural = if unknown.len() == 1 {
+        "argument"
+    } else {
+        "arguments"
+    };
+    Err(format!(
+        "unknown {plural} for tool '{tool}': {} — accepted: {}",
+        unknown.join(", "),
+        accepted.join(", ")
+    ))
+}
+
 fn mcp_text(v: Value) -> Value {
     json!({ "content": [{ "type": "text", "text": v.to_string() }] })
 }
@@ -2713,11 +2829,7 @@ fn search_score(n: &ir::Node, terms: &[String]) -> u32 {
     per_term + if exact { 8 } else { 0 }
 }
 
-fn mcp_call(
-    graph: &mut InMemoryGraph,
-    root: &Path,
-    params: Option<&Value>,
-) -> Result<Value, String> {
+fn mcp_call(session: &mut McpSession, params: Option<&Value>) -> Result<Value, String> {
     let params = params.ok_or("missing params")?;
     let name = params
         .get("name")
@@ -2727,8 +2839,13 @@ fn mcp_call(
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
+    check_args(name, &a)?;
     let str_arg = |k: &str| a.get(k).and_then(Value::as_str).map(str::to_owned);
     let usize_arg = |k: &str, d: usize| a.get(k).and_then(Value::as_u64).map_or(d, |n| n as usize);
+
+    let root = session.resolve_root(str_arg("root").as_deref())?;
+    let root = root.as_path();
+    let graph = session.graph(root)?;
 
     match name {
         "reindex" => {
@@ -3542,6 +3659,80 @@ mod tests {
         assert!(
             synced.get(newfn).is_some(),
             "--sync rebuilds from the working tree and sees the new function"
+        );
+    }
+
+    #[test]
+    fn every_mcp_tool_accepts_a_root() {
+        let tools = mcp_tools();
+        for t in tools.as_array().unwrap() {
+            let name = t.get("name").and_then(Value::as_str).unwrap();
+            let root = t
+                .pointer("/inputSchema/properties/root")
+                .unwrap_or_else(|| panic!("{name} has no root argument"));
+            assert_eq!(root.get("type").and_then(Value::as_str), Some("string"));
+            assert_eq!(
+                root.get("description").and_then(Value::as_str),
+                Some(ROOT_DESC)
+            );
+            // root stays optional so pre-#118 clients keep working
+            let required = t.pointer("/inputSchema/required").unwrap();
+            assert!(
+                !required
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|r| r.as_str() == Some("root")),
+                "{name} must not require root"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_mcp_args_are_rejected_naming_the_key_and_the_accepted_ones() {
+        // the #118 report: a misspelled root used to be dropped, and the answer
+        // came back as "no symbol", which reads as "the code isn't there"
+        let err = check_args("impact", &json!({ "symbol": "x", "rooot": "/tmp" })).unwrap_err();
+        assert_eq!(
+            err,
+            "unknown argument for tool 'impact': 'rooot' — accepted: budget, root, symbol"
+        );
+
+        let err = check_args("locate", &json!({ "task": "x", "a": 1, "b": 2 })).unwrap_err();
+        assert_eq!(
+            err,
+            "unknown arguments for tool 'locate': 'a', 'b' — accepted: budget, root, task"
+        );
+
+        assert!(check_args("impact", &json!({ "symbol": "x", "root": "/tmp" })).is_ok());
+        assert!(check_args("impact", &json!({})).is_ok());
+        // an unknown tool is the dispatch's error to report
+        assert!(check_args("nope", &json!({ "whatever": 1 })).is_ok());
+    }
+
+    #[test]
+    fn mcp_session_resolves_roots_and_names_a_missing_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let launch = dir.path().canonicalize().unwrap();
+        let session = McpSession {
+            default_root: launch.clone(),
+            graphs: HashMap::new(),
+        };
+        // omitted root keeps the launch project
+        assert_eq!(session.resolve_root(None).unwrap(), launch);
+        // relative paths resolve against the server's cwd, absolute ones as given
+        assert_eq!(
+            session
+                .resolve_root(Some(&launch.to_string_lossy()))
+                .unwrap(),
+            launch
+        );
+        let err = session
+            .resolve_root(Some("/definitely/not/a/repo"))
+            .unwrap_err();
+        assert!(
+            err.contains("no such project root '/definitely/not/a/repo'"),
+            "{err}"
         );
     }
 }

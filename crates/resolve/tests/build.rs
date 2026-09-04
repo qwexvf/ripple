@@ -1504,3 +1504,515 @@ fn python_self_method_scopes_to_enclosing_class() {
         "self.request() must NOT reach the sibling class's request"
     );
 }
+
+/// Java, Tier 0–2: a dotted `import com.example.Util` resolves to the class file
+/// under the conventional source root, and the static call `Util.helper(n)`
+/// through that import reaches `Util.helper` — a method qualified by its class.
+#[test]
+fn java_import_and_static_call_resolve_across_files() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/java");
+    let r = resolve::build(&root).unwrap();
+
+    let util = SymbolId::of("src/main/java/com/example/Util.java", "Util");
+    let helper = SymbolId::of("src/main/java/com/example/Util.java", "Util.helper");
+    let run = SymbolId::of("src/main/java/com/example/App.java", "App.run");
+
+    assert!(
+        r.nodes.iter().any(|n| n.id == helper && n.name == "helper"),
+        "a method is qualified by its declaring class"
+    );
+    assert!(
+        r.edges
+            .iter()
+            .any(|e| e.dst == util && e.kind == EdgeKind::Imports),
+        "`import com.example.Util` should resolve to the class under the source root"
+    );
+    assert!(
+        r.edges
+            .iter()
+            .any(|e| e.src == run && e.dst == helper && e.kind == EdgeKind::Calls),
+        "`Util.helper(n)` should reach Util.helper across files"
+    );
+}
+
+/// #105 + #120 for Java. A parameter, a field and a `new`-initialised local all
+/// write their type down, so `u.send(n)` pins `Util.send` across files instead of
+/// splitting with the same-named `Rival.send`; and the bare `trim(n)` inside
+/// `Util.send` means `this.trim()`, so it reaches `Util.trim`, not `Rival.trim`.
+#[test]
+fn java_typed_receivers_and_self_calls_pin_the_right_class() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/java");
+    let r = resolve::build(&root).unwrap();
+
+    let app = "src/main/java/com/example/App.java";
+    let util_file = "src/main/java/com/example/Util.java";
+    let util_send = SymbolId::of(util_file, "Util.send");
+    let rival_send = SymbolId::of(util_file, "Rival.send");
+    let util_trim = SymbolId::of(util_file, "Util.trim");
+    let rival_trim = SymbolId::of(util_file, "Rival.trim");
+
+    let confs = |src: SymbolId, dst: SymbolId| -> Vec<f32> {
+        r.edges
+            .iter()
+            .filter(|e| e.src == src && e.dst == dst && e.kind == EdgeKind::Calls)
+            .map(|e| e.confidence)
+            .collect()
+    };
+    for caller in ["App.viaParam", "App.viaField", "App.viaLocal"] {
+        let src = SymbolId::of(app, caller);
+        assert_eq!(confs(src, util_send), [0.85], "{caller} types its receiver");
+        assert!(
+            confs(src, rival_send).is_empty(),
+            "{caller} must not reach the same-named method of another class"
+        );
+    }
+    assert_eq!(
+        confs(util_send, util_trim),
+        [0.9],
+        "bare `trim(n)` inside Util.send is `this.trim()` (#120)"
+    );
+    assert!(
+        confs(util_send, rival_trim).is_empty(),
+        "and never Rival.trim"
+    );
+
+    // and the fallback is untouched: a receiver whose type is not written down
+    // still reaches both same-named methods, honestly split 1/N
+    let unknown = SymbolId::of(app, "App.viaUnknown");
+    assert_eq!(confs(unknown, util_send), [0.3]);
+    assert_eq!(confs(unknown, rival_send), [0.3]);
+}
+
+/// Kotlin, Tier 0–2: `import com.example.Util` maps the dotted path to
+/// `com/example/Util.kt` under the source root, and a member call on an instance
+/// of the imported class reaches `Util.send` in that file.
+#[test]
+fn kotlin_import_and_member_call_resolve_across_files() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/kotlin");
+    let r = resolve::build(&root).unwrap();
+
+    let util = SymbolId::of("src/main/kotlin/com/example/Util.kt", "Util");
+    let send = SymbolId::of("src/main/kotlin/com/example/Util.kt", "Util.send");
+    let helper = SymbolId::of("src/main/kotlin/com/example/Util.kt", "helper");
+    let run = SymbolId::of("src/main/kotlin/com/example/App.kt", "run");
+
+    assert!(
+        r.edges
+            .iter()
+            .any(|e| e.dst == util && e.kind == EdgeKind::Imports),
+        "`import com.example.Util` should resolve to com/example/Util.kt"
+    );
+    assert!(
+        r.edges
+            .iter()
+            .any(|e| e.src == run && e.dst == send && e.kind == EdgeKind::Calls),
+        "`u.send(n)` should reach Util.send across files"
+    );
+    assert!(
+        r.edges
+            .iter()
+            .any(|e| e.src == send && e.dst == helper && e.kind == EdgeKind::Calls),
+        "a method should reach a top-level function in its own file"
+    );
+}
+
+/// #105 + #120 for Kotlin. `val u = Util()`, `val u: Util = …` and `fun f(u: Util)`
+/// each pin `Util.send` rather than splitting with `Rival.send`; the bare `trim(n)`
+/// inside `Util.send` is `this.trim()`, while the bare `helper(n)` beside it still
+/// reaches the top-level function, because `Util` declares no `helper`.
+#[test]
+fn kotlin_typed_receivers_and_self_calls_pin_the_right_class() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/kotlin");
+    let r = resolve::build(&root).unwrap();
+
+    let app = "src/main/kotlin/com/example/App.kt";
+    let util_file = "src/main/kotlin/com/example/Util.kt";
+    let util_send = SymbolId::of(util_file, "Util.send");
+    let rival_send = SymbolId::of(util_file, "Rival.send");
+    let util_trim = SymbolId::of(util_file, "Util.trim");
+    let rival_trim = SymbolId::of(util_file, "Rival.trim");
+    let helper = SymbolId::of(util_file, "helper");
+
+    let confs = |src: SymbolId, dst: SymbolId| -> Vec<f32> {
+        r.edges
+            .iter()
+            .filter(|e| e.src == src && e.dst == dst && e.kind == EdgeKind::Calls)
+            .map(|e| e.confidence)
+            .collect()
+    };
+    for caller in ["run", "viaAscription", "viaParam"] {
+        let src = SymbolId::of(app, caller);
+        assert_eq!(confs(src, util_send), [0.85], "{caller} types its receiver");
+        assert!(
+            confs(src, rival_send).is_empty(),
+            "{caller} must not reach Rival.send"
+        );
+    }
+    assert_eq!(
+        confs(util_send, util_trim),
+        [0.9],
+        "`trim(n)` is `this.trim()`"
+    );
+    assert!(
+        confs(util_send, rival_trim).is_empty(),
+        "and never Rival.trim"
+    );
+    assert_eq!(
+        confs(util_send, helper),
+        [0.95],
+        "a bare call the class does not declare still reaches the top-level function"
+    );
+}
+
+/// Scala, Tier 0–2: `import a.b.C` maps the dotted path to `a/b/C.scala`, and the
+/// selector call `C.helper(n)` through that import reaches `C.helper` — a method
+/// qualified by the object it lives in.
+#[test]
+fn scala_import_and_selector_call_resolve_across_files() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/scala");
+    let r = resolve::build(&root).unwrap();
+
+    let c = SymbolId::of("a/b/C.scala", "C");
+    let helper = SymbolId::of("a/b/C.scala", "C.helper");
+    let free = SymbolId::of("a/b/C.scala", "free");
+    let run = SymbolId::of("x/Main.scala", "Main.run");
+
+    assert_ne!(
+        helper, free,
+        "a method is qualified by its owner, a def is not"
+    );
+    assert!(
+        r.edges
+            .iter()
+            .any(|e| e.dst == c && e.kind == EdgeKind::Imports),
+        "`import a.b.C` should resolve to a/b/C.scala"
+    );
+    assert!(
+        r.edges
+            .iter()
+            .any(|e| e.src == run && e.dst == helper && e.kind == EdgeKind::Calls),
+        "`C.helper(n)` should reach C.helper across files"
+    );
+}
+
+/// #105 + #120 for Scala. An ascribed `val b: Box` and a `def m(b: Box)` parameter
+/// pin `Box.send`; the bare `trim(n)` inside `Box.send` is `this.trim()`.
+#[test]
+fn scala_typed_receivers_and_self_calls_pin_the_right_class() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/scala");
+    let r = resolve::build(&root).unwrap();
+
+    let box_send = SymbolId::of("a/b/C.scala", "Box.send");
+    let rival_send = SymbolId::of("a/b/C.scala", "Rival.send");
+    let box_trim = SymbolId::of("a/b/C.scala", "Box.trim");
+    let rival_trim = SymbolId::of("a/b/C.scala", "Rival.trim");
+
+    let confs = |src: SymbolId, dst: SymbolId| -> Vec<f32> {
+        r.edges
+            .iter()
+            .filter(|e| e.src == src && e.dst == dst && e.kind == EdgeKind::Calls)
+            .map(|e| e.confidence)
+            .collect()
+    };
+    for caller in ["Main.viaParam", "Main.viaVal"] {
+        let src = SymbolId::of("x/Main.scala", caller);
+        assert_eq!(confs(src, box_send), [0.85], "{caller} types its receiver");
+        assert!(
+            confs(src, rival_send).is_empty(),
+            "{caller} must not reach Rival.send"
+        );
+    }
+    assert_eq!(
+        confs(box_send, box_trim),
+        [0.9],
+        "`trim(n)` is `this.trim()`"
+    );
+    assert!(
+        confs(box_send, rival_trim).is_empty(),
+        "and never Rival.trim"
+    );
+}
+
+/// C#, Tier 0–2. A `using` names a *namespace*, not a file, so the adapter
+/// deliberately resolves no local path and mints an external namespace node
+/// instead — that is the honest import target. Calls still cross files: the
+/// type-qualified `Util.Helper(n)` binds by owner.
+#[test]
+fn csharp_using_is_external_and_a_qualified_call_still_crosses_files() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/csharp");
+    let r = resolve::build(&root).unwrap();
+
+    let helper = SymbolId::of("Util.cs", "Util.Helper");
+    let send = SymbolId::of("Util.cs", "Util.Send");
+    let run = SymbolId::of("App.cs", "App.Run");
+
+    let ns_imports: Vec<&str> = r
+        .edges
+        .iter()
+        .filter(|e| e.kind == EdgeKind::Imports)
+        .filter_map(|e| r.nodes.iter().find(|n| n.id == e.dst))
+        .filter(|n| n.kind == ir::NodeKind::External)
+        .map(|n| n.name.as_str())
+        .collect();
+    assert!(
+        ns_imports.contains(&"Demo") && ns_imports.contains(&"System.Text"),
+        "a `using` imports an external namespace node: {ns_imports:?}"
+    );
+
+    assert!(
+        r.edges
+            .iter()
+            .any(|e| e.src == run && e.dst == helper && e.kind == EdgeKind::Calls),
+        "`Util.Helper(n)` should reach Util.Helper across files"
+    );
+    assert!(
+        r.edges
+            .iter()
+            .any(|e| e.src == send && e.dst == helper && e.kind == EdgeKind::Calls),
+        "a bare call inside the type should reach its sibling method"
+    );
+}
+
+/// #105 + #120 for C#. A parameter, a field and `var x = new Util()` all write the
+/// type down, so `u.Send(n)` pins `Util.Send` instead of splitting with
+/// `Rival.Send`; the bare `Trim(n)` inside `Util.Send` is `this.Trim()`.
+#[test]
+fn csharp_typed_receivers_and_self_calls_pin_the_right_class() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/csharp");
+    let r = resolve::build(&root).unwrap();
+
+    let util_send = SymbolId::of("Util.cs", "Util.Send");
+    let rival_send = SymbolId::of("Util.cs", "Rival.Send");
+    let util_trim = SymbolId::of("Util.cs", "Util.Trim");
+    let rival_trim = SymbolId::of("Util.cs", "Rival.Trim");
+
+    let confs = |src: SymbolId, dst: SymbolId| -> Vec<f32> {
+        r.edges
+            .iter()
+            .filter(|e| e.src == src && e.dst == dst && e.kind == EdgeKind::Calls)
+            .map(|e| e.confidence)
+            .collect()
+    };
+    for caller in ["App.ViaParam", "App.ViaField", "App.ViaVar"] {
+        let src = SymbolId::of("App.cs", caller);
+        assert_eq!(confs(src, util_send), [0.85], "{caller} types its receiver");
+        assert!(
+            confs(src, rival_send).is_empty(),
+            "{caller} must not reach Rival.Send"
+        );
+    }
+    assert_eq!(
+        confs(util_send, util_trim),
+        [0.9],
+        "`Trim(n)` is `this.Trim()`"
+    );
+    assert!(
+        confs(util_send, rival_trim).is_empty(),
+        "and never Rival.Trim"
+    );
+}
+
+/// C, Tier 0–2: a quoted `#include` resolves against the including file's own
+/// directory and against an `include/` root above it, a system `<stdio.h>` mints
+/// an external node, and a struct field is qualified by its struct.
+///
+/// Also the C linkage model (#116): `main.c` calls `util_helper()`, defined in
+/// `util.c`, with nothing but an `#include` in between — an include binds a file,
+/// not the names in it, so the edge comes from the project-wide file-scope lookup
+/// the C adapter opts into via `bare_calls_resolve_globally`. `bump()` is `static`
+/// in `util.c`, so the same call from `main.c` must resolve to nothing.
+#[test]
+fn c_includes_resolve_locally_and_to_an_include_root() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/c");
+    let r = resolve::build(&root).unwrap();
+
+    let main_mod = SymbolId::module("src/main.c");
+    let util_h = SymbolId::module("src/util.h");
+    let api_h = SymbolId::module("include/lib/api.h");
+    let util_helper = SymbolId::of("src/util.c", "util_helper");
+    let bump = SymbolId::of("src/util.c", "bump");
+    let main = SymbolId::of("src/main.c", "main");
+
+    let imports_from_main = |dst: SymbolId| {
+        r.edges
+            .iter()
+            .any(|e| e.src == main_mod && e.dst == dst && e.kind == EdgeKind::Imports)
+    };
+    assert!(
+        imports_from_main(util_h),
+        "`#include \"util.h\"` should resolve beside the including file"
+    );
+    assert!(
+        imports_from_main(api_h),
+        "`#include \"lib/api.h\"` should resolve under an `include/` root above the file"
+    );
+    assert!(
+        r.nodes
+            .iter()
+            .any(|n| n.id == SymbolId::of("src/util.h", "Point.x")),
+        "a struct field is qualified by its struct"
+    );
+    assert!(
+        r.edges
+            .iter()
+            .any(|e| e.src == util_helper && e.dst == bump && e.kind == EdgeKind::Calls),
+        "a bare call should reach a file-local function"
+    );
+
+    let cross_file: Vec<f32> = r
+        .edges
+        .iter()
+        .filter(|e| e.src == main && e.dst == util_helper && e.kind == EdgeKind::Calls)
+        .map(|e| e.confidence)
+        .collect();
+    assert_eq!(
+        cross_file,
+        [0.8],
+        "a bare cross-file call binds to the one non-static definition of the name"
+    );
+    assert!(
+        !r.edges
+            .iter()
+            .any(|e| e.src == main && e.dst == bump && e.kind == EdgeKind::Calls),
+        "a `static` definition in another file has internal linkage — never a target"
+    );
+
+    let external: Vec<&str> = r
+        .nodes
+        .iter()
+        .filter(|n| n.kind == ir::NodeKind::External)
+        .map(|n| n.name.as_str())
+        .collect();
+    assert!(
+        external.contains(&"stdio.h"),
+        "a system include mints an external node: {external:?}"
+    );
+}
+
+/// C++, Tier 0–2: a quoted `#include` of a local header resolves, an out-of-line
+/// `void Foo::bar()` is qualified `Foo.bar` off its `::` scope, and a member call
+/// on a local `Foo` reaches that definition in the other file.
+///
+/// Plus the two halves of #116. A bare `free_helper(n)` reaches the definition in
+/// `app.cc` through the flat linkage namespace, not through the `#include`. And
+/// `f.bar()` lands on exactly one node: the header's `void bar();` prototype is a
+/// declaration, so it is not captured as a method and cannot split the call 1/N
+/// with the definition that implements it.
+#[test]
+fn cpp_include_and_member_call_resolve_across_files() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cpp");
+    let r = resolve::build(&root).unwrap();
+
+    let main_mod = SymbolId::module("src/main.cc");
+    let header = SymbolId::module("src/app.hpp");
+    let bar_def = SymbolId::of("src/app.cc", "Foo.bar");
+    let free_helper = SymbolId::of("src/app.cc", "free_helper");
+    let run = SymbolId::of("src/main.cc", "run");
+
+    assert!(
+        r.nodes.iter().any(|n| n.id == bar_def && n.name == "bar"),
+        "`void Foo::bar()` is qualified by the owner in its `::` scope"
+    );
+    assert!(
+        r.edges
+            .iter()
+            .any(|e| e.src == main_mod && e.dst == header && e.kind == EdgeKind::Imports),
+        "`#include \"app.hpp\"` should resolve to the local header"
+    );
+    assert!(
+        !r.nodes
+            .iter()
+            .any(|n| n.id == SymbolId::of("src/app.hpp", "Foo.bar")),
+        "`void bar();` in the header is a declaration, not a second definition"
+    );
+    let to_bar: Vec<f32> = r
+        .edges
+        .iter()
+        .filter(|e| e.src == run && e.dst == bar_def && e.kind == EdgeKind::Calls)
+        .map(|e| e.confidence)
+        .collect();
+    assert_eq!(
+        to_bar,
+        [0.85],
+        "`f.bar()` pins the one Foo::bar definition — `Foo f;` types the receiver (#105)"
+    );
+    assert!(
+        r.edges
+            .iter()
+            .any(|e| e.src == bar_def && e.dst == free_helper && e.kind == EdgeKind::Calls),
+        "a member should reach a free function in its own file"
+    );
+
+    let to_helper: Vec<f32> = r
+        .edges
+        .iter()
+        .filter(|e| e.src == run && e.dst == free_helper && e.kind == EdgeKind::Calls)
+        .map(|e| e.confidence)
+        .collect();
+    assert_eq!(
+        to_helper,
+        [0.8],
+        "a bare `free_helper(n)` reaches the definition in the other file by linkage"
+    );
+}
+
+/// #105 for C++: `Foo f; f.bar();` reaches `Foo::bar` and *only* that one, even
+/// though `Other::bar` shares the name. Before the bindings query the receiver
+/// had no type, so both were candidates at 1/N.
+#[test]
+fn cpp_typed_local_pins_the_owning_class_method() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cpp");
+    let r = resolve::build(&root).unwrap();
+
+    let run = SymbolId::of("src/main.cc", "run");
+    let foo_bar = SymbolId::of("src/app.cc", "Foo.bar");
+    let other_bar = SymbolId::of("src/app.hpp", "Other.bar");
+
+    let targets = |dst: SymbolId| -> Vec<f32> {
+        r.edges
+            .iter()
+            .filter(|e| e.src == run && e.dst == dst && e.kind == EdgeKind::Calls)
+            .map(|e| e.confidence)
+            .collect()
+    };
+    assert_eq!(targets(foo_bar), [0.85], "`Foo f; f.bar()` → Foo::bar");
+    assert_eq!(
+        targets(other_bar),
+        [0.85],
+        "`Other o; o.bar()` → Other::bar"
+    );
+    assert!(
+        !r.edges
+            .iter()
+            .any(|e| e.src == run && e.dst == other_bar && e.site.start_line == 7),
+        "the `f.bar()` line must not also reach the same-named method of another class"
+    );
+}
+
+/// #120: a bare `close()` inside `~Foo()` means `this->close()` — `Foo::close`,
+/// defined in the *other* file — not the inline `Other::close` that the bare-name
+/// ladder finds first in this one. The destructor has no tags.scm capture, so the
+/// enclosing definition is the class itself.
+#[test]
+fn cpp_bare_call_in_a_member_scopes_to_its_own_class() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cpp");
+    let r = resolve::build(&root).unwrap();
+
+    let foo = SymbolId::of("src/app.hpp", "Foo");
+    let foo_close = SymbolId::of("src/app.cc", "Foo.close");
+    let other_close = SymbolId::of("src/app.hpp", "Other.close");
+
+    let confs: Vec<f32> = r
+        .edges
+        .iter()
+        .filter(|e| e.src == foo && e.dst == foo_close && e.kind == EdgeKind::Calls)
+        .map(|e| e.confidence)
+        .collect();
+    assert_eq!(confs, [0.9], "`close()` in ~Foo() binds Foo::close");
+    assert!(
+        !r.edges
+            .iter()
+            .any(|e| e.src == foo && e.dst == other_close && e.kind == EdgeKind::Calls),
+        "and never the same-named method of an unrelated class (#120)"
+    );
+}

@@ -1,6 +1,6 @@
 ---
 title: "MCP reference"
-description: "Wire ripple into Claude Code, Cursor, or any MCP client — the eight tools and the contracts they honour"
+description: "Wire ripple into Claude Code, Cursor, or any MCP client — the nine tools and the contracts they honour"
 sidebar:
   label: "MCP"
   order: 2
@@ -31,10 +31,37 @@ Or by config, for any client that reads the standard shape:
 }
 ```
 
-`--root` is where the graph lives. To trace across repositories, index them together
-first (`ripple index repo-a repo-b`) and point `--root` at the root that holds the graph.
+`--root` is the default project — where the graph lives when a call doesn't say otherwise.
+To trace across repositories, index them together first (`ripple index repo-a repo-b`) and
+point `--root` at the root that holds the graph.
+
+## Targeting a project: `root`
+
+Every tool takes an optional `root`, the mirror of the CLI's `--root`: an absolute path, or
+one relative to the server's working directory. Omit it and the call answers from the root
+`ripple mcp` was launched with, so existing clients need no change. A root that has never
+been indexed is indexed on first use, and each project's graph is loaded once and kept for
+the life of the process — so one server can answer about an API repo and a web repo in the
+same session.
+
+A path that isn't there is an error naming it (`no such project root '/nope': No such file
+or directory`), never an empty graph answering "no symbol".
+
+## Unknown arguments are errors
+
+An argument a tool doesn't declare is rejected, naming the offending key and the accepted
+ones:
+
+```json
+{"code": -32603, "message": "unknown argument for tool 'impact': 'rooot' — accepted: budget, root, symbol"}
+```
+
+A dropped key used to read as an answer: a misspelled `root` queried the launch project and
+replied "no symbol 'x'", which invites the caller to conclude the code isn't there.
 
 ## Tools
+
+Every tool also accepts `root` (see above); it is left out of the table below.
 
 | Tool | Required | Optional | What it answers |
 |---|---|---|---|

@@ -35,8 +35,10 @@ Flags shared by nearly every command:
 Builds the graph and writes it to `<root>/.ripple/graph.redb`. Defaults to `.` when no
 path is given.
 
-Languages: TypeScript, TSX, Python, Rust, Elixir, Go, Gleam, GraphQL. Go and Gleam
-need `--calls lsp` for their call graph; the rest resolve calls from the source.
+Languages: TypeScript, TSX, Python, Rust, Elixir, Go, Gleam, Ruby, PHP, Java, Scala,
+Kotlin, C#, C, C++, Svelte, Vue, HTML, GraphQL. Go and Gleam need `--calls lsp` for
+their call graph, and GraphQL has no call query (a schema declares types, it does not
+call anything); the rest resolve calls from the source.
 OpenAPI and Swagger documents are read too — as endpoint declarations, not as code.
 An `.html` file's `<script>` block is parsed as TypeScript in place, so its symbols
 and call edges resolve like a `.ts` file's — the seam single-file components

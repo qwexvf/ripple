@@ -2,17 +2,23 @@
 //! `.scm` query data files). Adding a language = a new module + a registry line;
 //! nothing above `ir` changes. See docs/05-language-support.md.
 
+pub mod c;
+pub mod cpp;
 pub mod cross;
+pub mod csharp;
 pub mod elixir;
 pub mod gleam;
 pub mod go;
 pub mod graphql;
 pub mod html;
+pub mod java;
+pub mod kotlin;
 pub mod php;
 pub mod python;
 pub mod resolve_import;
 pub mod ruby;
 pub mod rust;
+pub mod scala;
 pub mod sfc;
 pub mod spec;
 pub mod svelte;
@@ -185,6 +191,50 @@ pub trait LanguageAdapter: Send + Sync {
         false
     }
 
+    /// Does an *unqualified* call in this language resolve against every
+    /// file-scope name in the project, rather than only what the calling file
+    /// defines or imports? Default: no.
+    ///
+    /// Answer `true` only for a language with a single flat namespace for
+    /// external linkage — C and C++ are the cases. There, `foo(1)` in one
+    /// translation unit binds to the one non-`static` `foo` anywhere in the
+    /// program; the linker performs exactly this project-wide name lookup, and
+    /// the `#include` that made the prototype visible names a *file*, never the
+    /// names inside it. Without this signal a `.h`/`.c` split project gets a
+    /// same-file-only call graph (#116).
+    ///
+    /// Every other language ripple indexes answers `false`, and must: in a
+    /// language where names live in modules, classes, or packages, matching a bare
+    /// name across the project fabricates edges rather than finding them — the
+    /// `Vec::new()` problem that `resolve_qualified` already guards against.
+    ///
+    /// The resolver still only consults *exported* definitions (`is_exported`),
+    /// so a `static` function in another file is correctly unreachable, and it
+    /// still splits confidence `1/N` across genuine ambiguity.
+    fn bare_calls_resolve_globally(&self) -> bool {
+        false
+    }
+
+    /// Does an *unqualified* call written inside a member function body mean
+    /// `this.m()` — a call on the enclosing class — rather than a free function?
+    /// Default: no.
+    ///
+    /// Answer `true` for a class-based language where a member's own methods are
+    /// in scope unqualified: C++, Java, C#, Kotlin, Scala. There, `close()` inside
+    /// `~buffered_file()` is `this->close()`, but it is extracted as a plain
+    /// `@ref.call` with no receiver, so without this signal it falls to the
+    /// bare-name ladder and can bind — confidently — to a same-named method on an
+    /// unrelated class (#120, the C++ analogue of #104). The resolver only takes
+    /// this path when the enclosing class really does define a method of that
+    /// name; anything else falls through to the ordinary ladder, so a top-level
+    /// Kotlin function or a C free function is unaffected.
+    ///
+    /// `false` for a language where an unqualified name is never an implicit
+    /// member access — Python and Rust spell it `self.m()`, Go `r.M()`.
+    fn bare_call_in_method_is_self_call(&self) -> bool {
+        false
+    }
+
     /// Qualified name for a definition (e.g. TS methods → `Class.method` so
     /// same-named methods don't collide). Default: the bare name.
     fn qualified_name(
@@ -301,6 +351,12 @@ pub fn registry() -> Vec<Box<dyn LanguageAdapter>> {
         Box::new(html::Adapter::new()),
         Box::new(php::Adapter::new()),
         Box::new(ruby::Adapter::new()),
+        Box::new(java::Adapter::new()),
+        Box::new(scala::Adapter::new()),
+        Box::new(kotlin::Adapter::new()),
+        Box::new(csharp::Adapter::new()),
+        Box::new(c::Adapter::new()),
+        Box::new(cpp::Adapter::new()),
         Box::new(svelte::Adapter::new()),
         Box::new(vue::Adapter::new()),
     ]
@@ -375,6 +431,24 @@ mod tests {
     fn fingerprint_is_stable_across_calls() {
         assert_eq!(super::registry_fingerprint(), super::registry_fingerprint());
         assert_eq!(super::registry_fingerprint().len(), 16);
+    }
+
+    /// `.h` must reach the C++ adapter, not the C one. The convention for C++
+    /// headers is overwhelmingly `.h`, and the C grammar cannot parse a
+    /// `namespace`/`template` — when C claimed the glob, a C++ header extracted
+    /// zero symbols (#119). Registration order decides this, so pin it.
+    #[test]
+    fn a_dot_h_header_belongs_to_the_cpp_adapter() {
+        let reg = super::registry();
+        let id = |p: &str| {
+            super::adapter_for(&reg, std::path::Path::new(p))
+                .map(super::LanguageAdapter::id)
+                .unwrap_or("none")
+        };
+        assert_eq!(id("include/fmt/format.h"), "cpp");
+        assert_eq!(id("src/jv.c"), "c");
+        assert_eq!(id("src/app.cc"), "cpp");
+        assert_eq!(id("src/app.hpp"), "cpp");
     }
 
     /// The fingerprint must actually fold in the query sources — a build with an
