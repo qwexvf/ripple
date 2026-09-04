@@ -5,6 +5,8 @@
 //! and file-scope declarations "variables". Linkage stands in for visibility —
 //! a top-level symbol is externally visible unless it is declared `static`.
 
+pub mod include_dirs;
+
 use crate::{LanguageAdapter, Workspace};
 use std::path::{Path, PathBuf};
 use tree_sitter::Node;
@@ -58,28 +60,17 @@ impl LanguageAdapter for Adapter {
         Some(include_str!("queries/refs.scm"))
     }
 
-    /// A quoted `#include "foo.h"` names a local header. C has no `./` convention —
-    /// the path is relative to the including file's directory or to a project
-    /// include root above it — so probe the file's own directory first, then walk
-    /// up a bounded number of ancestors, trying both `<ancestor>/foo.h` and the
-    /// very common `<ancestor>/include/foo.h` layout. A system `<stdio.h>` include
-    /// (specifier starts with `<`) is never local: return `None` so it binds as an
-    /// external dependency via `external_dep_key`.
+    /// A quoted `#include "foo.h"` names a local header, but where that header
+    /// lives is a property of the build: the preprocessor looks beside the
+    /// including file and then along the `-I` search path. So probe the file's own
+    /// directory, then the include dirs the build declares
+    /// ([`include_dirs`] — `compile_commands.json`, else a `CMakeLists.txt` scan),
+    /// then fall back to the ancestor + `<ancestor>/include/` walk that predates
+    /// build discovery. A system `<stdio.h>` include (specifier starts with `<`) is
+    /// never local: `None` binds it as an external dependency via
+    /// `external_dep_key`.
     fn resolve_import(&self, spec: &str, from: &Path, _ws: &Workspace) -> Option<PathBuf> {
-        if spec.starts_with('<') {
-            return None;
-        }
-        let mut dir = from.parent();
-        for _ in 0..8 {
-            let base = dir?;
-            for cand in [base.join(spec), base.join("include").join(spec)] {
-                if cand.is_file() {
-                    return cand.canonicalize().ok();
-                }
-            }
-            dir = base.parent();
-        }
-        None
+        include_dirs::resolve(spec, from)
     }
 
     /// The dep-key of a header that didn't resolve locally: the header path with
@@ -347,6 +338,242 @@ mod tests {
                 ("field".to_owned(), "U.a".to_owned()),
                 ("field".to_owned(), "U.b".to_owned()),
             ]
+        );
+    }
+
+    /// A scratch tree that cleans itself up. `tempfile` is not a dev-dependency
+    /// of this crate, and each test needs its own directory because include-dir
+    /// discovery is memoized by the importing file's directory.
+    struct ScratchDir(PathBuf);
+
+    impl ScratchDir {
+        fn new() -> ScratchDir {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path =
+                std::env::temp_dir().join(format!("ripple-c-inc-{}-{n}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("mkdir scratch");
+            // the platform temp dir is a symlink on macOS; canonicalize once so
+            // every expected path in a test is comparable to a resolved one
+            ScratchDir(path.canonicalize().expect("canonicalize scratch"))
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+
+        fn file(&self, rel: &str, body: &str) -> PathBuf {
+            let path = self.0.join(rel);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("mkdir");
+            }
+            std::fs::write(&path, body).expect("write");
+            path
+        }
+
+        fn dir(&self, rel: &str) -> PathBuf {
+            let path = self.0.join(rel);
+            std::fs::create_dir_all(&path).expect("mkdir");
+            path
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A tree whose header sits somewhere no ancestor probe can reach:
+    /// `vendor/hdrs/vendorfoo.h`, included from `src/main.c`. Returns the scratch dir,
+    /// so the caller can drop a compile DB or a CMakeLists into it.
+    fn out_of_tree_header_fixture() -> ScratchDir {
+        let dir = ScratchDir::new();
+        dir.file("src/main.c", "");
+        dir.file("vendor/hdrs/vendorfoo.h", "");
+        dir
+    }
+
+    /// The include dir is declared only by the compile DB — no ancestor of
+    /// `src/main.c` contains `foo.h` or `include/foo.h` — so this resolves only if
+    /// the `-I` flag was read.
+    #[test]
+    fn compile_db_command_form_resolves_an_out_of_tree_include() {
+        let dir = out_of_tree_header_fixture();
+        let root = dir.path().to_string_lossy().into_owned();
+        dir.file(
+            "compile_commands.json",
+            &format!(
+                r#"[{{"directory":"{root}","command":"cc -c -I{root}/vendor/hdrs src/main.c","file":"{root}/src/main.c"}}]"#
+            ),
+        );
+
+        assert_eq!(
+            Adapter::new().resolve_import(
+                "vendorfoo.h",
+                &dir.path().join("src/main.c"),
+                &Workspace::default()
+            ),
+            dir.path()
+                .join("vendor/hdrs/vendorfoo.h")
+                .canonicalize()
+                .ok()
+        );
+    }
+
+    /// The `arguments` array form, and a compile DB in a `build/` subdirectory
+    /// with `directory` pointing at it, so the `-I` is relative to the build dir.
+    #[test]
+    fn compile_db_arguments_form_in_a_build_dir_resolves() {
+        let dir = out_of_tree_header_fixture();
+        let root = dir.path().to_string_lossy().into_owned();
+        dir.dir("build");
+        dir.file(
+            "build/compile_commands.json",
+            &format!(
+                r#"[{{"directory":"{root}/build","arguments":["cc","-c","-I","../vendor/hdrs","../src/main.c"],"file":"../src/main.c"}}]"#
+            ),
+        );
+
+        assert_eq!(
+            Adapter::new().resolve_import(
+                "vendorfoo.h",
+                &dir.path().join("src/main.c"),
+                &Workspace::default()
+            ),
+            dir.path()
+                .join("vendor/hdrs/vendorfoo.h")
+                .canonicalize()
+                .ok()
+        );
+    }
+
+    /// `-isystem` and `-iquote` carry first-party headers just as often as `-I`.
+    #[test]
+    fn compile_db_isystem_and_iquote_are_read() {
+        for flag in ["-isystem", "-iquote"] {
+            let dir = out_of_tree_header_fixture();
+            let root = dir.path().to_string_lossy().into_owned();
+            dir.file(
+                "compile_commands.json",
+                &format!(
+                    r#"[{{"directory":"{root}","command":"cc -c {flag} {root}/vendor/hdrs src/main.c","file":"src/main.c"}}]"#
+                ),
+            );
+
+            assert_eq!(
+                Adapter::new().resolve_import(
+                    "vendorfoo.h",
+                    &dir.path().join("src/main.c"),
+                    &Workspace::default()
+                ),
+                dir.path()
+                    .join("vendor/hdrs/vendorfoo.h")
+                    .canonicalize()
+                    .ok(),
+                "{flag}"
+            );
+        }
+    }
+
+    /// A header is not a translation unit, so the compile DB has no entry of its
+    /// own for it and only the flattened union of every target's `-I` is
+    /// available — which must not outrank a nearer, correct neighbour. On libgit2,
+    /// `src/cli/win32/precompiled.h`'s `#include "common.h"` is `src/cli/common.h`,
+    /// not the `src/libgit2/common.h` that another target's `-I` points at.
+    #[test]
+    fn a_nearby_header_beats_another_targets_include_dir() {
+        let dir = ScratchDir::new();
+        dir.file("src/cli/common.h", "");
+        dir.file("src/cli/win32/precompiled.h", "");
+        dir.file("src/libgit2/common.h", "");
+        let root = dir.path().to_string_lossy().into_owned();
+        dir.file(
+            "compile_commands.json",
+            &format!(
+                r#"[{{"directory":"{root}","command":"cc -c -I{root}/src/libgit2 src/libgit2/x.c","file":"src/libgit2/x.c"}}]"#
+            ),
+        );
+
+        assert_eq!(
+            Adapter::new().resolve_import(
+                "common.h",
+                &dir.path().join("src/cli/win32/precompiled.h"),
+                &Workspace::default()
+            ),
+            dir.path().join("src/cli/common.h").canonicalize().ok()
+        );
+    }
+
+    /// With no compile DB anywhere, `target_include_directories` in a
+    /// `CMakeLists.txt` is the fallback source of include dirs.
+    #[test]
+    fn cmake_lists_fallback_resolves_an_out_of_tree_include() {
+        let dir = out_of_tree_header_fixture();
+        dir.file(
+            "CMakeLists.txt",
+            "project(demo)\nadd_library(demo src/main.c)\ntarget_include_directories(demo PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/vendor/hdrs)\n",
+        );
+
+        assert_eq!(
+            Adapter::new().resolve_import(
+                "vendorfoo.h",
+                &dir.path().join("src/main.c"),
+                &Workspace::default()
+            ),
+            dir.path()
+                .join("vendor/hdrs/vendorfoo.h")
+                .canonicalize()
+                .ok()
+        );
+    }
+
+    /// A system header still returns `None` even when a compile DB is present, and
+    /// a header that no declared dir contains does too — nothing is invented.
+    #[test]
+    fn a_system_header_and_an_unknown_header_stay_unresolved() {
+        let dir = out_of_tree_header_fixture();
+        let root = dir.path().to_string_lossy().into_owned();
+        dir.file(
+            "compile_commands.json",
+            &format!(
+                r#"[{{"directory":"{root}","command":"cc -c -I{root}/vendor/hdrs src/main.c","file":"src/main.c"}}]"#
+            ),
+        );
+        let from = dir.path().join("src/main.c");
+        let adapter = Adapter::new();
+
+        assert_eq!(
+            adapter.resolve_import("<stdio.h>", &from, &Workspace::default()),
+            None
+        );
+        assert_eq!(
+            adapter.resolve_import("stdio.h", &from, &Workspace::default()),
+            None
+        );
+        assert_eq!(
+            adapter.resolve_import("nowhere.h", &from, &Workspace::default()),
+            None
+        );
+    }
+
+    /// A malformed compile DB yields no include dirs, and resolution falls through
+    /// to the ancestor probe exactly as it did before build discovery existed.
+    #[test]
+    fn a_malformed_compile_db_falls_through_to_the_legacy_probe() {
+        let dir = ScratchDir::new();
+        dir.file("src/main.c", "");
+        dir.file("include/lib/api.h", "");
+        dir.file("compile_commands.json", "{ this is not json");
+
+        assert_eq!(
+            Adapter::new().resolve_import(
+                "lib/api.h",
+                &dir.path().join("src/main.c"),
+                &Workspace::default()
+            ),
+            dir.path().join("include/lib/api.h").canonicalize().ok()
         );
     }
 
