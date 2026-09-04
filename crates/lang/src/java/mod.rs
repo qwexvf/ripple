@@ -57,6 +57,15 @@ impl LanguageAdapter for Adapter {
         Some(include_str!("queries/refs.scm"))
     }
 
+    fn bindings_query(&self) -> Option<&'static str> {
+        Some(include_str!("queries/bindings.scm"))
+    }
+
+    /// `helper()` inside an instance method is `this.helper()` (#120).
+    fn bare_call_in_method_is_self_call(&self) -> bool {
+        true
+    }
+
     /// Resolve a dotted FQN import to a source file inside the indexed tree.
     ///
     /// `com.google.gson.Gson` names the class `com/google/gson/Gson.java`, but the
@@ -213,6 +222,112 @@ mod tests {
             .expect("imports.scm");
         tree_sitter::Query::new(&lang, adapter.refs_query().expect("refs.scm present"))
             .expect("refs.scm");
+        tree_sitter::Query::new(
+            &lang,
+            adapter.bindings_query().expect("bindings.scm present"),
+        )
+        .expect("bindings.scm");
+    }
+
+    /// Every `bindings.scm` match as `(name, type)`, mirroring what
+    /// `parse::extract_bindings` does with the same query — including the
+    /// `#eq?`/`#not-eq?` predicates, which decide the `var` patterns.
+    fn bindings(src: &str) -> Vec<(String, String)> {
+        let adapter = Adapter::new();
+        let lang = adapter.grammar();
+        let query = tree_sitter::Query::new(
+            &lang,
+            adapter.bindings_query().expect("bindings.scm present"),
+        )
+        .expect("bindings.scm");
+        let tree = parse(src);
+        let bytes = src.as_bytes();
+        let names = query.capture_names();
+        let mut cursor = tree_sitter::QueryCursor::new();
+        let mut matches = cursor.matches(&query, tree.root_node(), bytes);
+        let mut out = Vec::new();
+        while let Some(m) = streaming_iterator::StreamingIterator::next(&mut matches) {
+            let text_of = |arg: &tree_sitter::QueryPredicateArg| match arg {
+                tree_sitter::QueryPredicateArg::String(s) => Some(s.to_string()),
+                tree_sitter::QueryPredicateArg::Capture(id) => m
+                    .captures
+                    .iter()
+                    .find(|c| c.index == *id)
+                    .and_then(|c| c.node.utf8_text(bytes).ok())
+                    .map(str::to_owned),
+            };
+            let holds = query.general_predicates(m.pattern_index).iter().all(|p| {
+                match (&*p.operator, &p.args[..]) {
+                    ("eq?", [a, b]) => text_of(a) == text_of(b),
+                    ("not-eq?", [a, b]) => text_of(a) != text_of(b),
+                    _ => true,
+                }
+            });
+            if !holds {
+                continue;
+            }
+            let mut name = None;
+            let mut ty = None;
+            for cap in m.captures {
+                let text = cap.node.utf8_text(bytes).unwrap_or("").to_owned();
+                match names[cap.index as usize] {
+                    "bind.name" => name = Some(text),
+                    "bind.ctor" | "bind.type" => ty = Some(text),
+                    _ => {}
+                }
+            }
+            if let Some(name) = name {
+                out.push((name, ty.unwrap_or_default()));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    fn bound(name: &str, ty: &str) -> (String, String) {
+        (name.to_owned(), ty.to_owned())
+    }
+
+    /// The four shapes a Java receiver's type is written down in: a declared
+    /// local, `var x = new Foo()`, a parameter, and a field.
+    #[test]
+    fn bindings_capture_every_written_down_type() {
+        let caps = bindings(
+            "class App {\n private Foo field;\n void m(Bar param) {\n  Baz local = mk();\n  var made = new Qux();\n }\n}\n",
+        );
+        assert_eq!(
+            caps,
+            [
+                bound("field", "Foo"),
+                bound("local", "Baz"),
+                bound("made", "Qux"),
+                bound("param", "Bar"),
+            ]
+        );
+    }
+
+    /// `var` is spelled as a `type_identifier` by this grammar, so without the
+    /// predicate guard a `var x = mk()` would claim the type `var` and a
+    /// `var x = new Foo()` would be captured twice, once wrongly.
+    #[test]
+    fn var_never_names_itself_as_a_type() {
+        assert_eq!(bindings("class A { void m() { var x = mk(); } }\n"), []);
+        assert_eq!(
+            bindings("class A { void m() { var x = new Foo(); } }\n"),
+            [bound("x", "Foo")]
+        );
+    }
+
+    /// Types the source does not write as a plain identifier are left alone —
+    /// resolution falls back to by-name candidates rather than guessing.
+    #[test]
+    fn generic_array_and_primitive_types_are_not_bound() {
+        assert_eq!(
+            bindings(
+                "class A {\n private List<Foo> xs;\n void m(Foo[] arr, int n) {\n  Runnable r = () -> {};\n }\n}\n"
+            ),
+            [bound("r", "Runnable")]
+        );
     }
 
     #[test]

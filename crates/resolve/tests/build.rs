@@ -1535,6 +1535,54 @@ fn java_import_and_static_call_resolve_across_files() {
     );
 }
 
+/// #105 + #120 for Java. A parameter, a field and a `new`-initialised local all
+/// write their type down, so `u.send(n)` pins `Util.send` across files instead of
+/// splitting with the same-named `Rival.send`; and the bare `trim(n)` inside
+/// `Util.send` means `this.trim()`, so it reaches `Util.trim`, not `Rival.trim`.
+#[test]
+fn java_typed_receivers_and_self_calls_pin_the_right_class() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/java");
+    let r = resolve::build(&root).unwrap();
+
+    let app = "src/main/java/com/example/App.java";
+    let util_file = "src/main/java/com/example/Util.java";
+    let util_send = SymbolId::of(util_file, "Util.send");
+    let rival_send = SymbolId::of(util_file, "Rival.send");
+    let util_trim = SymbolId::of(util_file, "Util.trim");
+    let rival_trim = SymbolId::of(util_file, "Rival.trim");
+
+    let confs = |src: SymbolId, dst: SymbolId| -> Vec<f32> {
+        r.edges
+            .iter()
+            .filter(|e| e.src == src && e.dst == dst && e.kind == EdgeKind::Calls)
+            .map(|e| e.confidence)
+            .collect()
+    };
+    for caller in ["App.viaParam", "App.viaField", "App.viaLocal"] {
+        let src = SymbolId::of(app, caller);
+        assert_eq!(confs(src, util_send), [0.85], "{caller} types its receiver");
+        assert!(
+            confs(src, rival_send).is_empty(),
+            "{caller} must not reach the same-named method of another class"
+        );
+    }
+    assert_eq!(
+        confs(util_send, util_trim),
+        [0.9],
+        "bare `trim(n)` inside Util.send is `this.trim()` (#120)"
+    );
+    assert!(
+        confs(util_send, rival_trim).is_empty(),
+        "and never Rival.trim"
+    );
+
+    // and the fallback is untouched: a receiver whose type is not written down
+    // still reaches both same-named methods, honestly split 1/N
+    let unknown = SymbolId::of(app, "App.viaUnknown");
+    assert_eq!(confs(unknown, util_send), [0.3]);
+    assert_eq!(confs(unknown, rival_send), [0.3]);
+}
+
 /// Kotlin, Tier 0–2: `import com.example.Util` maps the dotted path to
 /// `com/example/Util.kt` under the source root, and a member call on an instance
 /// of the imported class reaches `Util.send` in that file.
@@ -1568,6 +1616,54 @@ fn kotlin_import_and_member_call_resolve_across_files() {
     );
 }
 
+/// #105 + #120 for Kotlin. `val u = Util()`, `val u: Util = …` and `fun f(u: Util)`
+/// each pin `Util.send` rather than splitting with `Rival.send`; the bare `trim(n)`
+/// inside `Util.send` is `this.trim()`, while the bare `helper(n)` beside it still
+/// reaches the top-level function, because `Util` declares no `helper`.
+#[test]
+fn kotlin_typed_receivers_and_self_calls_pin_the_right_class() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/kotlin");
+    let r = resolve::build(&root).unwrap();
+
+    let app = "src/main/kotlin/com/example/App.kt";
+    let util_file = "src/main/kotlin/com/example/Util.kt";
+    let util_send = SymbolId::of(util_file, "Util.send");
+    let rival_send = SymbolId::of(util_file, "Rival.send");
+    let util_trim = SymbolId::of(util_file, "Util.trim");
+    let rival_trim = SymbolId::of(util_file, "Rival.trim");
+    let helper = SymbolId::of(util_file, "helper");
+
+    let confs = |src: SymbolId, dst: SymbolId| -> Vec<f32> {
+        r.edges
+            .iter()
+            .filter(|e| e.src == src && e.dst == dst && e.kind == EdgeKind::Calls)
+            .map(|e| e.confidence)
+            .collect()
+    };
+    for caller in ["run", "viaAscription", "viaParam"] {
+        let src = SymbolId::of(app, caller);
+        assert_eq!(confs(src, util_send), [0.85], "{caller} types its receiver");
+        assert!(
+            confs(src, rival_send).is_empty(),
+            "{caller} must not reach Rival.send"
+        );
+    }
+    assert_eq!(
+        confs(util_send, util_trim),
+        [0.9],
+        "`trim(n)` is `this.trim()`"
+    );
+    assert!(
+        confs(util_send, rival_trim).is_empty(),
+        "and never Rival.trim"
+    );
+    assert_eq!(
+        confs(util_send, helper),
+        [0.95],
+        "a bare call the class does not declare still reaches the top-level function"
+    );
+}
+
 /// Scala, Tier 0–2: `import a.b.C` maps the dotted path to `a/b/C.scala`, and the
 /// selector call `C.helper(n)` through that import reaches `C.helper` — a method
 /// qualified by the object it lives in.
@@ -1596,6 +1692,44 @@ fn scala_import_and_selector_call_resolve_across_files() {
             .iter()
             .any(|e| e.src == run && e.dst == helper && e.kind == EdgeKind::Calls),
         "`C.helper(n)` should reach C.helper across files"
+    );
+}
+
+/// #105 + #120 for Scala. An ascribed `val b: Box` and a `def m(b: Box)` parameter
+/// pin `Box.send`; the bare `trim(n)` inside `Box.send` is `this.trim()`.
+#[test]
+fn scala_typed_receivers_and_self_calls_pin_the_right_class() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/scala");
+    let r = resolve::build(&root).unwrap();
+
+    let box_send = SymbolId::of("a/b/C.scala", "Box.send");
+    let rival_send = SymbolId::of("a/b/C.scala", "Rival.send");
+    let box_trim = SymbolId::of("a/b/C.scala", "Box.trim");
+    let rival_trim = SymbolId::of("a/b/C.scala", "Rival.trim");
+
+    let confs = |src: SymbolId, dst: SymbolId| -> Vec<f32> {
+        r.edges
+            .iter()
+            .filter(|e| e.src == src && e.dst == dst && e.kind == EdgeKind::Calls)
+            .map(|e| e.confidence)
+            .collect()
+    };
+    for caller in ["Main.viaParam", "Main.viaVal"] {
+        let src = SymbolId::of("x/Main.scala", caller);
+        assert_eq!(confs(src, box_send), [0.85], "{caller} types its receiver");
+        assert!(
+            confs(src, rival_send).is_empty(),
+            "{caller} must not reach Rival.send"
+        );
+    }
+    assert_eq!(
+        confs(box_send, box_trim),
+        [0.9],
+        "`trim(n)` is `this.trim()`"
+    );
+    assert!(
+        confs(box_send, rival_trim).is_empty(),
+        "and never Rival.trim"
     );
 }
 
@@ -1636,6 +1770,45 @@ fn csharp_using_is_external_and_a_qualified_call_still_crosses_files() {
             .iter()
             .any(|e| e.src == send && e.dst == helper && e.kind == EdgeKind::Calls),
         "a bare call inside the type should reach its sibling method"
+    );
+}
+
+/// #105 + #120 for C#. A parameter, a field and `var x = new Util()` all write the
+/// type down, so `u.Send(n)` pins `Util.Send` instead of splitting with
+/// `Rival.Send`; the bare `Trim(n)` inside `Util.Send` is `this.Trim()`.
+#[test]
+fn csharp_typed_receivers_and_self_calls_pin_the_right_class() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/csharp");
+    let r = resolve::build(&root).unwrap();
+
+    let util_send = SymbolId::of("Util.cs", "Util.Send");
+    let rival_send = SymbolId::of("Util.cs", "Rival.Send");
+    let util_trim = SymbolId::of("Util.cs", "Util.Trim");
+    let rival_trim = SymbolId::of("Util.cs", "Rival.Trim");
+
+    let confs = |src: SymbolId, dst: SymbolId| -> Vec<f32> {
+        r.edges
+            .iter()
+            .filter(|e| e.src == src && e.dst == dst && e.kind == EdgeKind::Calls)
+            .map(|e| e.confidence)
+            .collect()
+    };
+    for caller in ["App.ViaParam", "App.ViaField", "App.ViaVar"] {
+        let src = SymbolId::of("App.cs", caller);
+        assert_eq!(confs(src, util_send), [0.85], "{caller} types its receiver");
+        assert!(
+            confs(src, rival_send).is_empty(),
+            "{caller} must not reach Rival.Send"
+        );
+    }
+    assert_eq!(
+        confs(util_send, util_trim),
+        [0.9],
+        "`Trim(n)` is `this.Trim()`"
+    );
+    assert!(
+        confs(util_send, rival_trim).is_empty(),
+        "and never Rival.Trim"
     );
 }
 
@@ -1760,8 +1933,8 @@ fn cpp_include_and_member_call_resolve_across_files() {
         .collect();
     assert_eq!(
         to_bar,
-        [0.6],
-        "`f.bar()` pins the one Foo::bar definition instead of splitting 1/N with a prototype"
+        [0.85],
+        "`f.bar()` pins the one Foo::bar definition — `Foo f;` types the receiver (#105)"
     );
     assert!(
         r.edges
@@ -1780,5 +1953,66 @@ fn cpp_include_and_member_call_resolve_across_files() {
         to_helper,
         [0.8],
         "a bare `free_helper(n)` reaches the definition in the other file by linkage"
+    );
+}
+
+/// #105 for C++: `Foo f; f.bar();` reaches `Foo::bar` and *only* that one, even
+/// though `Other::bar` shares the name. Before the bindings query the receiver
+/// had no type, so both were candidates at 1/N.
+#[test]
+fn cpp_typed_local_pins_the_owning_class_method() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cpp");
+    let r = resolve::build(&root).unwrap();
+
+    let run = SymbolId::of("src/main.cc", "run");
+    let foo_bar = SymbolId::of("src/app.cc", "Foo.bar");
+    let other_bar = SymbolId::of("src/app.hpp", "Other.bar");
+
+    let targets = |dst: SymbolId| -> Vec<f32> {
+        r.edges
+            .iter()
+            .filter(|e| e.src == run && e.dst == dst && e.kind == EdgeKind::Calls)
+            .map(|e| e.confidence)
+            .collect()
+    };
+    assert_eq!(targets(foo_bar), [0.85], "`Foo f; f.bar()` → Foo::bar");
+    assert_eq!(
+        targets(other_bar),
+        [0.85],
+        "`Other o; o.bar()` → Other::bar"
+    );
+    assert!(
+        !r.edges
+            .iter()
+            .any(|e| e.src == run && e.dst == other_bar && e.site.start_line == 7),
+        "the `f.bar()` line must not also reach the same-named method of another class"
+    );
+}
+
+/// #120: a bare `close()` inside `~Foo()` means `this->close()` — `Foo::close`,
+/// defined in the *other* file — not the inline `Other::close` that the bare-name
+/// ladder finds first in this one. The destructor has no tags.scm capture, so the
+/// enclosing definition is the class itself.
+#[test]
+fn cpp_bare_call_in_a_member_scopes_to_its_own_class() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cpp");
+    let r = resolve::build(&root).unwrap();
+
+    let foo = SymbolId::of("src/app.hpp", "Foo");
+    let foo_close = SymbolId::of("src/app.cc", "Foo.close");
+    let other_close = SymbolId::of("src/app.hpp", "Other.close");
+
+    let confs: Vec<f32> = r
+        .edges
+        .iter()
+        .filter(|e| e.src == foo && e.dst == foo_close && e.kind == EdgeKind::Calls)
+        .map(|e| e.confidence)
+        .collect();
+    assert_eq!(confs, [0.9], "`close()` in ~Foo() binds Foo::close");
+    assert!(
+        !r.edges
+            .iter()
+            .any(|e| e.src == foo && e.dst == other_close && e.kind == EdgeKind::Calls),
+        "and never the same-named method of an unrelated class (#120)"
     );
 }
