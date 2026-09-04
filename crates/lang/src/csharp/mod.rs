@@ -55,6 +55,15 @@ impl LanguageAdapter for Adapter {
         Some(include_str!("queries/refs.scm"))
     }
 
+    fn bindings_query(&self) -> Option<&'static str> {
+        Some(include_str!("queries/bindings.scm"))
+    }
+
+    /// `Helper()` inside an instance method is `this.Helper()` (#120).
+    fn bare_call_in_method_is_self_call(&self) -> bool {
+        true
+    }
+
     /// A definition is exported when its modifiers include `public`. Other
     /// accessibility levels (`protected`, `internal`, `private`) are not
     /// externally visible, so they don't count as exported.
@@ -221,6 +230,88 @@ mod tests {
             .expect("imports.scm");
         tree_sitter::Query::new(&lang, adapter.refs_query().expect("refs.scm present"))
             .expect("refs.scm");
+        tree_sitter::Query::new(
+            &lang,
+            adapter.bindings_query().expect("bindings.scm present"),
+        )
+        .expect("bindings.scm");
+    }
+
+    /// Every `bindings.scm` match as `(name, type)`, mirroring what
+    /// `parse::extract_bindings` does with the same query.
+    fn bindings(src: &str) -> Vec<(String, String)> {
+        let adapter = Adapter::new();
+        let lang = adapter.grammar();
+        let query = tree_sitter::Query::new(
+            &lang,
+            adapter.bindings_query().expect("bindings.scm present"),
+        )
+        .expect("bindings.scm");
+        let tree = parse(src);
+        let bytes = src.as_bytes();
+        let names = query.capture_names();
+        let mut cursor = tree_sitter::QueryCursor::new();
+        let mut matches = cursor.matches(&query, tree.root_node(), bytes);
+        let mut out = Vec::new();
+        while let Some(m) = streaming_iterator::StreamingIterator::next(&mut matches) {
+            let mut name = None;
+            let mut ty = None;
+            for cap in m.captures {
+                let text = cap.node.utf8_text(bytes).unwrap_or("").to_owned();
+                match names[cap.index as usize] {
+                    "bind.name" => name = Some(text),
+                    "bind.ctor" | "bind.type" => ty = Some(text),
+                    _ => {}
+                }
+            }
+            if let Some(name) = name {
+                out.push((name, ty.unwrap_or_default()));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    fn bound(name: &str, ty: &str) -> (String, String) {
+        (name.to_owned(), ty.to_owned())
+    }
+
+    /// A field, a local, a parameter and `var x = new Foo()` — one
+    /// `variable_declaration` node serves the field and the local, so both come
+    /// out of the same pattern.
+    #[test]
+    fn bindings_capture_every_written_down_type() {
+        let caps = bindings(
+            "class App {\n private Foo field;\n void M(Bar param) {\n  Baz local = Mk();\n  var made = new Qux();\n }\n}\n",
+        );
+        assert_eq!(
+            caps,
+            [
+                bound("field", "Foo"),
+                bound("local", "Baz"),
+                bound("made", "Qux"),
+                bound("param", "Bar"),
+            ]
+        );
+    }
+
+    /// `var` is its own node kind here, so an inferred local with no `new` writes
+    /// no type at all and must produce no binding.
+    #[test]
+    fn an_inferred_local_without_a_constructor_binds_nothing() {
+        assert_eq!(bindings("class A { void M() { var x = Mk(); } }\n"), []);
+    }
+
+    /// A generic, qualified or predefined type is not a plain `identifier`, so it
+    /// is left to the by-name fallback rather than guessed at.
+    #[test]
+    fn generic_qualified_and_predefined_types_are_not_bound() {
+        assert_eq!(
+            bindings(
+                "class A {\n private List<Foo> xs;\n void M(int n) {\n  System.Text.Foo q = null;\n }\n}\n"
+            ),
+            []
+        );
     }
 
     #[test]

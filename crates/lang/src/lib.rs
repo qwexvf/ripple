@@ -215,6 +215,26 @@ pub trait LanguageAdapter: Send + Sync {
         false
     }
 
+    /// Does an *unqualified* call written inside a member function body mean
+    /// `this.m()` — a call on the enclosing class — rather than a free function?
+    /// Default: no.
+    ///
+    /// Answer `true` for a class-based language where a member's own methods are
+    /// in scope unqualified: C++, Java, C#, Kotlin, Scala. There, `close()` inside
+    /// `~buffered_file()` is `this->close()`, but it is extracted as a plain
+    /// `@ref.call` with no receiver, so without this signal it falls to the
+    /// bare-name ladder and can bind — confidently — to a same-named method on an
+    /// unrelated class (#120, the C++ analogue of #104). The resolver only takes
+    /// this path when the enclosing class really does define a method of that
+    /// name; anything else falls through to the ordinary ladder, so a top-level
+    /// Kotlin function or a C free function is unaffected.
+    ///
+    /// `false` for a language where an unqualified name is never an implicit
+    /// member access — Python and Rust spell it `self.m()`, Go `r.M()`.
+    fn bare_call_in_method_is_self_call(&self) -> bool {
+        false
+    }
+
     /// Qualified name for a definition (e.g. TS methods → `Class.method` so
     /// same-named methods don't collide). Default: the bare name.
     fn qualified_name(

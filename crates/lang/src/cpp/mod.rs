@@ -59,6 +59,15 @@ impl LanguageAdapter for Adapter {
         Some(include_str!("queries/refs.scm"))
     }
 
+    fn bindings_query(&self) -> Option<&'static str> {
+        Some(include_str!("queries/bindings.scm"))
+    }
+
+    /// `close()` inside `~buffered_file()` is `this->close()` (#120).
+    fn bare_call_in_method_is_self_call(&self) -> bool {
+        true
+    }
+
     /// A quoted `#include "foo.h"` names a local header, but where that header
     /// lives is a property of the build. Shared with the C adapter: probe the
     /// including file's own directory, then the include dirs the build declares
@@ -245,7 +254,92 @@ mod tests {
         tree_sitter::Query::new(&lang, adapter.tags_query()).expect("tags.scm");
         tree_sitter::Query::new(&lang, adapter.imports_query().expect("imports")).expect("imports");
         tree_sitter::Query::new(&lang, adapter.refs_query().expect("refs")).expect("refs");
-        assert!(adapter.bindings_query().is_none());
+        tree_sitter::Query::new(&lang, adapter.bindings_query().expect("bindings"))
+            .expect("bindings");
+    }
+
+    /// Every `bindings.scm` match as `(name, type)`, mirroring what
+    /// `parse::extract_bindings` does with the same query.
+    fn bindings(src: &str) -> Vec<(String, String)> {
+        let adapter = Adapter::new();
+        let lang = adapter.grammar();
+        let query = tree_sitter::Query::new(&lang, adapter.bindings_query().expect("bindings"))
+            .expect("bindings.scm");
+        let tree = parse(src);
+        let bytes = src.as_bytes();
+        let names = query.capture_names();
+        let mut cursor = tree_sitter::QueryCursor::new();
+        let mut matches = cursor.matches(&query, tree.root_node(), bytes);
+        let mut out = Vec::new();
+        while let Some(m) = streaming_iterator::StreamingIterator::next(&mut matches) {
+            let mut name = None;
+            let mut ty = None;
+            for cap in m.captures {
+                let text = cap.node.utf8_text(bytes).unwrap_or("").to_owned();
+                match names[cap.index as usize] {
+                    "bind.name" => name = Some(text),
+                    "bind.ctor" | "bind.type" => ty = Some(text),
+                    _ => {}
+                }
+            }
+            if let Some(name) = name {
+                out.push((name, ty.unwrap_or_default()));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    fn bound(name: &str, ty: &str) -> (String, String) {
+        (name.to_owned(), ty.to_owned())
+    }
+
+    /// Data members, parameters (by value, reference and pointer) and locals
+    /// (plain, pointer, initialised) — every place C++ writes the type down.
+    #[test]
+    fn bindings_capture_every_written_down_type() {
+        let caps = bindings(
+            "class App {\n Foo field;\n Bar* pfield;\n void m(const Baz& r, Qux v, Quux* p) {\n  Local a;\n  Other* b;\n  Third c = mk();\n }\n};\n",
+        );
+        assert_eq!(
+            caps,
+            [
+                bound("a", "Local"),
+                bound("b", "Other"),
+                bound("c", "Third"),
+                bound("field", "Foo"),
+                bound("p", "Quux"),
+                bound("pfield", "Bar"),
+                bound("r", "Baz"),
+                bound("v", "Qux"),
+            ]
+        );
+    }
+
+    /// `auto x = Foo();` names its type in the initializer. `auto x = mk();` does
+    /// not name a type at all — it is still recorded, but the name it carries is a
+    /// function's, so the class lookup misses and resolution stays where it was.
+    #[test]
+    fn auto_takes_its_type_from_a_direct_constructor_call() {
+        assert_eq!(
+            bindings("void m() { auto x = Foo(); }\n"),
+            [bound("x", "Foo")]
+        );
+        assert_eq!(
+            bindings("void m() { auto x = ns::make(); }\n"),
+            [],
+            "a qualified call names no type this query will read"
+        );
+    }
+
+    /// A template or qualified type is not a plain `type_identifier`, so it is
+    /// left to the by-name fallback rather than guessed at.
+    #[test]
+    fn template_and_qualified_types_are_not_bound() {
+        assert_eq!(
+            bindings("void m() {\n std::vector<Foo> xs;\n ns::Bar y;\n int n = 0;\n}\n"),
+            []
+        );
     }
 
     /// The core shapes: class, struct, enum, free fn, member fn, field, typedef,

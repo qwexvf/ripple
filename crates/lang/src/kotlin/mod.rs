@@ -57,6 +57,16 @@ impl LanguageAdapter for Adapter {
         Some(include_str!("queries/refs.scm"))
     }
 
+    fn bindings_query(&self) -> Option<&'static str> {
+        Some(include_str!("queries/bindings.scm"))
+    }
+
+    /// `helper()` inside a member function is `this.helper()` when the class
+    /// declares one — a top-level function still resolves the old way (#120).
+    fn bare_call_in_method_is_self_call(&self) -> bool {
+        true
+    }
+
     /// Kotlin is public by default: a declaration is exported unless it carries a
     /// `private`, `internal` or `protected` visibility modifier.
     fn is_exported(&self, def: Node, src: &[u8]) -> bool {
@@ -227,6 +237,88 @@ mod tests {
             .expect("imports.scm");
         tree_sitter::Query::new(&lang, adapter.refs_query().expect("refs.scm present"))
             .expect("refs.scm");
+        tree_sitter::Query::new(
+            &lang,
+            adapter.bindings_query().expect("bindings.scm present"),
+        )
+        .expect("bindings.scm");
+    }
+
+    /// Every `bindings.scm` match as `(name, type)`, mirroring what
+    /// `parse::extract_bindings` does with the same query.
+    fn bindings(src: &str) -> Vec<(String, String)> {
+        let adapter = Adapter::new();
+        let lang = adapter.grammar();
+        let query = tree_sitter::Query::new(
+            &lang,
+            adapter.bindings_query().expect("bindings.scm present"),
+        )
+        .expect("bindings.scm");
+        let tree = parse(src);
+        let bytes = src.as_bytes();
+        let names = query.capture_names();
+        let mut cursor = tree_sitter::QueryCursor::new();
+        let mut matches = cursor.matches(&query, tree.root_node(), bytes);
+        let mut out = Vec::new();
+        while let Some(m) = streaming_iterator::StreamingIterator::next(&mut matches) {
+            let mut name = None;
+            let mut ty = None;
+            for cap in m.captures {
+                let text = cap.node.utf8_text(bytes).unwrap_or("").to_owned();
+                match names[cap.index as usize] {
+                    "bind.name" => name = Some(text),
+                    "bind.ctor" | "bind.type" => ty = Some(text),
+                    _ => {}
+                }
+            }
+            if let Some(name) = name {
+                out.push((name, ty.unwrap_or_default()));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    fn bound(name: &str, ty: &str) -> (String, String) {
+        (name.to_owned(), ty.to_owned())
+    }
+
+    /// An ascribed property, an ascribed local, `val x = Foo()`, and a parameter.
+    #[test]
+    fn bindings_capture_every_written_down_type() {
+        let caps = bindings(
+            "class App {\n private val field: Foo = mk()\n fun m(param: Bar) {\n  val local: Baz = mk()\n  val made = Qux()\n }\n}\n",
+        );
+        assert_eq!(
+            caps,
+            [
+                bound("field", "Foo"),
+                bound("local", "Baz"),
+                bound("made", "Qux"),
+                bound("param", "Bar"),
+            ]
+        );
+    }
+
+    /// The constructor pattern is anchored to an *untyped* declaration, so an
+    /// ascribed `val x: Foo = Bar()` reports the ascription and nothing else — the
+    /// two patterns can never contradict each other.
+    #[test]
+    fn an_ascription_wins_over_the_initializer() {
+        assert_eq!(
+            bindings("class A { fun m() { val x: Foo = Bar() } }\n"),
+            [bound("x", "Foo")]
+        );
+    }
+
+    /// A nullable or function type is not a `user_type`, so it writes nothing down
+    /// as far as this query is concerned.
+    #[test]
+    fn nullable_and_function_types_are_not_bound() {
+        assert_eq!(
+            bindings("class A { fun m(cb: () -> Unit) { val x: Foo? = null } }\n"),
+            []
+        );
     }
 
     /// The core vocabulary: a class, an object, a top-level function and a

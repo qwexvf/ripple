@@ -7,3 +7,6 @@ int free_helper(int n) {
 void Foo::bar() {
     free_helper(count);
 }
+
+void Foo::close() {
+}

@@ -62,6 +62,16 @@ impl LanguageAdapter for Adapter {
         Some(include_str!("queries/refs.scm"))
     }
 
+    fn bindings_query(&self) -> Option<&'static str> {
+        Some(include_str!("queries/bindings.scm"))
+    }
+
+    /// `helper()` inside a member of a class/trait/object is `this.helper()` when
+    /// that type declares one — otherwise resolution is unchanged (#120).
+    fn bare_call_in_method_is_self_call(&self) -> bool {
+        true
+    }
+
     /// Map a plain `import a.b.C` to the file `a/b/C.scala`. The specifier is the
     /// whole declaration text, so the `import` keyword is stripped first. Only
     /// plain dotted paths resolve here — selector (`{…}`) and wildcard (`_`/`*`)
@@ -258,6 +268,83 @@ mod tests {
             .expect("imports.scm");
         tree_sitter::Query::new(&lang, adapter.refs_query().expect("refs.scm present"))
             .expect("refs.scm");
+        tree_sitter::Query::new(
+            &lang,
+            adapter.bindings_query().expect("bindings.scm present"),
+        )
+        .expect("bindings.scm");
+    }
+
+    /// Every `bindings.scm` match as `(name, type)`, mirroring what
+    /// `parse::extract_bindings` does with the same query.
+    fn bindings(src: &str) -> Vec<(String, String)> {
+        let adapter = Adapter::new();
+        let lang = adapter.grammar();
+        let query = tree_sitter::Query::new(
+            &lang,
+            adapter.bindings_query().expect("bindings.scm present"),
+        )
+        .expect("bindings.scm");
+        let tree = parse(src);
+        let bytes = src.as_bytes();
+        let names = query.capture_names();
+        let mut cursor = tree_sitter::QueryCursor::new();
+        let mut matches = cursor.matches(&query, tree.root_node(), bytes);
+        let mut out = Vec::new();
+        while let Some(m) = streaming_iterator::StreamingIterator::next(&mut matches) {
+            let mut name = None;
+            let mut ty = None;
+            for cap in m.captures {
+                let text = cap.node.utf8_text(bytes).unwrap_or("").to_owned();
+                match names[cap.index as usize] {
+                    "bind.name" => name = Some(text),
+                    "bind.ctor" | "bind.type" => ty = Some(text),
+                    _ => {}
+                }
+            }
+            if let Some(name) = name {
+                out.push((name, ty.unwrap_or_default()));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    fn bound(name: &str, ty: &str) -> (String, String) {
+        (name.to_owned(), ty.to_owned())
+    }
+
+    /// The ascribed forms only: a `val`, a `var`, and a `def` parameter.
+    #[test]
+    fn bindings_capture_the_ascribed_types() {
+        let caps = bindings(
+            "class App {\n private val field: Foo = mk()\n var state: Bar = mk()\n def m(param: Baz): Unit = {\n  val local: Qux = mk()\n }\n}\n",
+        );
+        assert_eq!(
+            caps,
+            [
+                bound("field", "Foo"),
+                bound("local", "Qux"),
+                bound("param", "Baz"),
+                bound("state", "Bar"),
+            ]
+        );
+    }
+
+    /// An inferred `val x = new Foo()` is deliberately not bound: leaving the type
+    /// off is the Scala idiom, and reading it back off the initializer is
+    /// inference, which this pass does not do.
+    #[test]
+    fn an_inferred_val_is_not_bound() {
+        assert_eq!(bindings("class A { val x = new Foo() }\n"), []);
+        assert_eq!(bindings("class A { val x = mk() }\n"), []);
+    }
+
+    /// A generic ascription is not a plain `type_identifier`, so it writes nothing
+    /// down for this query.
+    #[test]
+    fn a_generic_ascription_is_not_bound() {
+        assert_eq!(bindings("class A { val xs: List[Foo] = Nil }\n"), []);
     }
 
     #[test]

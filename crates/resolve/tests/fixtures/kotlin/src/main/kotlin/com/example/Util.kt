@@ -6,6 +6,20 @@ fun helper(n: Int): Int {
 
 class Util {
     fun send(n: Int): Int {
-        return helper(n)
+        return helper(n) + trim(n)
+    }
+
+    fun trim(n: Int): Int {
+        return n
+    }
+}
+
+class Rival {
+    fun send(n: Int): Int {
+        return n
+    }
+
+    fun trim(n: Int): Int {
+        return -n
     }
 }
