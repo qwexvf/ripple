@@ -522,6 +522,7 @@ dependencies = [
  "parse",
  "rayon",
  "serde_json",
+ "tempfile",
  "walkdir",
 ]
 

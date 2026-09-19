@@ -360,6 +360,37 @@ fn skips_dependency_and_build_directories() {
     );
 }
 
+/// `link` used to place each binding by rescanning every definition in its file,
+/// once per reference — cubic in a file's size. A 187k-line generated bundle in an
+/// indexed repo turned that into an index that never finished (#127); 800
+/// definitions in one file took minutes. The bound is loose on purpose: it is
+/// there to catch a return to superlinear, not to measure a machine.
+#[test]
+fn links_a_large_generated_file_in_linear_time() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir(root.join("src")).unwrap();
+    let mut src = String::new();
+    for i in 0..800 {
+        src.push_str(&format!(
+            "class C{i} {{ m{i}(v: number) {{ return v; }} }}\n\
+             export function f{i}(a: number) {{\n  const x{i} = new C{i}();\n  return x{i}.m{i}(a);\n}}\n"
+        ));
+    }
+    std::fs::write(root.join("src/bundle.ts"), src).unwrap();
+
+    let start = std::time::Instant::now();
+    let r = resolve::build(root).unwrap();
+    let elapsed = start.elapsed();
+
+    let calls = r.edges.iter().filter(|e| e.kind == EdgeKind::Calls).count();
+    assert!(calls >= 800, "every typed receiver still resolves: {calls}");
+    assert!(
+        elapsed < std::time::Duration::from_secs(60),
+        "linking 800 definitions took {elapsed:?}"
+    );
+}
+
 /// Elixir `import Mod` lets a bare call cross a module boundary — the class of
 /// edge `eval --oracle lsp` showed ripple was missing entirely.
 #[test]

@@ -894,14 +894,14 @@ fn resolve_calls(
     rules: CallRules,
     sink: &mut LinkSink,
 ) {
-    let types = Bindings::new(&f.extract.bindings);
-
     let empty = HashMap::new();
     let local = idx.file_defs.get(&f.canonical).unwrap_or(&empty);
 
     // defs sorted by start position → O(log n + siblings) enclosing lookup per ref
     let mut defs_by_start: Vec<&Node> = f.extract.defs.iter().collect();
     defs_by_start.sort_by_key(|d| (d.span.start_line, d.span.start_col));
+
+    let types = Bindings::new(&f.extract.bindings, &defs_by_start);
 
     for r in &f.extract.refs {
         let enclosing = enclosing_def(&defs_by_start, r.site);
@@ -940,14 +940,16 @@ fn resolve_calls(
                 }
             }
             RefKind::Member => {
-                let type_map = types.at(r.site, enclosing, &defs_by_start);
+                // only the receiver's own type is ever consulted, so ask for that
+                // one name rather than building the file's whole map per reference
+                let recv_type = match r.receiver.as_ref() {
+                    Some(Receiver::Ident(v)) => types.type_of(v, r.site, enclosing),
+                    _ => None,
+                };
                 // a local declaration of the receiver name shadows any import of the
                 // same name: `const React = makeFake(); React.foo()` is not the
                 // imported `React`, so it must not bind to an external/module symbol.
-                let shadowed = matches!(
-                    r.receiver.as_ref(),
-                    Some(Receiver::Ident(v)) if type_map.contains_key(v.as_str())
-                );
+                let shadowed = recv_type.is_some();
                 let ext_dep = if shadowed {
                     None
                 } else {
@@ -976,7 +978,7 @@ fn resolve_calls(
                         &r.name,
                         r.receiver.as_ref(),
                         enclosing,
-                        &type_map,
+                        recv_type,
                         idx,
                         root,
                     )
@@ -1182,7 +1184,7 @@ fn resolve_member(
     method: &str,
     receiver: Option<&Receiver>,
     enclosing: Option<&Node>,
-    type_map: &HashMap<&str, &str>,
+    recv_type: Option<&str>,
     idx: &DefIndex,
     root: usize,
 ) -> (Vec<SymbolId>, f32) {
@@ -1214,7 +1216,7 @@ fn resolve_member(
             None => (candidates(), CONF_CANDIDATE),
         },
         Some(Receiver::New(ctor)) => by_class(ctor, CONF_KNOWN_RECEIVER),
-        Some(Receiver::Ident(v)) => match type_map.get(v.as_str()) {
+        Some(Receiver::Ident(_)) => match recv_type {
             Some(class) => by_class(class, CONF_TYPED_RECEIVER),
             None => (candidates(), CONF_CANDIDATE),
         },
@@ -1228,21 +1230,98 @@ fn resolve_member(
 /// binding the same name to different types is ordinary code (`const client = new
 /// AdminClient()` in one, `new UserClient()` in the next), and the flat map sent every
 /// `client.foo()` in the file to whichever came last.
+///
+/// Keyed by name because that is how it is asked: a member call consults the type of
+/// its receiver and of nothing else. Building the file's whole map per reference —
+/// and rescanning every definition inside it to place each binding — made `link`
+/// cubic in a file's size, which is what stalled indexing a repo holding a 187k-line
+/// generated bundle (#127).
 struct Bindings<'a> {
-    /// sorted by declaration position, so the nearest preceding one is findable
-    by_site: Vec<&'a parse::BindRec>,
+    /// name → its bindings in declaration order, each carrying the containment
+    /// facts a lookup needs
+    by_name: HashMap<&'a str, Vec<Scoped<'a>>>,
+}
+
+/// One binding together with the definitions holding its declaration.
+///
+/// These are the parts of scope that depend on the *declaration* and not on the
+/// reference asking about it, so they are computed once per binding instead of once
+/// per (binding, reference) pair.
+struct Scoped<'a> {
+    rec: &'a parse::BindRec,
+    /// class definitions whose span holds the declaration
+    classes: Vec<&'a Node>,
+    /// container definitions whose span holds the declaration
+    containers: Vec<&'a Node>,
+    /// whether *any* definition holds it — a binding inside one is not file-level
+    held: bool,
+}
+
+impl<'a> Scoped<'a> {
+    /// Is this binding a member of a class that holds `site` — a field whose type
+    /// says what `x.m()` means anywhere in that class?
+    ///
+    /// The second half is what keeps it from being a class-wide free-for-all: no
+    /// definition may hold the binding while leaving the reference out, so a sibling
+    /// method's local stays that method's business.
+    fn member_in_scope(&self, site_line: u32) -> bool {
+        self.classes.iter().any(|d| d.contains_line(site_line))
+            && !self.containers.iter().any(|d| !d.contains_line(site_line))
+    }
 }
 
 impl<'a> Bindings<'a> {
-    fn new(records: &'a [parse::BindRec]) -> Bindings<'a> {
-        let mut by_site: Vec<&parse::BindRec> = records.iter().collect();
-        by_site.sort_by_key(|b| (b.site.start_line, b.site.start_col));
-        Bindings { by_site }
+    /// `defs` is the file's definitions: a binding inside one is not in scope for a
+    /// reference outside it. Placed by a sweep over their spans in line order, so
+    /// the cost is the nesting depth per binding rather than the definition count.
+    fn new(records: &'a [parse::BindRec], defs: &[&'a Node]) -> Bindings<'a> {
+        let mut spans: Vec<(u32, u32, &'a Node)> = defs
+            .iter()
+            .flat_map(|d| {
+                d.definition_spans()
+                    .map(move |s| (s.start_line, s.end_line, *d))
+            })
+            .collect();
+        spans.sort_unstable_by_key(|&(start, end, _)| (start, end));
+
+        let mut order: Vec<&'a parse::BindRec> = records.iter().collect();
+        order.sort_by_key(|b| (b.site.start_line, b.site.start_col));
+
+        let mut by_name: HashMap<&'a str, Vec<Scoped<'a>>> = HashMap::new();
+        // sweep: `open` holds the spans that started at or before the current line
+        // and have not ended, which is exactly the set containing it
+        let mut open: Vec<(u32, &'a Node)> = Vec::new();
+        let mut next = 0;
+        for rec in order {
+            let line = rec.site.start_line;
+            while next < spans.len() && spans[next].0 <= line {
+                let (_, end, node) = spans[next];
+                open.push((end, node));
+                next += 1;
+            }
+            open.retain(|&(end, _)| end >= line);
+            by_name.entry(rec.name.as_str()).or_default().push(Scoped {
+                rec,
+                classes: open
+                    .iter()
+                    .filter(|(_, d)| d.kind == NodeKind::Class)
+                    .map(|&(_, d)| d)
+                    .collect(),
+                containers: open
+                    .iter()
+                    .filter(|(_, d)| is_container(d.kind))
+                    .map(|&(_, d)| d)
+                    .collect(),
+                held: !open.is_empty(),
+            });
+        }
+        Bindings { by_name }
     }
 
-    /// The bindings visible at `site`: those declared inside the enclosing definition
-    /// before it, file-level ones outside every definition, and the members of a class
-    /// that holds the reference.
+    /// The type bound to `name` at `site`: one declared inside the enclosing
+    /// definition before it, a file-level one before it, or a member of a class that
+    /// holds the reference. `Some("")` is a binding whose type the capture did not
+    /// pin — the name is taken, which is enough to shadow an import.
     ///
     /// Nearest-preceding wins, which is the closest thing to scope that spans alone can
     /// express — no language knowledge, and shadowing inside a block resolves the same
@@ -1250,61 +1329,35 @@ impl<'a> Bindings<'a> {
     /// "preceding": a field is in scope throughout the class whether it is written
     /// above the method that uses it or below, so `private Foo x;` at the bottom of a
     /// Java class still types `x.m()` at the top. A local of the same name always wins.
-    ///
-    /// `defs` is the file's definitions, so a binding inside *another* function can be
-    /// told apart from one at module level — otherwise one function's local leaks into
-    /// another's calls, which is the bug this replaces.
-    fn at(
-        &self,
-        site: Span,
-        enclosing: Option<&Node>,
-        defs: &[&Node],
-    ) -> HashMap<&'a str, &'a str> {
-        // name → (from a local, declaration site, type). One declarator is captured
-        // twice — once typed (`const b: Bar`/`new Bar()`), once bare — at the same
-        // site; the bare capture carries an empty type. Prefer the non-empty one at a
-        // given site so an untyped record never downgrades a known type, while a
-        // genuinely later (nearest-preceding) redeclaration still shadows an earlier one.
-        let mut out: HashMap<&str, (bool, Span, &str)> = HashMap::new();
-        for b in &self.by_site {
-            let line = b.site.start_line;
+    fn type_of(&self, name: &str, site: Span, enclosing: Option<&Node>) -> Option<&'a str> {
+        // (from a local, declaration site, type). One declarator is captured twice —
+        // once typed (`const b: Bar`/`new Bar()`), once bare — at the same site; the
+        // bare capture carries an empty type. Prefer the non-empty one at a given
+        // site so an untyped record never downgrades a known type, while a genuinely
+        // later (nearest-preceding) redeclaration still shadows an earlier one.
+        let mut best: Option<(bool, Span, &'a str)> = None;
+        for b in self.by_name.get(name)? {
+            let line = b.rec.site.start_line;
             let local = enclosing.is_some_and(|d| d.contains_line(line));
-            let member = !local && class_member_in_scope(line, site, defs);
+            let member = !local && b.member_in_scope(site.start_line);
             if !member {
-                if (b.site.start_line, b.site.start_col) > (site.start_line, site.start_col) {
+                if (line, b.rec.site.start_col) > (site.start_line, site.start_col) {
                     continue; // declared after the reference
                 }
-                if !local && defs.iter().any(|d| d.contains_line(line)) {
+                if !local && b.held {
                     continue; // held by some other definition — not in scope here
                 }
             }
-            match out.get(b.name.as_str()) {
+            match best {
                 // an enclosing binding never displaces a local one
                 Some((true, ..)) if !local => {}
                 // same declarator seen twice: keep whichever pins a type
-                Some((_, esite, etype)) if *esite == b.site && !etype.is_empty() => {}
-                _ => {
-                    out.insert(b.name.as_str(), (local, b.site, b.type_name.as_str()));
-                }
+                Some((_, esite, etype)) if esite == b.rec.site && !etype.is_empty() => {}
+                _ => best = Some((local, b.rec.site, b.rec.type_name.as_str())),
             }
         }
-        out.into_iter().map(|(k, (.., ty))| (k, ty)).collect()
+        best.map(|(.., ty)| ty)
     }
-}
-
-/// Is the binding at `line` a member of a class that holds `site` — a field whose
-/// type says what `x.m()` means anywhere in that class?
-///
-/// The second half is what keeps it from being a class-wide free-for-all: no
-/// definition may hold the binding while leaving the reference out, so a sibling
-/// method's local stays that method's business.
-fn class_member_in_scope(line: u32, site: Span, defs: &[&Node]) -> bool {
-    let holds_both = |d: &Node| d.contains_line(line) && d.contains_line(site.start_line);
-    defs.iter()
-        .any(|d| d.kind == NodeKind::Class && holds_both(d))
-        && !defs
-            .iter()
-            .any(|d| is_container(d.kind) && d.contains_line(line) && !holds_both(d))
 }
 
 /// The file a member call's receiver names, when the receiver is a namespace import.
