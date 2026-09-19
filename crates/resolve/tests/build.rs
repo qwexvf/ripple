@@ -391,6 +391,47 @@ fn links_a_large_generated_file_in_linear_time() {
     );
 }
 
+/// A repo's own `.gitignore` is the only place that knows `.output/` and
+/// `storybook-static/` are build output. Without it their bundles are indexed as
+/// source, which on one TanStack repo meant 812 of 1862 indexed files were
+/// generated (#126, #127).
+#[test]
+fn honours_gitignore() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    // `ignore` applies gitignore rules only inside a git repo, and it decides that
+    // by looking for `.git` — an empty one is enough, no history needed
+    std::fs::create_dir(root.join(".git")).unwrap();
+    std::fs::write(root.join(".gitignore"), "/generated\nstorybook-static\n").unwrap();
+    for (dir, name) in [
+        ("src", "appOwnCode"),
+        ("generated", "generatedBundleCode"),
+        ("storybook-static/assets", "storybookBundleCode"),
+    ] {
+        std::fs::create_dir_all(root.join(dir)).unwrap();
+        std::fs::write(
+            root.join(dir).join("mod.ts"),
+            format!("export function {name}() {{ return 1; }}\n"),
+        )
+        .unwrap();
+    }
+
+    let r = resolve::build(root).unwrap();
+    let names: Vec<&str> = r.nodes.iter().map(|n| n.name.as_str()).collect();
+    assert!(
+        names.contains(&"appOwnCode"),
+        "own code is indexed: {names:?}"
+    );
+    assert!(
+        !names.contains(&"generatedBundleCode"),
+        "an ignored directory must not be indexed: {names:?}"
+    );
+    assert!(
+        !names.contains(&"storybookBundleCode"),
+        "an ignored directory must not be indexed by a bare-name rule: {names:?}"
+    );
+}
+
 /// Elixir `import Mod` lets a bare call cross a module boundary — the class of
 /// edge `eval --oracle lsp` showed ripple was missing entirely.
 #[test]

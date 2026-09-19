@@ -14,7 +14,6 @@ use parse::{CachedFile, Queries, Receiver, RefKind};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use walkdir::WalkDir;
 
 mod crossservice;
 mod routes;
@@ -274,12 +273,9 @@ fn discover(
     // Kept apart from `candidates`: they have no grammar, so nothing below the
     // cross facts applies to them — no defs, no refs, no adapter.
     let mut spec_files: Vec<(PathBuf, String)> = Vec::new();
-    for entry in WalkDir::new(root)
-        .into_iter()
-        .filter_entry(|e| !is_ignored_dir(e))
-    {
+    for entry in walk(root) {
         let entry = entry?;
-        if !entry.file_type().is_file() {
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
         }
         let path = entry.path();
@@ -1472,8 +1468,26 @@ fn default_export(idx: &DefIndex, target: &Path) -> Option<SymbolId> {
     }
 }
 
-pub(crate) fn is_ignored_dir(e: &walkdir::DirEntry) -> bool {
-    e.file_type().is_dir()
+/// A walk of `root` that skips what the repo itself declares uninteresting.
+///
+/// Honouring `.gitignore` is not a nicety. A working tree holds build output whose
+/// bundles dwarf its source — 656 files under `.output/` and 156 under
+/// `storybook-static/` against 323 hand-written ones in the repo that produced #127
+/// — and indexing them buries every ranking under definitions nobody wrote.
+///
+/// Hidden entries stay in: a dotfile is often source, and `.gitignore` already has an
+/// opinion about the ones that are not. [`IGNORED_DIRS`] stays as the backstop for a
+/// tree that is not a git repo (where `ignore` applies no gitignore rules at all) and
+/// for one that never bothered to ignore its own `node_modules`.
+pub(crate) fn walk(root: &Path) -> ignore::Walk {
+    ignore::WalkBuilder::new(root)
+        .hidden(false)
+        .filter_entry(|e| !is_ignored_dir(e))
+        .build()
+}
+
+pub(crate) fn is_ignored_dir(e: &ignore::DirEntry) -> bool {
+    e.file_type().is_some_and(|t| t.is_dir())
         && e.file_name()
             .to_str()
             .is_some_and(|n| IGNORED_DIRS.contains(&n))

@@ -5,9 +5,6 @@
 use lang::Workspace;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use walkdir::WalkDir;
-
-const IGNORED_DIRS: &[&str] = &["node_modules", "dist", "build", "out", ".git", ".ripple"];
 
 pub fn discover(root: &Path) -> Workspace {
     let mut ws = Workspace::default();
@@ -132,11 +129,7 @@ fn read_tsconfig(root: &Path, ws: &mut Workspace) {
 
 /// Map every workspace `package.json` "name" to its directory (skips node_modules).
 fn read_packages(root: &Path, ws: &mut Workspace) {
-    for entry in WalkDir::new(root)
-        .into_iter()
-        .filter_entry(|e| !is_ignored_dir(e))
-        .filter_map(Result::ok)
-    {
+    for entry in crate::walk(root).filter_map(Result::ok) {
         if entry.file_name() != "package.json" {
             continue;
         }
@@ -233,11 +226,4 @@ fn strip_trailing_commas(text: &str) -> String {
         i += 1;
     }
     out
-}
-
-fn is_ignored_dir(e: &walkdir::DirEntry) -> bool {
-    e.file_type().is_dir()
-        && e.file_name()
-            .to_str()
-            .is_some_and(|n| IGNORED_DIRS.contains(&n))
 }
