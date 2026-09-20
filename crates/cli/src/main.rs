@@ -139,18 +139,23 @@ fn flag_tables() -> &'static (HashSet<&'static str>, HashSet<&'static str>) {
         for line in USAGE.lines() {
             let mut tokens = line.split_whitespace().peekable();
             while let Some(tok) = tokens.next() {
-                let flag = tok.trim_start_matches('[').trim_end_matches([']', '|']);
-                if !flag.starts_with("--") {
-                    continue;
-                }
-                known.insert(flag);
                 // `[--depth N]` / `[--root <path>]` take a value; `[--json]` does not
                 let takes_value = tokens.peek().is_some_and(|next| {
-                    let n = next.trim_start_matches('[').trim_end_matches([']', '|']);
+                    let n = next.trim_matches(|c| "[]|".contains(c));
                     !n.starts_with("--") && !n.starts_with('(')
                 });
-                if takes_value {
-                    with_value.insert(flag);
+                // one token can name several flags: `[--in|--out]` is two, and
+                // registering it whole made the parser refuse both (they are the
+                // alternatives it was documenting)
+                for alt in tok.split('|') {
+                    let flag = alt.trim_matches(|c| "[]|".contains(c));
+                    if !flag.starts_with("--") {
+                        continue;
+                    }
+                    known.insert(flag);
+                    if takes_value {
+                        with_value.insert(flag);
+                    }
                 }
             }
         }
@@ -3474,12 +3479,53 @@ mod tests {
         assert!(reject_unknown_flags(&v(&["--json", "--depth", "2"])).is_ok());
         // a value is a value, even when it looks like a flag
         assert!(reject_unknown_flags(&v(&["--in-file", "--nope"])).is_ok());
-        // every documented flag passes, or the table and USAGE have drifted
-        for flag in flag_tables().0.iter() {
+        // Scanned out of USAGE rather than read off `flag_tables`, which is the
+        // thing under test: deriving both sides the same way is how `[--in|--out]`
+        // got registered as one flag named `--in|--out` and the parser refused
+        // both of the real ones — with a test that passed, because it asked the
+        // table what it contained instead of what USAGE says.
+        for flag in flags_written_in_usage() {
             assert!(
-                reject_unknown_flags(&v(&[flag, "x"])).is_ok(),
-                "documented flag refused: {flag}"
+                reject_unknown_flags(&v(&[&flag, "x"])).is_ok(),
+                "USAGE documents {flag}, but the parser refuses it"
             );
+        }
+    }
+
+    /// Every `--flag` spelled anywhere in `USAGE`, found by scanning the text.
+    fn flags_written_in_usage() -> Vec<String> {
+        let mut out = Vec::new();
+        let mut rest = USAGE;
+        while let Some(i) = rest.find("--") {
+            rest = &rest[i..];
+            let end = rest
+                .find(|c: char| !c.is_ascii_alphanumeric() && c != '-')
+                .unwrap_or(rest.len());
+            let (flag, tail) = rest.split_at(end);
+            if flag.len() > 2 {
+                out.push(flag.to_owned());
+            }
+            rest = if tail.is_empty() { "" } else { tail };
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// The alternatives a `[--a|--b]` token documents are two flags, not one.
+    #[test]
+    fn alternative_flags_are_registered_separately() {
+        for flag in [
+            "--in",
+            "--out",
+            "--floor-contradicted",
+            "--drop-contradicted",
+        ] {
+            assert!(
+                flag_tables().0.contains(flag),
+                "{flag} is written in USAGE as an alternative but is not a known flag"
+            );
+            assert!(!value_flags().contains(flag), "{flag} takes no value");
         }
     }
 
