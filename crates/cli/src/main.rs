@@ -18,6 +18,23 @@ use verify::{bare_name, is_callable_name};
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // before dispatch, because every command has to answer them and none of them
+    // owns the answer: `ripple index --help` used to reach `cmd_index`, where an
+    // unrecognised flag is dropped by `positionals` and the empty root list falls
+    // back to ".", so asking for help silently reindexed the current directory
+    // over its own graph.
+    if args
+        .iter()
+        .any(|a| a == "--help" || a == "-h" || a == "help")
+    {
+        println!("{USAGE}");
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("ripple {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    reject_unknown_flags(&args)?;
     match args.first().map(String::as_str) {
         Some("parse") => cmd_parse(&args[1..]),
         Some("index") => cmd_index(&args[1..]),
@@ -36,7 +53,7 @@ fn main() -> Result<()> {
     }
 }
 
-const USAGE: &str = "usage:\n  ripple parse <file> [--json]\n  ripple index <path>... [--calls lsp [--calls-budget 120s]] [--debug]   (--calls lsp: call edges from a language server; --debug: per-phase timings to stderr)\n  ripple neighbors <symbol> [--in|--out] [--depth N] [--in-file <substr>] [--root <path>] [--json]\n  ripple locate <task words...> [--budget N] [--root <path>] [--json] [--debug]   (where do I start for this task?)\n  ripple impact <symbol>... [--budget N] [--in-file <substr>] [--root <path>] [--json] [--verify lsp] [--sync]\n  ripple review [<base>] [--budget N] [--root <path>] [--json] [--verify lsp] [--sync]\n    --sync   (rebuild from the working tree in memory before answering, so edits since the last index are reflected — no re-index, nothing persisted)\n    --verify lsp [--verify-budget 2s] [--floor-contradicted|--drop-contradicted]  (upgrade call edges from a language server)\n  ripple path <from> <to> [--depth 6] [--limit 3] [--root <path>] [--json]   (how does A reach B?)\n  ripple risk <symbol|file> [--root <path>] [--json]\n  ripple mcp [--root <path>]   (MCP server over stdio for AI agents)\n  ripple daemon [run] [--max-resident 8]   (resident, file-watching index server; systemd-friendly)\n    ripple daemon register <path> | status | stop   (talk to a running daemon over its socket)\n  ripple eval [--commits N] [--skip N] [--weights <spec>] [--root <path>]   (held-out co-change recall)\n    --risk                                        (do the risk terms rank the files a later fix touched?)\n    --review [--budget N] [--cases N] [--converge 0.6] [--escape-days 7] [--max-introducer-files 40]   (does review rank the defective symbol within the change that introduced it? bulk introducers dropped)\n    --vs-grep [--budget N] [--commits N]   (does the blast radius beat grep at predicting co-change?)\n    --oracle lsp [--sample N] [--granularity function|file]   (agree with a language server?)\n  ripple lsp doctor [--root <path>] [--budget 10s] [--json]   (are language servers usable here?)\n  ripple lsp trust [--root <path>]   (allow this repo's own .ripple/lsp.json to launch servers)";
+const USAGE: &str = "usage:\n  ripple parse <file> [--json]\n  ripple index <path>... [--calls lsp [--calls-budget 120s]] [--debug]   (--calls lsp: call edges from a language server; --debug: per-phase timings to stderr)\n  ripple neighbors <symbol> [--in|--out] [--depth N] [--in-file <substr>] [--root <path>] [--json]\n  ripple locate <task words...> [--budget N] [--root <path>] [--json] [--debug]   (where do I start for this task?)\n  ripple impact <symbol>... [--budget N] [--in-file <substr>] [--root <path>] [--json] [--verify lsp] [--sync]\n  ripple review [<base>] [--budget N] [--root <path>] [--json] [--verify lsp] [--sync]\n    --sync   (rebuild from the working tree in memory before answering, so edits since the last index are reflected — no re-index, nothing persisted)\n    --verify lsp [--verify-budget 2s] [--floor-contradicted|--drop-contradicted]  (upgrade call edges from a language server)\n  ripple path <from> <to> [--depth 6] [--limit 3] [--root <path>] [--json]   (how does A reach B?)\n  ripple risk <symbol|file> [--root <path>] [--json]\n  ripple mcp [--root <path>]   (MCP server over stdio for AI agents)\n  ripple daemon [run] [--max-resident 8]   (resident, file-watching index server; systemd-friendly)\n    ripple daemon register <path> | status | stop   (talk to a running daemon over its socket)\n  ripple eval [--commits N] [--skip N] [--weights <spec>] [--root <path>]   (held-out co-change recall)\n    --risk                                        (do the risk terms rank the files a later fix touched?)\n    --review [--budget N] [--cases N] [--converge 0.6] [--escape-days 7] [--max-introducer-files 40]   (does review rank the defective symbol within the change that introduced it? bulk introducers dropped)\n    --vs-grep [--budget N] [--commits N]   (does the blast radius beat grep at predicting co-change?)\n    --oracle lsp [--sample N] [--granularity function|file]   (agree with a language server?)\n  ripple lsp doctor [--root <path>] [--budget 10s] [--json]   (are language servers usable here?)\n  ripple lsp trust [--root <path>]   (allow this repo's own .ripple/lsp.json to launch servers)\n  ripple --help\n  ripple --version";
 
 /// Where `root`'s own database would live.
 fn own_db_path(root: &Path) -> PathBuf {
@@ -108,16 +125,17 @@ const NEIGHBOR_KINDS: [EdgeKind; 9] = [
     EdgeKind::Serves,
 ];
 
-/// Flags that consume the following token as their value, read off `USAGE`.
+/// Every flag `USAGE` documents, and which of them consume the following token.
 ///
 /// Derived rather than declared: the list used to be a second copy that had to be
 /// kept in sync by hand, and every value-taking flag added without touching it
 /// reintroduced the bug where `--root <path>` leaked its value as a positional
 /// (#24). `USAGE` is the one place a flag is written down now.
-fn value_flags() -> &'static HashSet<&'static str> {
-    static FLAGS: std::sync::OnceLock<HashSet<&'static str>> = std::sync::OnceLock::new();
+fn flag_tables() -> &'static (HashSet<&'static str>, HashSet<&'static str>) {
+    static FLAGS: std::sync::OnceLock<(HashSet<&'static str>, HashSet<&'static str>)> =
+        std::sync::OnceLock::new();
     FLAGS.get_or_init(|| {
-        let mut out = HashSet::new();
+        let (mut known, mut with_value) = (HashSet::new(), HashSet::new());
         for line in USAGE.lines() {
             let mut tokens = line.split_whitespace().peekable();
             while let Some(tok) = tokens.next() {
@@ -125,18 +143,50 @@ fn value_flags() -> &'static HashSet<&'static str> {
                 if !flag.starts_with("--") {
                     continue;
                 }
+                known.insert(flag);
                 // `[--depth N]` / `[--root <path>]` take a value; `[--json]` does not
                 let takes_value = tokens.peek().is_some_and(|next| {
                     let n = next.trim_start_matches('[').trim_end_matches([']', '|']);
                     !n.starts_with("--") && !n.starts_with('(')
                 });
                 if takes_value {
-                    out.insert(flag);
+                    with_value.insert(flag);
                 }
             }
         }
-        out
+        (known, with_value)
     })
+}
+
+fn value_flags() -> &'static HashSet<&'static str> {
+    &flag_tables().1
+}
+
+/// Refuse a flag `USAGE` does not document, rather than ignoring it.
+///
+/// `positionals` drops any `--token` it does not recognise, so an undocumented flag
+/// used to be silently discarded and the command ran with its defaults — a typo
+/// (`--jsonn`) printed the wrong format, and `--help` reindexed the working
+/// directory. Values are skipped so `--in-file --json` is still a filter for the
+/// literal string, not a flag.
+fn reject_unknown_flags(args: &[String]) -> Result<()> {
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if !a.starts_with("--") {
+            i += 1;
+            continue;
+        }
+        if !flag_tables().0.contains(a.as_str()) {
+            bail!("unknown flag: {a}\n{USAGE}");
+        }
+        i += if value_flags().contains(a.as_str()) {
+            2
+        } else {
+            1
+        };
+    }
+    Ok(())
 }
 
 /// Positional args, correctly skipping `--flag value` pairs (so `--root X` never
@@ -3407,6 +3457,37 @@ mod tests {
             "a2 follows a; b is reached twice so it says so once; an unreachable hop is \
              still printed rather than dropped"
         );
+    }
+
+    /// `positionals` drops a `--token` it does not know, so an undocumented flag
+    /// used to vanish and the command ran on its defaults: `ripple index --help`
+    /// indexed the working directory and overwrote its graph instead of printing
+    /// usage. A flag the code does not document is now a refusal.
+    #[test]
+    fn an_undocumented_flag_is_refused() {
+        assert!(reject_unknown_flags(&v(&["--jsonn"])).is_err());
+        assert!(reject_unknown_flags(&v(&["index", "--halp"])).is_err());
+        assert!(reject_unknown_flags(&v(&["--json", "--depth", "2"])).is_ok());
+        // a value is a value, even when it looks like a flag
+        assert!(reject_unknown_flags(&v(&["--in-file", "--nope"])).is_ok());
+        // every documented flag passes, or the table and USAGE have drifted
+        for flag in flag_tables().0.iter() {
+            assert!(
+                reject_unknown_flags(&v(&[flag, "x"])).is_ok(),
+                "documented flag refused: {flag}"
+            );
+        }
+    }
+
+    /// `--help` and `--version` belong to no subcommand, so they are answered
+    /// before dispatch. Documenting them in `USAGE` is what keeps
+    /// `reject_unknown_flags` from refusing them on the way there.
+    #[test]
+    fn help_and_version_are_documented_flags() {
+        for flag in ["--help", "--version"] {
+            assert!(flag_tables().0.contains(flag), "{flag} is not in USAGE");
+            assert!(!value_flags().contains(flag), "{flag} takes no value");
+        }
     }
 
     /// The parser reads its flag table off `USAGE`, so the failure that remains is

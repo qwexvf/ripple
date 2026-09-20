@@ -20,6 +20,8 @@ ripple eval [--commits N] [--skip N] [--weights <spec>] [--root <path>]
 ripple eval --risk | --review | --vs-grep | --oracle lsp [--sample N] [--granularity function|file]
 ripple lsp doctor [--root <path>] [--budget 10s] [--json]
 ripple lsp trust [--root <path>]
+ripple --help
+ripple --version
 ```
 
 Flags shared by nearly every command:
@@ -29,6 +31,12 @@ Flags shared by nearly every command:
 | `--root <path>` | Which repository to answer about. Defaults to `.`; the graph is read from `<root>/.ripple/graph.redb` |
 | `--json` | Machine-readable output. Use this for anything scripted — the human format is not a stable interface |
 | `--budget N` | Cap the number of hits. The output always reports `{shown, total}` so a cut is visible |
+| `--help`, `-h` | Print this usage and exit, from any position — `ripple index --help` answers rather than indexing |
+| `--version`, `-V` | Print the version. Worth quoting in a bug report |
+
+An undocumented flag is an error, not a default. `ripple impact f --jsonn` fails with
+`unknown flag: --jsonn` instead of quietly printing the human format, because a flag
+the parser does not recognise used to be dropped and the command ran on its defaults.
 
 ## `ripple index <path>...`
 
