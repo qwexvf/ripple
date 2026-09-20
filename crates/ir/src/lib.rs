@@ -136,6 +136,18 @@ pub struct Node {
     #[serde(default)]
     pub extra_spans: Vec<Span>,
     pub is_exported: bool,
+    /// Does this symbol live on the test side — in a test file, or inside an
+    /// in-file test scope (Rust's `#[cfg(test)] mod tests`)?
+    ///
+    /// Stamped by `resolve::mark_tests` from the same `TestScopes` that emits the
+    /// `Tests` edges, because test convention is language knowledge and nothing
+    /// above `ir` may ask an adapter. A `Tests` edge only marks a symbol that
+    /// *tests something*; a fixture or helper that tests are merely built from has
+    /// none, which is why `review` could not tell one from production code and
+    /// ranked six copies of a capture helper above the change to resolution
+    /// semantics (#123).
+    #[serde(default)]
+    pub is_test: bool,
     /// Overlay-derived risk; zero until the git overlay runs. See docs/06.
     #[serde(default)]
     pub risk: RiskScores,

@@ -330,6 +330,7 @@ fn index_project(roots: &[PathBuf], lsp_calls: Option<std::time::Duration>) -> R
     // tests last: an Elixir call edge only exists after the cross-service pass, and
     // a test that calls nothing ripple resolved is a test ripple can't see (#36)
     let scopes = resolve::TestScopes::of(&indexed.files, &indexed.roots, &lang::registry());
+    resolve::mark_tests(&scopes, &mut nodes);
     let tests_span = ir::timing::start("link_tests");
     let mut test_edges = resolve::link_tests(&scopes, &edges);
     tests_span.stop(test_edges.len());
@@ -1988,6 +1989,7 @@ fn build_indexed_graph_incremental(
     edges.append(&mut cross.edges);
 
     let scopes = resolve::TestScopes::of(&indexed.files, &indexed.roots, &lang::registry());
+    resolve::mark_tests(&scopes, &mut nodes);
     let mut test_edges = resolve::link_tests(&scopes, &edges);
     edges.append(&mut test_edges);
 
@@ -3340,6 +3342,7 @@ mod tests {
             span,
             extra_spans: Vec::new(),
             is_exported: true,
+            is_test: false,
             risk: ir::RiskScores::default(),
             doc: None,
             route_path: None,
@@ -3374,6 +3377,7 @@ mod tests {
             span,
             extra_spans: Vec::new(),
             is_exported: true,
+            is_test: false,
             risk: ir::RiskScores::default(),
             doc: None,
             route_path: None,
@@ -3592,6 +3596,7 @@ mod tests {
             },
             extra_spans: Vec::new(),
             is_exported: true,
+            is_test: false,
             risk: ir::RiskScores::default(),
             doc: None,
             route_path: None,

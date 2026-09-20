@@ -24,7 +24,7 @@ use workspace::Workspaces;
 
 pub use crossservice::{link_cross_service, CrossEdges};
 pub use routes::{Quality, RouteIndex};
-pub use testlink::{link_tests, TestScopes};
+pub use testlink::{link_tests, mark_tests, TestScopes};
 
 /// Directories that hold code nobody is going to change in this repo:
 /// dependencies, build output, and tool caches. Indexing them is not just waste —
@@ -677,6 +677,7 @@ fn external_node(id: SymbolId, name: &str, qualified_name: &str, dep: &str) -> N
         },
         extra_spans: Vec::new(),
         is_exported: false,
+        is_test: false,
         risk: ir::RiskScores::default(),
         doc: None,
         route_path: None,
@@ -1416,6 +1417,7 @@ fn module_node(module_path: &str) -> Node {
         },
         extra_spans: Vec::new(),
         is_exported: false,
+        is_test: false,
         risk: ir::RiskScores::default(),
         doc: None,
         route_path: None,

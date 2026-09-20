@@ -150,11 +150,12 @@ The one no MCP server offers. **Input:** a PR (base..head), a budget. **Output:*
 
 `missing_cochange` implements CodeScene's best idea — *the absence of an expected co-change is a bug smell* — as an agent-queryable primitive.
 
-`review_priority` = `(1 + risk) × (1 + ln(1 + downstream weight)) × (1 + ln(1 + changed lines) × (½ + ½ · rewritten share))`. Three properties it has to hold at once, learned the hard way:
+`review_priority` = `(1 + risk) × (1 + ln(1 + downstream weight)) × (1 + ln(1 + changed lines) × (½ + ½ · rewritten share)) × (test-side ? ¼ : 1)`. Three properties it has to hold at once, learned the hard way:
 
 - **Reach is logarithmic, not linear.** Multiplied raw, a one-line edit to a hub outranked every real change in the diff: on ripple's own `v0.1.2..v0.2.0`, `registry` — a single `Box::new(gleam::Adapter::new()),` — ranked first at 34.4 on 46 dependents, while the release's largest new function ranked 11th.
 - **The change itself is a term.** Every other signal (dependents, churn, bug-density, ownership) looks backwards, so code the diff *adds* has no history and scores at the floor — exactly the code a reviewer opens first.
 - **A test is not reach.** `down_weight` skips hits on the test side, the same rule `score_structure` applies to `fanout`, so the two counters agree. The hit stays in `impact`'s own answer — "your test will break" is worth knowing, it just isn't blast radius.
+- **Test scaffolding is not what you read first.** A changed symbol that is itself test-side keeps a quarter of its score. Scaffolding scores well on every other input — a capture helper is long, is reached from every test in its module, and sits in a file with real churn — and on ripple's own six-adapter branch five of the top eight rows were near-identical copies of one such helper, with the change to bare-call resolution fourth. Down-weighted rather than dropped: a changed test is worth seeing, it is just never first. The flag is `Node::is_test`, stamped from the same `TestScopes` that emits the `Tests` edges, because a helper the tests are merely *built from* exercises nothing and so carries no `Tests` edge of its own ([#123](https://github.com/qwexvf/ripple/issues/123)).
 - **Every definition site counts.** `changed_lines` and the rewritten share read all of a symbol's spans; a multi-clause Elixir function edited in its second clause is still that function, not its module.
 - **Size and share both matter.** 60 lines of a 60-line function is a rewrite; 60 lines of a 2000-line file is a patch. Hence the share factor multiplying the log of the count.
 

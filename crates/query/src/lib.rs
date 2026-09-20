@@ -341,6 +341,20 @@ fn rewrite_share(sym: &Node, ranges: &[(u32, u32)]) -> f32 {
 /// keyed by module_path) for review, by risk × downstream blast radius × how much
 /// of the symbol the diff rewrote. Also surfaces missing-co-change and untested
 /// changes. See docs/06-risk-and-queries.md.
+/// How much of its score a changed symbol keeps for living on the test side.
+///
+/// Test scaffolding scores well on every input review focus has: a capture helper
+/// is long (33 changed lines), it is reached from every test in its module, and it
+/// sits in a file with real churn. Six near-identical copies of one such helper
+/// once filled the top of `ripple review` on this repo's own branch while the
+/// change to bare-call resolution sat fourth (#123).
+///
+/// Down-weighted rather than dropped: a changed test is worth seeing, it is just
+/// never the thing to read first. The factor is set so a helper at the very top of
+/// an unweighted ranking lands below the production changes it was burying, and no
+/// lower — a rewritten test file should still outrank an untouched one.
+const TEST_SIDE_WEIGHT: f32 = 0.25;
+
 pub fn review_focus(
     graph: &InMemoryGraph,
     changed: &HashMap<String, Vec<(u32, u32)>>,
@@ -402,7 +416,8 @@ pub fn review_focus(
         let changed_lines = changed_within(sym, ranges);
         let review_priority = (1.0 + sym.risk.composite)
             * (1.0 + down_weight.ln_1p())
-            * (1.0 + (changed_lines as f32).ln_1p() * (0.5 + 0.5 * rewrite_share(sym, ranges)));
+            * (1.0 + (changed_lines as f32).ln_1p() * (0.5 + 0.5 * rewrite_share(sym, ranges)))
+            * if sym.is_test { TEST_SIDE_WEIGHT } else { 1.0 };
 
         let mut reasons = Vec::new();
         if sym.risk.bug_density > 0.6 {
@@ -805,6 +820,7 @@ mod tests {
             span: span(),
             extra_spans: Vec::new(),
             is_exported: true,
+            is_test: false,
             risk: ir::RiskScores::default(),
             doc: None,
             route_path: None,
@@ -1067,6 +1083,38 @@ mod tests {
         let all = review_focus(&graph, &changed, 20, "");
         assert_eq!(all.focus.len(), 5);
         assert_eq!(all.total, 5, "nothing cut, nothing to report");
+    }
+
+    /// A capture helper and the resolution change it was burying score the same on
+    /// every input review focus has — same churn, same changed lines, same reach —
+    /// so nothing but the test-side flag can separate them. Six such helpers once
+    /// filled the top of `ripple review` on this repo's own branch (#123).
+    #[test]
+    fn a_changed_test_helper_ranks_below_identical_production_code() {
+        let prod = node("crates/resolve/src/lib.rs", "resolve_bare");
+        let mut helper = node("crates/lang/src/cpp/mod.rs", "captures");
+        helper.is_test = true;
+        let graph = InMemoryGraph::from_parts(vec![helper.clone(), prod.clone()], Vec::new());
+        let changed = HashMap::from([
+            ("crates/resolve/src/lib.rs".to_owned(), vec![(1, 1)]),
+            ("crates/lang/src/cpp/mod.rs".to_owned(), vec![(1, 1)]),
+        ]);
+
+        let r = review_focus(&graph, &changed, 10, "");
+        assert_eq!(r.focus.len(), 2, "the helper is down-weighted, not dropped");
+        assert_eq!(
+            r.focus[0].node.id,
+            prod.id,
+            "production code reads first: {:?}",
+            r.focus
+                .iter()
+                .map(|f| (&f.node.name, f.review_priority))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            r.focus[1].review_priority < r.focus[0].review_priority,
+            "and the helper scores strictly lower"
+        );
     }
 
     #[test]

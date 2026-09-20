@@ -1052,6 +1052,7 @@ mod tests {
             },
             extra_spans: Vec::new(),
             is_exported: false,
+            is_test: false,
             risk: RiskScores::default(),
             doc: None,
             route_path: None,

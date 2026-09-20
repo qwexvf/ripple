@@ -90,6 +90,22 @@ impl TestScopes {
     }
 }
 
+/// Stamp `is_test` on every node these scopes cover.
+///
+/// The `Tests` edges alone cannot carry this: one is emitted for a symbol that
+/// *tests something*, so a fixture or a capture helper that tests are merely built
+/// from gets none and reads as production code everywhere downstream. The scopes
+/// already know better — a symbol in a test file, or inside an in-file test scope,
+/// is in `ids` whether or not it exercises anything (#123).
+pub fn mark_tests(scopes: &TestScopes, nodes: &mut [ir::Node]) {
+    if scopes.is_empty() {
+        return;
+    }
+    for n in nodes.iter_mut() {
+        n.is_test = scopes.contains(n.id);
+    }
+}
+
 /// One `Tests` edge per (test symbol, tested symbol) pair reachable by a call or
 /// reference that leaves the test side.
 ///

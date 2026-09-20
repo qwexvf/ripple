@@ -1082,6 +1082,44 @@ fn edges_inside_a_root_survive_a_second_root() {
     );
 }
 
+/// `review` could not tell a capture helper from production code, because the only
+/// test signal in the graph was the `Tests` edge — and a helper the tests are built
+/// from exercises nothing, so no such edge names it. `mark_tests` stamps the scopes
+/// themselves, which already know better (#123).
+#[test]
+fn a_test_helper_that_exercises_nothing_is_still_marked_test_side() {
+    let rs = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/testlink/rs");
+    let indexed =
+        resolve::build_incremental(std::slice::from_ref(&rs), &std::collections::HashMap::new())
+            .unwrap();
+    let scopes = resolve::TestScopes::of(&indexed.files, &indexed.roots, &lang::registry());
+    let mut nodes = indexed.result.nodes.clone();
+    resolve::mark_tests(&scopes, &mut nodes);
+
+    let flag = |name: &str| {
+        nodes
+            .iter()
+            .find(|n| n.name == name)
+            .unwrap_or_else(|| panic!("{name} not extracted"))
+            .is_test
+    };
+    assert!(
+        flag("fixture"),
+        "a helper inside the test scope is test-side"
+    );
+    assert!(flag("covers_real"), "so is the test itself");
+    assert!(!flag("real"), "production code in the same file is not");
+
+    // and the Tests edges on their own could not have told us: the helper tests
+    // nothing, so none of them names it
+    let tests = resolve::link_tests(&scopes, &indexed.result.edges);
+    let fixture = SymbolId::of("lib.rs", "fixture");
+    assert!(
+        !tests.iter().any(|e| e.src == fixture || e.dst == fixture),
+        "no Tests edge names a helper that exercises nothing"
+    );
+}
+
 /// A test file's `import` is how it reaches the code it tests; without counting it
 /// the test *module* stayed a dependent, so a well-tested symbol still scored
 /// fanout and #42's fix only worked on the function-level caller.

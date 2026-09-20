@@ -26,6 +26,7 @@ fn node(module: &str, name: &str, kind: NodeKind) -> Node {
         span: span(),
         extra_spans: Vec::new(),
         is_exported: true,
+        is_test: false,
         risk: ir::RiskScores::default(),
         doc: None,
         route_path: None,

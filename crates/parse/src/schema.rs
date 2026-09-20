@@ -106,6 +106,7 @@ fn canonical() -> FileExtract {
             span: span(),
             extra_spans: vec![span()],
             is_exported: true,
+            is_test: false,
             risk: RiskScores {
                 churn: 0.0,
                 complexity: 0.0,
