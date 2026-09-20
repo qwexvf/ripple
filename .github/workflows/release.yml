@@ -23,8 +23,13 @@ jobs:
             os: ubuntu-latest
           - target: aarch64-apple-darwin
             os: macos-latest
+          # cross-compiled from the arm64 runner: the macos-13 (Intel) image was
+          # retired, and a job asking for it is never claimed — v0.8.0 sat queued
+          # for a day and shipped without its Intel asset. Xcode on the arm64
+          # image carries the x86_64 SDK, so the only thing this needs is the
+          # target, which the toolchain step already installs from the matrix.
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-latest
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
