@@ -109,7 +109,9 @@ pub struct RiskScores {
     pub bug_density: f32,
     /// author dispersion; stored as (1 - dispersion) so higher = riskier
     pub ownership: f32,
-    /// |static dependents ∪ co-change dependents| (query-time; not stored yet)
+    /// |static dependents ∪ co-change dependents|, filled by
+    /// `overlay::score_structure` once every edge exists and persisted with the
+    /// node, so a query reads it rather than recomputing it
     pub fanout: f32,
     /// test-edge linkage; higher lowers risk
     pub test_proximity: f32,

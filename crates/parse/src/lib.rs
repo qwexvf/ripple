@@ -745,7 +745,10 @@ fn dotted_ident_chain(node: TsNode, src: &[u8]) -> Option<String> {
 /// Evaluate a match's general predicates (`#eq?`, `#not-eq?`, `#any-of?`,
 /// `#not-any-of?`). Required for grammars like Elixir where a `def`/`defmodule`
 /// is a plain `call` node distinguished only by a predicate on the target.
-/// `#match?`/regex predicates are not yet supported and are treated as passing.
+///
+/// `#match?`/`#not-match?` pass here and are decided by `Matcher::regexes_hold`,
+/// which every caller evaluates alongside this. Splitting them keeps the regexes
+/// compiled once per query instead of once per match.
 fn predicates_hold(query: &Query, m: &QueryMatch, src: &[u8]) -> bool {
     let arg_text = |arg: &QueryPredicateArg| -> Option<String> {
         match arg {

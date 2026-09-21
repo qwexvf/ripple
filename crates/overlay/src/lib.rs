@@ -798,8 +798,11 @@ fn informative(values: &[f32]) -> bool {
 /// Without this, a metric that is constant across the corpus silently caps the
 /// composite: on a single-author repo every file has one author, so `ownership`
 /// percentile-ranks to 0 everywhere and its 0.2 weight subtracted a flat 20% from
-/// every score. Terms nothing populates yet (`complexity`, `test_proximity`) drop
-/// out by the same rule rather than pretending to be a measured zero.
+/// every score. A repo with no `Tests` edges drops `test_proximity` by the same
+/// rule, rather than scoring every symbol as untested.
+///
+/// `complexity` is not one of these terms at all: nothing populates it yet, so it
+/// is absent from the blend rather than entering as a measured zero.
 fn blend(terms: &[(f32, f32, bool)]) -> f32 {
     let (sum, weight) = terms
         .iter()
