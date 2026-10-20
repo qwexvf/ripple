@@ -1,8 +1,9 @@
 # ripple
 
-**An AI-native code impact & review-targeting engine.** Give it a change, get back a
-risk-ranked blast radius. Give it a PR, get back the hunks to review first. Built in Rust,
-language-agnostic core over a thin per-language adapter seam.
+**Code impact and review targeting, built for AI agents.** Give it a change and it tells you
+what is likely to break, ranked by risk. Give it a PR and it tells you which hunks to read
+first. Written in Rust. The core doesn't know about languages; each one plugs in through a
+small adapter.
 
 ```bash
 ripple locate "add a new language adapter"   # where do I start for this task?
@@ -11,39 +12,42 @@ ripple review [<base>]                         # for this PR, what do I read fir
 ripple path <from> <to>                        # how does A reach B?
 ```
 
-Ripple runs three ways over the same graph: a **CLI**, an
-**[MCP server](docs/src/content/docs/reference/mcp.md)** so an AI agent can orient in an
-unfamiliar codebase before it edits — find the right symbol, see the blast radius, rank the
-review surface — instead of grepping blind, and a
-**[resident daemon](docs/src/content/docs/reference/daemon.md)** that keeps the graph hot
-and re-indexes on save, turning a query into a sub-millisecond socket round-trip.
+You can run ripple three ways, all over the same graph:
+
+- a **CLI**
+- an **[MCP server](docs/src/content/docs/reference/mcp.md)**, so an AI agent can find its
+  way around an unfamiliar codebase before it edits (find the right symbol, see what a change
+  touches, rank what to review) instead of grepping blind
+- a **[daemon](docs/src/content/docs/reference/daemon.md)** that keeps the graph in memory and
+  re-indexes on save, so a query is a sub-millisecond socket round-trip
 
 ## The two questions
 
-Everything here exists to answer two questions AI-assisted development actually needs, and
-that no shipping tool answers well:
+ripple exists to answer two questions that come up constantly when working with AI on code,
+and that I couldn't find an existing tool answering well:
 
-1. **Blast radius** — "if I change `X`, what is likely to break?" — a *risk-ranked* set of
-   impacted code, not a flat reachability dump.
-2. **Review targeting** — "for this PR, where do I look first?" — the risky hunks ordered by
-   how likely they are to hide a defect, each with its downstream impact and a reason.
+1. **Blast radius:** "if I change `X`, what is likely to break?" The answer is a list of
+   affected code *ranked by risk*, not a flat dump of everything reachable.
+2. **Review targeting:** "for this PR, where do I look first?" The risky hunks, ordered by
+   how likely they are to hide a bug, each with its downstream impact and a reason.
 
-The whitespace ripple fills is the **join + ranking function** across a function-level
-static graph, git co-change, and defect-risk scoring — served through a budget-aware
-interface an agent can actually consume. See [`02-gap.md`](docs/src/content/docs/design/02-gap.md).
+Plenty of tools build call graphs or mine git history. What ripple adds is joining a
+function-level static graph with git co-change and defect-risk scoring, ranking the result,
+and returning it within a size budget an agent can work with. More on that in
+[`02-gap.md`](docs/src/content/docs/design/02-gap.md).
 
 ## Languages
 
 TypeScript · TSX · Python · Go · Ruby · PHP · Rust · Elixir · Gleam · Java · Scala · Kotlin · C# · C · C++ · Svelte · Vue · GraphQL · HTML
 
-Adding one touches only `crates/lang/` — a module plus `.scm` query files plus one
-registry line. Every layer above the [IR boundary](docs/src/content/docs/design/04-architecture.md)
-is blind to which language produced a node, and git-history signals work at *file*
-granularity, so a barely-supported language still gets useful impact/review from day one.
+Adding a language only touches `crates/lang/`: a module, some `.scm` query files, and one
+registry line. Nothing above the [IR boundary](docs/src/content/docs/design/04-architecture.md)
+knows which language a node came from. Git-history signals work per *file*, so even a
+language with thin support gets useful impact and review results from the start.
 
 ## Install
 
-**Prebuilt binary** — Linux x86_64 and macOS arm64, from the latest release:
+**Prebuilt binary** (Linux x86_64 and macOS arm64, from the latest release):
 
 ```bash
 # Linux x86_64
@@ -53,7 +57,7 @@ sudo mv ripple /usr/local/bin/            # or anywhere on your PATH
 ripple --help
 ```
 
-**From source** — Rust 1.85+ (edition 2021):
+**From source** (Rust 1.85+, edition 2021):
 
 ```bash
 git clone https://github.com/qwexvf/ripple && cd ripple
@@ -67,8 +71,8 @@ cargo install --path crates/cli          # installs `ripple` onto PATH
 ripple index .          # build the graph → .ripple/graph.redb  (add .ripple/ to .gitignore)
 ```
 
-Indexing ripple's own repo — 130 files, ~2k nodes / 2.6k edges — takes a fraction of a
-second; warm incremental re-index is faster still. Then ask it things:
+Indexing ripple's own repo (130 files, ~2k nodes, 2.6k edges) takes a fraction of a second.
+A warm incremental re-index is faster. Then ask it things:
 
 ```bash
 $ ripple locate "add a new language adapter"
@@ -84,9 +88,9 @@ blast radius of registry — 5 of 75 hits (ranked):
   ...
 ```
 
-Every ranked line carries a score and a confidence (`Calls<0.81>`) — inferred edges never
-fabricate certainty. Add `--json` to any query for machine output, `--root <path>` to query
-from elsewhere, and `--budget N` to cap the answer to what fits.
+Each ranked line has a score and a confidence (`Calls<0.81>`), so an inferred edge never
+looks more certain than it is. Add `--json` to any query for machine output, `--root <path>`
+to query a repo you're not in, and `--budget N` to cap the size of the answer.
 
 ### The commands
 
@@ -102,17 +106,18 @@ from elsewhere, and `--budget N` to cap the answer to what fits.
 | `ripple daemon` | Resident, file-watching index server (see below) |
 | `ripple index <path>...` | Build/refresh the graph (multi-root, incremental) |
 
-Ripple also cross-links **across repositories** indexed together — an HTTP call site in one
-service matched to the route that serves it in another — and can **upgrade call edges from a
-language server** (`--verify lsp`) when precision matters. See the
-[CLI reference](docs/src/content/docs/reference/cli.md) for the full flag surface.
+Repos indexed together get linked to each other. For example, an HTTP call in one service is
+matched to the route that handles it in another. When you need more precision, ripple can
+also upgrade call edges using a language server (`--verify lsp`). The
+[CLI reference](docs/src/content/docs/reference/cli.md) has every flag.
 
 ## Daemon
 
-The one real cost of a query is *startup* — compiling every language adapter's tree-sitter
-queries (~0.8s) before it can answer. `ripple daemon` pays that once, keeps each project's
-graph resident in RAM, and **re-indexes on save** via a file watcher, so a query is a
-sub-millisecond socket round-trip instead of a cold build. One daemon serves many projects.
+Most of the time a query spends is *startup*: compiling the tree-sitter queries for every
+language adapter (~0.8s) before it can answer anything. `ripple daemon` does that once,
+keeps each project's graph in RAM, and **re-indexes on save** through a file watcher. A query
+then becomes a sub-millisecond socket round-trip instead of a cold build. One daemon serves
+many projects.
 
 ```bash
 ripple daemon                     # run it (foreground; a service manager keeps it up)
@@ -121,15 +126,15 @@ ripple daemon status              # which projects are resident, node/edge count
 ripple daemon stop
 ```
 
-It stays bounded on a machine full of repos: graphs are **demand-loaded and LRU-evicted**
-(RAM capped by `--max-resident`, default 8), every rebuild goes through **one
-de-duplicating queue** (a burst of saves collapses to a single re-index, CPU near one
-core), and watches ignore `.ripple/`/`.git/`/`node_modules/` so the daemon's own writes
-don't loop.
+It stays light on a machine with lots of repos. Graphs are **loaded on demand and evicted
+LRU** (RAM capped by `--max-resident`, default 8). Every rebuild goes through **one
+de-duplicating queue**, so a burst of saves turns into a single re-index and CPU use stays
+near one core. Watches ignore `.ripple/`, `.git/` and `node_modules/` so the daemon's own
+writes don't trigger it again.
 
-Clients speak newline-delimited JSON over a Unix socket (under `$XDG_RUNTIME_DIR` by
-default), so a **systemd user unit** ([`contrib/systemd/`](contrib/systemd/ripple-daemon.service))
-just works:
+Clients talk to it with newline-delimited JSON over a Unix socket (under `$XDG_RUNTIME_DIR`
+by default), which means a **systemd user unit**
+([`contrib/systemd/`](contrib/systemd/ripple-daemon.service)) works out of the box:
 
 ```bash
 cp contrib/systemd/ripple-daemon.service ~/.config/systemd/user/
@@ -137,16 +142,16 @@ systemctl --user enable --now ripple-daemon
 ripple daemon register .
 ```
 
-Full details in the [daemon reference](docs/src/content/docs/reference/daemon.md).
-(Linux/systemd first; launchd and other-OS wrappers are future work.)
+See the [daemon reference](docs/src/content/docs/reference/daemon.md) for details.
+Linux/systemd comes first; launchd and other OS wrappers aren't done yet.
 
 ## How it works
 
-A **language-agnostic core** — graph model, git overlay, risk scoring, impact/review
-queries, MCP server — sits above a **thin per-language adapter** seam. Source parses to a
-normalized IR via tree-sitter; a resolve pass links imports and calls across files; a git
-overlay layers churn / co-change / bug-density / ownership; queries traverse the in-memory
-graph and rank by a risk-weighted score. See
+The core (graph model, git overlay, risk scoring, impact/review queries, MCP server) doesn't
+know about languages. Below it is a **thin adapter per language**. tree-sitter parses source
+into a normalized IR. A resolve pass links imports and calls across files. A git overlay adds
+churn, co-change, bug-density and ownership. Queries walk the in-memory graph and rank
+results by a risk-weighted score. Details in
 [`04-architecture.md`](docs/src/content/docs/design/04-architecture.md).
 
 ```
@@ -165,26 +170,27 @@ crates/
 
 ## Documentation
 
-Prose lives in [`docs/`](docs/), an Astro site — `cd docs && bun install && bun dev` to read
-it locally. Start with **[Getting started](docs/src/content/docs/getting-started.md)** (every
-command run against a real repo, output pasted verbatim), then the
+The docs live in [`docs/`](docs/) as an Astro site. Run `cd docs && bun install && bun dev`
+to read them locally. Start with **[Getting started](docs/src/content/docs/getting-started.md)**
+(every command run against a real repo, with the output pasted as is), then the
 [CLI](docs/src/content/docs/reference/cli.md) and
 [MCP](docs/src/content/docs/reference/mcp.md) references.
 
-The design docs under [`docs/src/content/docs/design/`](docs/src/content/docs/design/) cover
-the reasoning in depth — the [architecture](docs/src/content/docs/design/04-architecture.md)
-and its invariants, [risk scoring and query semantics](docs/src/content/docs/design/06-risk-and-queries.md),
+The design docs in [`docs/src/content/docs/design/`](docs/src/content/docs/design/) explain
+the reasoning: the [architecture](docs/src/content/docs/design/04-architecture.md) and its
+invariants, [risk scoring and query semantics](docs/src/content/docs/design/06-risk-and-queries.md),
 [cross-service resolution](docs/src/content/docs/design/10-cross-service-resolution.md),
 [LSP integration](docs/src/content/docs/design/11-lsp-integration.md), and the
-[dogfood log](docs/src/content/docs/design/12-dogfood-log.md) — what ripple got wrong when
-used for real, which has produced more committed fixes than the roadmap has.
+[dogfood log](docs/src/content/docs/design/12-dogfood-log.md). That last one records what
+ripple got wrong in real use, and it has led to more fixes than the roadmap has.
 
 ## Contributing
 
-`CLAUDE.md` documents the working conventions and the load-bearing architecture invariants —
-read it before writing code. In short: `cargo fmt --all` clean, `cargo clippy --all-targets`
-clean, `cargo test` green; small focused PRs; behavior ships with a test. Run
-`git config core.hooksPath .githooks` once per clone so the pre-push hook mirrors CI.
+Read `CLAUDE.md` before writing code. It covers the working conventions and the architecture
+invariants that matter. The short version: `cargo fmt --all` and
+`cargo clippy --all-targets` clean, `cargo test` green, small focused PRs, and every behavior
+change comes with a test. Run `git config core.hooksPath .githooks` once per clone so the
+pre-push hook matches CI.
 
 ## License
 
