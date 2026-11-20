@@ -147,11 +147,21 @@ matches the words against symbol names, module paths, endpoint routes, and doc c
 recall with graph centrality and per-symbol risk by Reciprocal Rank Fusion — so a word
 landing on a central, risky symbol beats a bare substring hit.
 
-Each seed line shows its kind, the fields that matched (`why`), its dependent count, and a
-one-hop blast-radius preview of what it touches. `--budget` defaults to 10; when the cut
+Each seed line shows its kind, `file:line`, the fields that matched (`why`) and its
+dependent count, followed by the text of its definition line. `--touches` adds a one-hop
+preview of what each seed touches; it is off by default because it made up most of an
+answer's size and `impact` gives the same thing ranked. `--budget` defaults to 10; when the cut
 falls inside a run of equally-ranked candidates it says so, so a thin ranking is never
 mistaken for a confident one. Use this before `impact`/`neighbors`, which want the exact
 name `locate` hands you.
+
+## `ripple search <words...>`
+
+Symbols by name, best match first: a whole word of the name outranks a prefix, which
+outranks a substring, which outranks a hit on the module path. The same ranking as the MCP
+`search` tool. Each row is `Kind name (file:line)  <definition line>`. `--budget` defaults
+to 20 and the cut is reported. Use it when you know roughly what a symbol is called;
+`locate` is for a task you can only describe.
 
 ## `ripple impact <symbol>...`
 
@@ -171,13 +181,17 @@ substring, and no match is an error rather than an empty answer.
 
 Ranks the symbols changed in a diff by review priority — risk × downstream reach — with a
 reason on each line. With no `<base>` it diffs the working tree against `HEAD`; give it a
-rev (`HEAD~3`, a branch, a merge base) to review a range.
+rev (`HEAD~3`, a branch, a merge base) to review a range. Each row gives the symbol's line
+range (`file:start-end`), which is the hunk to open.
 
 ## `ripple neighbors <symbol>`
 
 One hop, unranked. `--in` for callers and importers, `--out` for callees and imports;
 `--depth N` to go further. Use this when you want the raw graph rather than a judgement
 about it — `impact` is the ranked version.
+
+Each row ends with `(file:line)` and that line's text: for a caller (`--in`) the call site,
+for a callee (`--out`) its definition. `--json` carries the same `line`.
 
 Edge kinds surfaced: `Calls`, `Imports`, `ChangesWith`, `GraphqlCall`, `DbQuery`.
 
