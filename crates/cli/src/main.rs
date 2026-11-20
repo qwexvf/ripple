@@ -3567,6 +3567,8 @@ fn cmd_neighbors(args: &[String]) -> Result<()> {
     } else {
         "neighbors of"
     };
+    // shared by every symbol the name matched: the cap is per answer
+    let mut snippets = SNIPPET_ROWS;
     for start in matches {
         let hops = graph.neighbors(start.id, dir, Some(&NEIGHBOR_KINDS), depth);
         let via_members = if dir == Dir::In {
@@ -3604,7 +3606,6 @@ fn cmd_neighbors(args: &[String]) -> Result<()> {
                 start.module_path,
                 format_args!("{:?}", start.kind)
             );
-            let mut snippets = SNIPPET_ROWS;
             for row in &tree_order(start.id, &hops, dir) {
                 let h = &row.hop;
                 // several call sites are several edges; collapsing them silently would
