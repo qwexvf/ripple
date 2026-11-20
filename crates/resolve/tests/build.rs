@@ -467,6 +467,45 @@ fn resolves_bare_calls_through_an_elixir_import() {
     assert_eq!(cross.imported, 1, "exactly one call resolved via import");
 }
 
+/// `Uploader.delete(...)` where `delete` comes from `use Waffle.Definition`: the
+/// module defines no `delete`, so the call used to produce no edge at all and the
+/// uploader read as unused. It now reaches the module, below a resolved call.
+#[test]
+fn a_qualified_call_to_an_injected_function_reaches_the_module() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/elixir_injected");
+    let indexed = resolve::build_incremental(
+        std::slice::from_ref(&root),
+        &std::collections::HashMap::new(),
+    )
+    .unwrap();
+    let cross = resolve::link_cross_service(&indexed.files, &indexed.result.nodes);
+
+    let remove = SymbolId::of("caller.ex", "remove");
+    let dir = SymbolId::of("caller.ex", "dir");
+    let uploader = SymbolId::of("uploader.ex", "App.Uploader");
+    let storage_dir = SymbolId::of("uploader.ex", "storage_dir");
+    let calls: Vec<(SymbolId, SymbolId, f32)> = cross
+        .edges
+        .iter()
+        .filter(|e| e.kind == EdgeKind::Calls)
+        .map(|e| (e.src, e.dst, e.confidence))
+        .collect();
+
+    let to_module: Vec<_> = calls.iter().filter(|c| c.1 == uploader).collect();
+    assert_eq!(to_module.len(), 1, "only the injected call: {calls:?}");
+    assert_eq!(to_module[0].0, remove);
+    assert!(to_module[0].2 < 0.9, "priced below a resolved call");
+    assert!(
+        calls.iter().any(|c| c.0 == dir && c.1 == storage_dir),
+        "a defined function is still the target: {calls:?}"
+    );
+    assert_eq!(
+        calls.len(),
+        2,
+        "a call into a non-project module adds nothing"
+    );
+}
+
 /// Struct fields became symbols, and a field routinely shares its name with the
 /// getter beside it. Nothing filtered call targets by kind, so `plan()` matched the
 /// field too and the real edge kept only half its confidence — 26 call edges in
