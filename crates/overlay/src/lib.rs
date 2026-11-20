@@ -83,6 +83,28 @@ pub fn mine(root: &Path) -> GitOverlay {
     try_mine(root).unwrap_or_default()
 }
 
+/// Is `path` (relative to `root`) tracked in the git index of the repository
+/// holding `root`? `false` when there is no repository.
+pub fn is_tracked(root: &Path, path: &str) -> bool {
+    let Ok(repo) = git2::Repository::discover(root) else {
+        return false;
+    };
+    let (Some(workdir), Ok(index)) = (repo.workdir(), repo.index()) else {
+        return false;
+    };
+    let abs = root
+        .canonicalize()
+        .unwrap_or_else(|_| root.to_path_buf())
+        .join(path);
+    let workdir = workdir
+        .canonicalize()
+        .unwrap_or_else(|_| workdir.to_path_buf());
+    let Ok(rel) = abs.strip_prefix(&workdir) else {
+        return false;
+    };
+    index.get_path(rel, 0).is_some()
+}
+
 /// The overlay cache: the HEAD it was mined at, plus the overlay itself.
 #[derive(Serialize, Deserialize)]
 struct CachedOverlay {

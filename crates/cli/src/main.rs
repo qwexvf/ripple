@@ -376,6 +376,9 @@ fn index_project(roots: &[PathBuf], lsp_calls: Option<std::time::Duration>) -> R
         store.write_index(&nodes, &edges, &indexed.files, &indexed.roots)
     })?;
     write_index_pointers(&roots[0], &indexed.roots)?;
+    for (_, root) in &indexed.roots {
+        keep_index_out_of_git(root);
+    }
     for root in &dropped {
         let _ = std::fs::remove_file(root.join(".ripple").join(INDEX_POINTER));
     }
@@ -1057,6 +1060,30 @@ fn warn_if_stale(store: &RedbStore, modules: &HashSet<&str>) {
 ///
 /// Best-effort per root: a read-only checkout is a reason to lose the shortcut,
 /// not a reason to fail an index that already succeeded.
+/// Make `.ripple/` ignore itself, and say so when the graph is already committed.
+///
+/// A committed `graph.redb` is restored by every checkout with a fresh mtime and
+/// old contents: files added since read as missing, and unchanged files hash as
+/// "changed since indexing" (#139). The ignore file is only created, never
+/// rewritten, so a project that wants a different rule keeps it.
+fn keep_index_out_of_git(root: &Path) {
+    let dir = root.join(".ripple");
+    let ignore = dir.join(".gitignore");
+    if dir.is_dir() && !ignore.exists() {
+        let _ = std::fs::write(
+            &ignore,
+            "# written by ripple: the index is local state\n*\n",
+        );
+    }
+    if overlay::is_tracked(root, ".ripple/graph.redb") {
+        eprintln!(
+            "⚠ {}: .ripple/graph.redb is committed to git, so every checkout restores a stale index; \
+             untrack it with `git rm -r --cached .ripple`",
+            root.display()
+        );
+    }
+}
+
 fn write_index_pointers(primary: &Path, roots: &[(String, PathBuf)]) -> Result<()> {
     let primary = primary
         .canonicalize()

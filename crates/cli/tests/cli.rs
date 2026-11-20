@@ -69,3 +69,15 @@ fn an_unknown_flag_is_an_error_not_a_default() {
         "the error must name the flag"
     );
 }
+
+/// A committed graph is restored stale by every checkout (#139), so the index
+/// directory ignores itself.
+#[test]
+fn index_directory_ignores_itself() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("a.ts"), "export function f() {}\n").unwrap();
+    let root = tmp.path().to_str().unwrap();
+    assert!(ripple(&["index", root]).status.success());
+    let ignore = std::fs::read_to_string(tmp.path().join(".ripple/.gitignore")).unwrap();
+    assert!(ignore.lines().any(|l| l == "*"), "{ignore}");
+}
