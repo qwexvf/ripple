@@ -160,3 +160,30 @@ fn rows_carry_their_line_and_its_text() {
     );
     assert!(run(&["locate", "load", "user", "--touches"]).contains('←'));
 }
+
+#[test]
+fn eval_vs_grep_refuses_an_empty_extract_cache_instead_of_scoring_grep_zero() {
+    use store::GraphStore;
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("a.ts"),
+        "export function loadUser(id: string) {}\n",
+    )
+    .expect("write");
+    let root = dir.path().to_str().expect("utf8 path");
+    assert!(ripple(&["index", root]).status.success(), "index failed");
+
+    // what a build with a different extract shape leaves behind: the graph loads,
+    // the extract cache reads as empty (#155)
+    let mut store = store::RedbStore::open(dir.path().join(".ripple/graph.redb"));
+    store.write_extracts(&[]).expect("clear extracts");
+    drop(store);
+
+    let out = ripple(&["eval", "--vs-grep", "--root", root]);
+    assert!(!out.status.success(), "eval scored a stale cache");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("re-run `ripple index`"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
