@@ -596,6 +596,42 @@ fn rust_method_calls_reach_their_methods() {
     );
 }
 
+/// A macro's arguments are a token tree, so a call that only ever happens inside
+/// `assert!`/`assert_eq!` produced no edge and review marked the function untested
+/// (#150).
+#[test]
+fn rust_calls_inside_macro_arguments_link() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rust_macro_calls");
+    let r = resolve::build(&root).unwrap();
+    let calls = |src: SymbolId| -> Vec<(SymbolId, f32)> {
+        r.edges
+            .iter()
+            .filter(|e| e.src == src && e.kind == EdgeKind::Calls)
+            .map(|e| (e.dst, e.confidence))
+            .collect()
+    };
+
+    let test = calls(SymbolId::of("lib.rs", "parses"));
+    let parse = SymbolId::of("lib.rs", "parse");
+    let new = SymbolId::of("lib.rs", "Parser::new");
+    assert!(test.iter().any(|(d, _)| *d == parse), "{test:?}");
+    assert!(test.iter().any(|(d, _)| *d == new), "{test:?}");
+    // `Parser::new()` is one qualified call, not also a bare `new()`
+    assert_eq!(
+        test.iter().filter(|(d, _)| *d == new).count(),
+        1,
+        "{test:?}"
+    );
+
+    let check = calls(SymbolId::of("lib.rs", "check"));
+    assert!(
+        check
+            .iter()
+            .any(|(d, _)| *d == SymbolId::of("lib.rs", "self_check")),
+        "{check:?}"
+    );
+}
+
 #[test]
 fn deterministic_build() {
     let a = resolve::build(&fixture()).unwrap();

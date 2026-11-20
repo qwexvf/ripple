@@ -14,3 +14,15 @@
   function: (field_expression
     value: (_) @ref.recv
     field: (field_identifier) @ref.member))
+
+; Macro arguments. `assert_eq!(parse(x), 1)` is a token tree, not an expression, so
+; none of the patterns above see the call inside it; a function whose only test
+; calls it from `assert!` read as untested (#150). Tokens carry no structure, so
+; a call is an identifier immediately followed by a parenthesized group. A token
+; matched by more than one of these keeps the most specific reading (see
+; `parse::extract_refs`).
+(token_tree (identifier) @ref.call . (token_tree))
+(token_tree
+  (identifier) @ref.qualifier . "::" . (identifier) @ref.call . (token_tree))
+(token_tree
+  [(identifier) (self)] @ref.recv . "." . (identifier) @ref.member . (token_tree))

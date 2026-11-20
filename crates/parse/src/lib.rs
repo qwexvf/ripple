@@ -615,6 +615,7 @@ fn extract_refs(tree: &Tree, matcher: &Matcher, src: &[u8]) -> Result<Vec<RefRec
             }
         }
     }
+    keep_most_specific(&mut out);
     // merged once, then binary-searched per ref: the linear scan was O(refs ×
     // ignored), and an Elixir module that is mostly @spec puts thousands in both
     let ignored = merge_regions(ignored);
@@ -689,12 +690,37 @@ fn extract_bindings(tree: &Tree, matcher: &Matcher, src: &[u8]) -> Result<Vec<Bi
     Ok(out)
 }
 
+/// Collapse refs that several query patterns produced for the same token to the
+/// most specific reading: a member call over a bare one, a qualified call over an
+/// unqualified one. A pattern over unstructured tokens (a Rust macro's arguments)
+/// cannot say "an identifier *not* preceded by `::`", so the general pattern fires
+/// alongside the specific one and would otherwise emit a second, looser edge.
+fn keep_most_specific(refs: &mut Vec<RefRec>) {
+    fn rank(r: &RefRec) -> u8 {
+        match (r.kind, r.qualifier.is_some()) {
+            (RefKind::Member, _) => 2,
+            (RefKind::Call, true) => 1,
+            (RefKind::Call, false) => 0,
+        }
+    }
+    let key = |r: &RefRec| (r.site.start_line, r.site.start_col, r.name.clone());
+    let mut best: HashMap<(u32, u32, String), u8> = HashMap::new();
+    for r in refs.iter() {
+        let e = best.entry(key(r)).or_insert(0);
+        *e = (*e).max(rank(r));
+    }
+    let mut seen = std::collections::HashSet::new();
+    refs.retain(|r| best.get(&key(r)) == Some(&rank(r)) && seen.insert((key(r), rank(r))));
+}
+
 fn receiver_of(node: Option<TsNode>, src: &[u8]) -> Receiver {
     let Some(node) = node else {
         return Receiver::Other;
     };
     match node.kind() {
-        "this" => Receiver::This,
+        // Rust's `self` is its own node kind wherever the grammar has structure to
+        // give it, including inside a macro's token tree
+        "this" | "self" => Receiver::This,
         // `self`/`cls` are the self-reference convention in Python, Rust, Swift and
         // others the way `this` (its own node kind) is in JS/TS — the receiver is the
         // enclosing type's instance. Classifying them as `This` scopes `self.method()`
