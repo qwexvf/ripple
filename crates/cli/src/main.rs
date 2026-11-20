@@ -752,9 +752,11 @@ fn cmd_impact(args: &[String]) -> Result<()> {
     let mut store = RedbStore::open(db_path(&root)?);
     let mut graph = load_current(&store, &root, args.iter().any(|a| a == "--sync"))?;
     let mut seeds: Vec<ir::SymbolId> = Vec::new();
+    let mut lookups: Vec<Value> = Vec::new();
     for s in &symbols {
-        let matches = lookup_or_bail(&graph, s, json, args)?;
+        let (matches, described) = lookup_or_bail(&graph, s, args)?;
         seeds.extend(matches.iter().map(|n| n.id));
+        lookups.push(described);
     }
     graph = verify_upgrade(&mut store, graph, &root, args, &seeds, json)?;
 
@@ -794,6 +796,7 @@ fn cmd_impact(args: &[String]) -> Result<()> {
             serde_json::to_string_pretty(&serde_json::json!({
                 "shown": hits.len(),
                 "reached": result.reached,
+                "lookups": lookups,
                 "hits": out,
             }))?
         );
@@ -954,12 +957,15 @@ fn locate_payload(located: &query::Located, tags: &[(String, PathBuf)]) -> serde
 /// An *exact* name matching several symbols is the more dangerous case and used to
 /// pass silently: six unrelated `run`s across three languages were seeded as one,
 /// and the union reads exactly like one symbol's blast radius (#37).
+/// Resolve a symbol argument, or fail naming it. The note about an inexact or
+/// ambiguous match goes to stderr in both modes, so stdout stays the answer alone
+/// and pipes cleanly (#132). The returned JSON describes the same caveat for
+/// `--json` consumers, who never see stderr.
 fn lookup_or_bail<'a>(
     graph: &'a InMemoryGraph,
     query: &str,
-    json: bool,
     args: &[String],
-) -> Result<Vec<&'a ir::Node>> {
+) -> Result<(Vec<&'a ir::Node>, Value)> {
     let Some((nodes, how)) = graph.lookup(query) else {
         bail!("no symbol matched: {query}");
     };
@@ -967,13 +973,31 @@ fn lookup_or_bail<'a>(
     // so a note about symbols the user already excluded is noise
     let nodes = narrow_to_file(nodes, query, args)?;
     if let Some(note) = lookup_note(query, &nodes, how) {
-        if json {
-            eprintln!("{note}");
-        } else {
-            println!("{note}");
-        }
+        eprintln!("{note}");
     }
-    Ok(nodes)
+    let described = lookup_json(query, &nodes, how);
+    Ok((nodes, described))
+}
+
+/// The machine-readable form of `lookup_note`: which rule matched the query, how
+/// many symbols it matched, and the first few of them. `ambiguous` is true whenever
+/// the answer is about anything other than one exactly-named symbol.
+fn lookup_json(query: &str, nodes: &[&ir::Node], how: store::Match) -> Value {
+    const SHOWN: usize = 10;
+    let rule = match how {
+        store::Match::Exact => "exact",
+        store::Match::QualifiedSuffix => "qualified_suffix",
+        store::Match::Substring => "substring",
+    };
+    json!({
+        "query": query,
+        "match": rule,
+        "candidates": nodes.len(),
+        "ambiguous": how != store::Match::Exact || nodes.len() > 1,
+        "matched": nodes.iter().take(SHOWN).map(|n| json!({
+            "name": n.name, "module": n.module_path, "kind": format!("{:?}", n.kind),
+        })).collect::<Vec<_>>(),
+    })
 }
 
 /// What to say about a lookup whose answer isn't one exactly-named symbol.
@@ -1177,8 +1201,8 @@ fn cmd_path(args: &[String]) -> Result<()> {
 
     let graph = RedbStore::open(db_path(&root)?).load()?;
     // no --in-file here: one filter over two endpoints has no unambiguous meaning
-    let starts = lookup_or_bail(&graph, from, json, &[])?;
-    let targets = lookup_or_bail(&graph, to, json, &[])?;
+    let (starts, from_lookup) = lookup_or_bail(&graph, from, &[])?;
+    let (targets, to_lookup) = lookup_or_bail(&graph, to, &[])?;
 
     let mut routes: Vec<(String, String, query::Route)> = Vec::new();
     for s in &starts {
@@ -1219,7 +1243,10 @@ fn cmd_path(args: &[String]) -> Result<()> {
             .collect();
         println!(
             "{}",
-            serde_json::to_string_pretty(&json!({ "routes": out }))?
+            serde_json::to_string_pretty(&json!({
+                "lookups": [from_lookup, to_lookup],
+                "routes": out,
+            }))?
         );
         return Ok(());
     }
@@ -3243,7 +3270,7 @@ fn cmd_neighbors(args: &[String]) -> Result<()> {
     let store = RedbStore::open(db_path(&root)?);
     let graph = store.load()?;
 
-    let matches = lookup_or_bail(&graph, &symbol, json, args)?;
+    let (matches, lookup) = lookup_or_bail(&graph, &symbol, args)?;
     warn_if_stale(
         &store,
         &matches.iter().map(|n| n.module_path.as_str()).collect(),
@@ -3254,23 +3281,24 @@ fn cmd_neighbors(args: &[String]) -> Result<()> {
     } else {
         "neighbors of"
     };
+    // one document per invocation, however many symbols the name matched: one
+    // array per match printed back to back is not parseable JSON (#130)
+    let mut json_rows: Vec<Value> = Vec::new();
     for start in matches {
         let hops = graph.neighbors(start.id, dir, Some(&NEIGHBOR_KINDS), depth);
         if json {
-            let out: Vec<_> = hops
-                .iter()
-                .map(|h| {
-                    serde_json::json!({
-                        "name": h.node.name, "kind": format!("{:?}", h.node.kind),
-                        "edge": format!("{:?}", h.edge.kind), "confidence": h.edge.confidence,
-                        "module": h.node.module_path, "depth": h.depth,
-                        // which node this hop hangs off — without it a depth-3 walk is
-                        // a flat list and the chain can't be reconstructed
-                        "from": parent_of(h, dir).and_then(|p| graph.get(p)).map(|n| n.name.clone()),
-                    })
+            json_rows.extend(hops.iter().map(|h| {
+                serde_json::json!({
+                    "name": h.node.name, "kind": format!("{:?}", h.node.kind),
+                    "edge": format!("{:?}", h.edge.kind), "confidence": h.edge.confidence,
+                    "module": h.node.module_path, "depth": h.depth,
+                    // which node this hop hangs off — without it a depth-3 walk is
+                    // a flat list and the chain can't be reconstructed
+                    "from": parent_of(h, dir).and_then(|p| graph.get(p)).map(|n| n.name.clone()),
+                    // which matched symbol this row answers about, when the name was ambiguous
+                    "target": start.name, "target_module": start.module_path,
                 })
-                .collect();
-            println!("{}", serde_json::to_string_pretty(&out)?);
+            }));
         } else {
             println!(
                 "{arrow} {} ({}) [{}]",
@@ -3294,6 +3322,16 @@ fn cmd_neighbors(args: &[String]) -> Result<()> {
                 );
             }
         }
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "direction": if dir == Dir::In { "in" } else { "out" },
+                "lookup": lookup,
+                "neighbors": json_rows,
+            }))?
+        );
     }
     Ok(())
 }
@@ -3647,6 +3685,21 @@ mod tests {
             doc: None,
             route_path: None,
         }
+    }
+
+    /// `--json` consumers never see stderr, so the caveat has to be in the document (#132).
+    #[test]
+    fn lookup_json_marks_inexact_and_ambiguous_matches() {
+        let (a, b) = (named("run", "verify.rs"), named("run", "b.ts"));
+        let one = lookup_json("run", &[&a], store::Match::Exact);
+        assert_eq!(one["ambiguous"], false);
+        assert_eq!(one["candidates"], 1);
+        let two = lookup_json("run", &[&a, &b], store::Match::Exact);
+        assert_eq!(two["ambiguous"], true);
+        assert_eq!(two["matched"].as_array().map(Vec::len), Some(2));
+        let loose = lookup_json("ru", &[&a], store::Match::Substring);
+        assert_eq!(loose["ambiguous"], true);
+        assert_eq!(loose["match"], "substring");
     }
 
     /// Six unrelated `run`s in three languages used to be seeded as one symbol,

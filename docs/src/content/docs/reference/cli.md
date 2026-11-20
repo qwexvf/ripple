@@ -185,6 +185,14 @@ about it — `impact` is the ranked version.
 
 Edge kinds surfaced: `Calls`, `Imports`, `ChangesWith`, `GraphqlCall`, `DbQuery`.
 
+`--json` prints one object, `{direction, lookup, neighbors}`, however many symbols the name
+matched. Each row names the matched symbol it answers about in `target` / `target_module`.
+
+When a name matches loosely or more than once, the note saying so goes to stderr. In `--json`
+output `impact` and `path` carry it as `lookups` and `neighbors` as `lookup`: the match rule
+(`exact`, `qualified_suffix`, `substring`), the candidate count, `ambiguous`, and the first
+matched symbols.
+
 ## `ripple path <from> <to>`
 
 How does A reach B? Routes along the dependency direction, shortest first, each annotated
