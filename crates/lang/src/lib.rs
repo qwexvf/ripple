@@ -219,6 +219,16 @@ pub trait LanguageAdapter: Send + Sync {
         false
     }
 
+    /// Does a bare call see every top-level definition in the calling file's
+    /// directory, exported or not? Default: no.
+    ///
+    /// `true` for Go, where a package is a directory of files sharing one
+    /// namespace: `AnalyzeUsage(…)` in `snapshot.go` names the function in
+    /// `usage_full.go` with no import at all (#136).
+    fn bare_calls_see_package(&self) -> bool {
+        false
+    }
+
     /// May a member call whose receiver type is unknown resolve to every project
     /// method of that name (at a split, low confidence)? Default: yes.
     ///

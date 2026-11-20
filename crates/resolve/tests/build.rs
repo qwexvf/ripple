@@ -711,6 +711,29 @@ fn rust_use_binds_names_across_workspace_crates() {
     );
 }
 
+/// A Go package is a directory: a bare call to a function in a sibling file needs
+/// no import and was dropped (#136). A same-named function in another package is
+/// not in scope.
+#[test]
+fn go_bare_calls_reach_the_same_package() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/go_package");
+    let r = resolve::build(&root).unwrap();
+    let snapshot = SymbolId::of("usecase/snapshot.go", "Snapshot");
+    let mut called: Vec<SymbolId> = r
+        .edges
+        .iter()
+        .filter(|e| e.src == snapshot && e.kind == EdgeKind::Calls)
+        .map(|e| e.dst)
+        .collect();
+    called.sort_unstable();
+    let mut expected = vec![
+        SymbolId::of("usecase/usage_full.go", "AnalyzeUsage"),
+        SymbolId::of("usecase/usage_full.go", "helper"),
+    ];
+    expected.sort_unstable();
+    assert_eq!(called, expected);
+}
+
 #[test]
 fn deterministic_build() {
     let a = resolve::build(&fixture()).unwrap();

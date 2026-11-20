@@ -441,6 +441,9 @@ struct DefIndex {
     /// files sharing one namespace, so a `config.Foo()` call resolves against every
     /// file in `internal/config/`, not one. Keyed by the file's parent dir. See #85.
     pkg_exports: HashMap<(PathBuf, String), Vec<SymbolId>>,
+    /// (directory, name) → top-level definitions, exported or not, for a language
+    /// whose package is its directory ([`lang::LanguageAdapter::bare_calls_see_package`]).
+    pkg_defs: HashMap<(PathBuf, String), Vec<SymbolId>>,
     /// (root, class, method) → symbols
     methods_by_class: HashMap<(usize, String, String), Vec<SymbolId>>,
     /// (root, method) → symbols (candidate fallback)
@@ -512,6 +515,14 @@ fn index_defs(
         for d in &f.extract.defs {
             idx.family_of.insert(d.id, family);
             idx.file_of.insert(d.id, f.canonical.clone());
+            if d.qualified_name == d.name {
+                if let Some(dir) = f.canonical.parent() {
+                    idx.pkg_defs
+                        .entry((dir.to_path_buf(), d.name.clone()))
+                        .or_default()
+                        .push(d.id);
+                }
+            }
             by_name.entry(d.name.clone()).or_default().push(d.id);
             if d.is_exported {
                 idx.export_table
@@ -621,6 +632,7 @@ fn link(
             self_calls: adapter.is_some_and(|a| a.bare_call_in_method_is_self_call()),
             family: adapter.map_or("", |a| a.linkage_family()),
             member_fallback: adapter.is_none_or(|a| a.member_calls_fall_back_by_name()),
+            package: adapter.is_some_and(|a| a.bare_calls_see_package()),
         };
         resolve_calls(f, root, idx, module_id, &scope, rules, &mut sink);
     }
@@ -968,6 +980,8 @@ struct CallRules {
     family: &'static str,
     /// [`lang::LanguageAdapter::member_calls_fall_back_by_name`]
     member_fallback: bool,
+    /// [`lang::LanguageAdapter::bare_calls_see_package`]
+    package: bool,
 }
 
 /// Resolve a file's call sites (bare + member) into Calls edges.
@@ -1020,7 +1034,7 @@ fn resolve_calls(
                     None => {
                         resolve_self_call(&r.name, enclosing, local, idx, root, rules.self_calls)
                             .unwrap_or_else(|| {
-                                resolve_bare(&r.name, local, scope, idx, root, rules.global_linkage)
+                                resolve_bare(&r.name, &f.canonical, local, scope, idx, root, rules)
                             })
                     }
                 }
@@ -1127,11 +1141,12 @@ fn resolve_calls(
 /// spraying, and the caller divides confidence by the number that survive.
 fn resolve_bare(
     name: &str,
+    file: &Path,
     local: &HashMap<String, Vec<SymbolId>>,
     scope: &ImportScope,
     idx: &DefIndex,
     root: usize,
-    global_linkage: bool,
+    rules: CallRules,
 ) -> (Vec<SymbolId>, f32) {
     if let Some(ids) = local.get(name) {
         if !ids.is_empty() {
@@ -1144,7 +1159,17 @@ fn resolve_bare(
     if let Some(ids) = scope.ambiguous.get(name) {
         return (ids.clone(), CONF_LOCAL_CALL);
     }
-    if !global_linkage {
+    // a Go package is its directory: another file's top-level name is in scope
+    // with no import (#136)
+    if rules.package {
+        let in_package = file
+            .parent()
+            .and_then(|dir| idx.pkg_defs.get(&(dir.to_path_buf(), name.to_owned())));
+        if let Some(ids) = in_package.filter(|ids| !ids.is_empty()) {
+            return (ids.clone(), CONF_LOCAL_CALL);
+        }
+    }
+    if !rules.global_linkage {
         return (Vec::new(), CONF_LOCAL_CALL);
     }
     let mut candidates: Vec<SymbolId> = idx

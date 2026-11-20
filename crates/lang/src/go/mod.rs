@@ -79,6 +79,10 @@ impl LanguageAdapter for Adapter {
     /// path (no dot in its first segment — `fmt`, `net/http`) is not a
     /// third-party dependency and normalizes away. Intra-module packages are
     /// resolved locally by [`LanguageAdapter::resolve_import`] before this runs.
+    fn bare_calls_see_package(&self) -> bool {
+        true
+    }
+
     fn external_dep_key(&self, spec: &str) -> Option<String> {
         resolve_import::go_dep_key(spec)
     }
