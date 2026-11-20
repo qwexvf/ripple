@@ -275,6 +275,15 @@ with those that did not. All of it is observational. "Used" says an answer was a
 not that it was right, and ripple tends to be reached for on the harder tasks, which
 inflates its per-edit cost. `eval --vs-grep` is the controlled comparison.
 
+To compare fairly on real work, assign sessions at random. `--arms <file>` (default
+`$XDG_STATE_HOME/ripple/ab.jsonl` when it exists) reads lines of
+`{"session_id": "...", "arm": "..."}`, written by a session-start hook that also keeps
+ripple out of `holdout` sessions. The report then adds one row per arm: edits, the
+model's context and output tokens per edit (from each message's `usage`, subagents
+included), lookups per edit, and ripple calls (which should be zero in the holdout arm).
+Edits are counted from the file-editing tools only (Edit, MultiEdit, Write, NotebookEdit),
+so a session that edits through the shell is undercounted in either arm.
+
 ## `ripple lsp doctor`
 
 Reports which languages are indexed here and whether a language server is installed to
