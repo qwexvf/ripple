@@ -610,6 +610,34 @@ fn singular(word: &str) -> String {
     }
 }
 
+/// Is this task word written as a code identifier (`getAuthSession`, `run_ci`)
+/// rather than as prose? Decided by shape alone: an inner capital or an underscore.
+/// Short ones are left out, since `a_b` squashes to something any name could equal.
+fn is_identifier(word: &str) -> bool {
+    let chars: Vec<char> = word.chars().collect();
+    let shaped = chars.contains(&'_')
+        || chars
+            .windows(2)
+            .any(|p| p[0].is_lowercase() && p[1].is_uppercase());
+    shaped && chars.iter().filter(|c| c.is_alphanumeric()).count() >= 4
+}
+
+/// An identifier with its casing and separators removed, so one name compares
+/// equal across conventions: `UploadFileDialog`, `upload_file_dialog` and
+/// `upload-file-dialog` are all `uploadfiledialog`.
+fn squash(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// A path's file name without its extensions.
+fn file_stem(path: &str) -> &str {
+    let file = path.rsplit('/').next().unwrap_or(path);
+    file.split('.').next().unwrap_or(file)
+}
+
 /// Score `node` against each of the task `terms`: one entry per term, zero where
 /// it does not match, plus which field carried each hit. All zeros means drop it.
 /// A route word weighs most (a URL is a deliberate name for a feature), then the
@@ -760,8 +788,30 @@ pub fn locate(graph: &InMemoryGraph, task: &str, budget: usize) -> Located {
     // a task that *is* a symbol's name asks for that symbol: `locate run_ci` split
     // into `run` + `ci` and let a dozen central test helpers named `run` bury the
     // exact match (#135). Exact names go first, still in ranked order among themselves.
+    //
+    // The same holds for an identifier written inside a longer task: in
+    // `getAuthSession server session suspended player` the split words `get`,
+    // `auth`, `session` each match hundreds of symbols, and the one symbol spelled
+    // `getAuthSession` came back below `getFragmentData`. A file named for the
+    // identifier counts too (`UploadFileDialog` is `upload-file-dialog.tsx`).
     let query = task.trim();
-    let exact = |c: &Cand| c.node.name == query || c.node.qualified_name == query;
+    let identifiers: Vec<String> = task
+        .split_whitespace()
+        .filter(|w| is_identifier(w))
+        .map(squash)
+        .collect();
+    let exact = |c: &Cand| {
+        c.node.name == query
+            || c.node.qualified_name == query
+            || (!identifiers.is_empty() && {
+                let name = if c.node.kind == ir::NodeKind::Module {
+                    squash(file_stem(&c.node.module_path))
+                } else {
+                    squash(&c.node.name)
+                };
+                identifiers.contains(&name)
+            })
+    };
     let key = |a: usize, b: usize| {
         exact(&cands[b])
             .cmp(&exact(&cands[a]))
@@ -1255,6 +1305,38 @@ mod tests {
         let r = locate(&graph, "login", 2);
         assert_eq!(r.seeds[0].node.id, hub.id, "the hub outranks the leaf");
         assert_eq!(r.seeds[0].centrality, 2);
+    }
+
+    /// An identifier inside a longer task pins the symbol spelled that way: its
+    /// split words alone each match more central symbols.
+    #[test]
+    fn locate_puts_an_identifier_named_in_the_task_first() {
+        let target = node("src/server/fns/get-session.ts", "getAuthSession");
+        let hub = node("src/generated/fragment-masking.ts", "getSessionPlayer");
+        let mut file = node(
+            "src/components/upload-file-dialog.tsx",
+            "upload-file-dialog.tsx",
+        );
+        file.kind = NodeKind::Module;
+        let mut nodes = vec![target.clone(), hub.clone(), file.clone()];
+        let mut edges = Vec::new();
+        for i in 0..20 {
+            let caller = node("src/x.ts", &format!("c{i}"));
+            edges.push(calls(&caller, &hub));
+            nodes.push(caller);
+        }
+        let graph = InMemoryGraph::from_parts(nodes, edges);
+
+        let r = locate(&graph, "getAuthSession server session suspended player", 2);
+        assert_eq!(r.seeds[0].node.id, target.id);
+
+        // a file is found by the identifier it is named for, whatever its casing
+        let r = locate(&graph, "UploadFileDialog upload header", 1);
+        assert_eq!(r.seeds[0].node.id, file.id);
+
+        // prose words are not identifiers: `session` must not pin anything
+        assert!(!is_identifier("session"));
+        assert!(!is_identifier("a_b"));
     }
 
     /// A hub that matches one word of the task, and only through its path, used to
