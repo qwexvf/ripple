@@ -18,8 +18,8 @@ You can run ripple three ways, all over the same graph:
 - an **[MCP server](docs/src/content/docs/reference/mcp.md)**, so an AI agent can find its
   way around an unfamiliar codebase before it edits (find the right symbol, see what a change
   touches, rank what to review) instead of grepping blind
-- a **[daemon](docs/src/content/docs/reference/daemon.md)** that keeps the graph in memory and
-  re-indexes on save, so a query is a sub-millisecond socket round-trip
+- a **[daemon](docs/src/content/docs/reference/daemon.md)** that re-indexes registered projects
+  on save, so the graph every query reads stays current
 
 ## The two questions
 
@@ -115,9 +115,11 @@ also upgrade call edges using a language server (`--verify lsp`). The
 
 Most of the time a query spends is *startup*: compiling the tree-sitter queries for every
 language adapter (~0.8s) before it can answer anything. `ripple daemon` does that once,
-keeps each project's graph in RAM, and **re-indexes on save** through a file watcher. A query
-then becomes a sub-millisecond socket round-trip instead of a cold build. One daemon serves
-many projects.
+keeps each project's graph in RAM, and **re-indexes on save** through a file watcher. Each
+re-index rewrites `.ripple/graph.redb`, which is what the `ripple` CLI commands read, so they
+answer from current source without a manual `ripple index`. The CLI does not query the daemon
+itself; a client that speaks the socket protocol directly gets an answer in a few milliseconds
+instead of paying startup. One daemon serves many projects.
 
 ```bash
 ripple daemon                     # run it (foreground; a service manager keeps it up)
@@ -142,7 +144,8 @@ systemctl --user enable --now ripple-daemon
 ripple daemon register .
 ```
 
-See the [daemon reference](docs/src/content/docs/reference/daemon.md) for details.
+Registrations are remembered in `$XDG_STATE_HOME/ripple/daemon-projects`, so a restarted
+daemon resumes watching them. See the [daemon reference](docs/src/content/docs/reference/daemon.md) for details.
 Linux/systemd comes first; launchd and other OS wrappers aren't done yet.
 
 ## How it works
