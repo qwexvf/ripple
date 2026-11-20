@@ -89,7 +89,7 @@ fn rows_carry_their_line_and_its_text() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(
         tmp.path().join("a.ts"),
-        "export function loadUser() {}\n\nexport function main() {\n  loadUser();\n}\n",
+        "export function loadUser(id: string) {}\n\nexport function main() {\n  loadUser(\"a\");\n}\n",
     )
     .unwrap();
     let run = |args: &[&str]| {
@@ -105,22 +105,22 @@ fn rows_carry_their_line_and_its_text() {
 
     let callers = run(&["neighbors", "loadUser", "--in"]);
     assert!(
-        callers.contains("main (a.ts:4)  loadUser();"),
+        callers.contains("main (a.ts:4)  loadUser(\"a\");"),
         "a caller is shown at its call site:\n{callers}"
     );
     let callees = run(&["neighbors", "main", "--out"]);
     assert!(
-        callees.contains("loadUser (a.ts:1)  export function loadUser() {}"),
+        callees.contains("loadUser (a.ts:1)  export function loadUser(id: string) {}"),
         "a callee is shown at its definition:\n{callees}"
     );
     let found = run(&["search", "load", "user"]);
     assert!(
-        found.contains("loadUser (a.ts:1)  export function loadUser() {}"),
+        found.contains("loadUser (a.ts:1)  export function loadUser(id: string) {}"),
         "{found}"
     );
     let located = run(&["locate", "load", "user"]);
     assert!(
-        located.contains("      export function loadUser() {}"),
+        located.contains("      export function loadUser(id: string) {}"),
         "{located}"
     );
     assert!(

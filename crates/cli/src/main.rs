@@ -898,7 +898,7 @@ fn cmd_locate(args: &[String]) -> Result<()> {
             s.why.join(", "),
             s.centrality
         );
-        if let Some(text) = sources.line(&s.node.module_path, s.node.span.start_line) {
+        if let Some(text) = definition_text(&mut sources, &s.node) {
             println!("      {text}");
         }
         // the one-hop preview was 64% of a locate answer's characters in the
@@ -938,7 +938,7 @@ fn locate_payload(
                 "symbol": s.node.name,
                 "module": s.node.module_path,
                 "line": s.node.span.start_line,
-                "text": sources.line(&s.node.module_path, s.node.span.start_line),
+                "text": definition_text(sources, &s.node),
                 "repo": repo_of(&s.node.module_path, tags),
                 "kind": format!("{:?}", s.node.kind),
                 "why": s.why,
@@ -1502,6 +1502,18 @@ fn located_line(sources: &mut Sources, module_path: &str, line: u32) -> String {
         Some(text) => format!("({module_path}:{line})  {text}"),
         None => format!("({module_path}:{line})"),
     }
+}
+
+/// A node's definition line, unless it only restates the name (`defmodule X do`,
+/// `pub struct X {`): then it costs tokens and tells the agent nothing new.
+fn definition_text(sources: &mut Sources, node: &ir::Node) -> Option<String> {
+    let text = sources.line(&node.module_path, node.span.start_line)?;
+    let rest = text.replace(node.name.as_str(), "");
+    let words = rest
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|w| !w.is_empty())
+        .count();
+    (words > 2).then_some(text)
 }
 
 fn hit_name(node: &ir::Node) -> String {
@@ -3666,6 +3678,27 @@ mod tests {
     use super::*;
     fn v(a: &[&str]) -> Vec<String> {
         a.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn a_definition_line_that_only_restates_the_name_is_dropped() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("a.ex"),
+            "defmodule App.Events do\n  def register(event, player_id, opts \\\\ []) do\n",
+        )
+        .unwrap();
+        let mut sources = Sources::new(Vec::new(), tmp.path());
+        let node = |name: &str, line: u32| {
+            let mut n = sym(name, "a.ex");
+            n.span.start_line = line;
+            n
+        };
+        assert_eq!(definition_text(&mut sources, &node("App.Events", 1)), None);
+        assert_eq!(
+            definition_text(&mut sources, &node("register", 2)).as_deref(),
+            Some("def register(event, player_id, opts \\\\ []) do")
+        );
     }
 
     #[test]
