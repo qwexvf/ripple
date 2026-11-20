@@ -6,7 +6,8 @@
 //! `super::` prefixes, `lib.rs`/`mod.rs` conventions). Same-file calls resolve;
 //! cross-file ones await that work. Under-link, never wrong-link.
 
-use crate::LanguageAdapter;
+use crate::{LanguageAdapter, Workspace};
+use std::path::{Path, PathBuf};
 use tree_sitter::Node;
 
 pub struct Adapter;
@@ -52,6 +53,49 @@ impl LanguageAdapter for Adapter {
 
     fn refs_query(&self) -> Option<&'static str> {
         Some(include_str!("queries/refs.scm"))
+    }
+
+    fn imports_query(&self) -> Option<&'static str> {
+        Some(include_str!("queries/imports.scm"))
+    }
+
+    fn bindings_query(&self) -> Option<&'static str> {
+        Some(include_str!("queries/bindings.scm"))
+    }
+
+    /// Most Rust member calls are on std types (`v.push()`, `m.get()`), whose
+    /// methods are not in the graph. Guessing by name sent each of them to every
+    /// project method sharing the name: 13,000 extra edges on ripple's own tree.
+    fn member_calls_fall_back_by_name(&self) -> bool {
+        false
+    }
+
+    /// A `use` path names a crate, then modules. Only the crate is mapped: the
+    /// module tree (`mod` declarations, `mod.rs`, `#[path]`) is not modelled, so the
+    /// answer is the crate's root file and the resolver searches below it for the
+    /// name (`unexported_import_searches_package`). `None` for any crate that is not
+    /// in the workspace, which `external_dep_key` then names.
+    fn resolve_import(&self, spec: &str, from_file: &Path, ws: &Workspace) -> Option<PathBuf> {
+        let first = spec.split("::").next()?.trim();
+        let crate_dir = match first {
+            "crate" | "self" | "super" => enclosing_crate(from_file)?,
+            name => ws.rust_crates.get(name)?.clone(),
+        };
+        crate_root_file(&crate_dir)
+    }
+
+    /// The crate a non-workspace `use` path names: `std` for `std::collections`,
+    /// `serde` for `serde::Deserialize`.
+    fn external_dep_key(&self, spec: &str) -> Option<String> {
+        let first = spec.split("::").next()?.trim();
+        if first.is_empty() || matches!(first, "crate" | "self" | "super") {
+            return None;
+        }
+        Some(first.to_owned())
+    }
+
+    fn unexported_import_searches_package(&self) -> bool {
+        true
     }
 
     /// `pub` in any form (`pub`, `pub(crate)`, …). A function in a private module
@@ -204,6 +248,23 @@ fn impl_type<'a>(def: Node, src: &'a [u8]) -> Option<&'a str> {
     None
 }
 
+/// The nearest directory at or above `file` holding a `Cargo.toml`.
+fn enclosing_crate(file: &Path) -> Option<PathBuf> {
+    file.ancestors()
+        .skip(1)
+        .find(|d| d.join("Cargo.toml").is_file())
+        .map(Path::to_path_buf)
+}
+
+/// `src/lib.rs`, else `src/main.rs`, of a crate directory.
+fn crate_root_file(crate_dir: &Path) -> Option<PathBuf> {
+    ["src/lib.rs", "src/main.rs"]
+        .iter()
+        .map(|f| crate_dir.join(f))
+        .find(|p| p.is_file())
+        .and_then(|p| p.canonicalize().ok())
+}
+
 /// The trait a method is declared in, for a method with no `impl` around it: a
 /// required signature or a default body inside `trait T { … }`.
 fn trait_name<'a>(def: Node, src: &'a [u8]) -> Option<&'a str> {
@@ -319,6 +380,10 @@ mod tests {
         tree_sitter::Query::new(&lang, adapter.tags_query()).expect("tags.scm");
         tree_sitter::Query::new(&lang, adapter.refs_query().expect("refs.scm present"))
             .expect("refs.scm");
+        tree_sitter::Query::new(&lang, adapter.imports_query().expect("imports.scm"))
+            .expect("imports.scm");
+        tree_sitter::Query::new(&lang, adapter.bindings_query().expect("bindings.scm"))
+            .expect("bindings.scm");
     }
 
     #[test]

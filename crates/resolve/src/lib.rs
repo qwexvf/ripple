@@ -475,6 +475,8 @@ struct DefIndex {
     /// [`lang::LanguageAdapter::linkage_family`] of the file each definition is in.
     /// A call resolved by name keeps only candidates from its own family (#134).
     family_of: HashMap<SymbolId, &'static str>,
+    /// the file each definition is in, for a search scoped to a package directory
+    file_of: HashMap<SymbolId, PathBuf>,
 }
 
 /// The trailing identifier of a qualified name or path — `Client` from
@@ -509,6 +511,7 @@ fn index_defs(
         let by_name = idx.file_defs.entry(f.canonical.clone()).or_default();
         for d in &f.extract.defs {
             idx.family_of.insert(d.id, family);
+            idx.file_of.insert(d.id, f.canonical.clone());
             by_name.entry(d.name.clone()).or_default().push(d.id);
             if d.is_exported {
                 idx.export_table
@@ -617,6 +620,7 @@ fn link(
             global_linkage: adapter.is_some_and(|a| a.bare_calls_resolve_globally()),
             self_calls: adapter.is_some_and(|a| a.bare_call_in_method_is_self_call()),
             family: adapter.map_or("", |a| a.linkage_family()),
+            member_fallback: adapter.is_none_or(|a| a.member_calls_fall_back_by_name()),
         };
         resolve_calls(f, root, idx, module_id, &scope, rules, &mut sink);
     }
@@ -666,6 +670,10 @@ struct ImportScope {
     /// dependency node for (Go's `os`, `url`). A member call on one names that
     /// module's function, so it must not fall back to same-named methods here (#134).
     opaque_modules: HashSet<String>,
+    /// local name → the several project symbols an import could mean, when the
+    /// imported file does not export it and the adapter allows a package search.
+    /// A call through the name splits its confidence across them.
+    ambiguous: HashMap<String, Vec<SymbolId>>,
 }
 
 /// Id of the external module (dep-key) node. Kept in sync with
@@ -872,19 +880,75 @@ fn resolve_imports(
                 MAX_REEXPORT_HOPS,
             )
         };
-        if let Some(sym) = resolved {
-            scope.bindings.insert(imp.local_name.clone(), sym);
+        let candidates = match resolved {
+            Some(sym) => vec![sym],
+            None if adapter.unexported_import_searches_package() => {
+                package_candidates(idx, root, &target, &imp.imported_name, adapter)
+            }
+            None => Vec::new(),
+        };
+        match candidates.as_slice() {
+            [] => continue,
+            [sym] => {
+                scope.bindings.insert(imp.local_name.clone(), *sym);
+            }
+            many => {
+                scope
+                    .ambiguous
+                    .insert(imp.local_name.clone(), many.to_vec());
+            }
+        }
+        let n = candidates.len() as f32;
+        for sym in candidates {
             sink.edges.push(Edge {
                 src: module_id,
                 dst: sym,
                 kind: EdgeKind::Imports,
-                confidence: cross_root_conf(idx, root, sym, CONF_IMPORT),
+                confidence: cross_root_conf(idx, root, sym, CONF_IMPORT / n),
                 site: imp.site,
                 source: EdgeSource::Extracted,
             });
         }
     }
     scope
+}
+
+/// Exported definitions named `name` anywhere under `target`'s directory, in the
+/// importing file's language family. For an import that reached a package root
+/// whose export table does not list the name: Rust re-exports a submodule's item
+/// with `pub use`, which is not modelled, so the item's own file is found by name.
+/// Too many candidates is no answer at all.
+fn package_candidates(
+    idx: &DefIndex,
+    root: usize,
+    target: &Path,
+    name: &str,
+    adapter: &dyn LanguageAdapter,
+) -> Vec<SymbolId> {
+    let Some(dir) = target.parent() else {
+        return Vec::new();
+    };
+    let family = adapter.linkage_family();
+    let mut found: Vec<SymbolId> = idx
+        .by_name
+        .get(&(root, name.to_owned()))
+        .into_iter()
+        .flatten()
+        .copied()
+        .filter(|id| idx.family_of.get(id) == Some(&family))
+        .filter(|id| {
+            idx.file_of.get(id).is_some_and(|file| {
+                file.starts_with(dir)
+                    && idx.export_table.get(&(file.clone(), name.to_owned())) == Some(id)
+            })
+        })
+        .collect();
+    found.sort_unstable();
+    found.dedup();
+    if found.len() > MAX_PATH_CANDIDATES {
+        return Vec::new();
+    }
+    found
 }
 
 /// What the calling file's language says about unqualified calls — the two
@@ -902,6 +966,8 @@ struct CallRules {
     /// [`lang::LanguageAdapter::linkage_family`]: which definitions a call in this
     /// file can name at all.
     family: &'static str,
+    /// [`lang::LanguageAdapter::member_calls_fall_back_by_name`]
+    member_fallback: bool,
 }
 
 /// Resolve a file's call sites (bare + member) into Calls edges.
@@ -1005,6 +1071,7 @@ fn resolve_calls(
                         recv_type,
                         idx,
                         root,
+                        rules.member_fallback,
                     )
                 }
             }
@@ -1073,6 +1140,9 @@ fn resolve_bare(
     }
     if let Some(&sym) = scope.bindings.get(name) {
         return (vec![sym], CONF_LOCAL_CALL);
+    }
+    if let Some(ids) = scope.ambiguous.get(name) {
+        return (ids.clone(), CONF_LOCAL_CALL);
     }
     if !global_linkage {
         return (Vec::new(), CONF_LOCAL_CALL);
@@ -1215,8 +1285,12 @@ fn resolve_member(
     recv_type: Option<&str>,
     idx: &DefIndex,
     root: usize,
+    fallback: bool,
 ) -> (Vec<SymbolId>, f32) {
     let candidates = || {
+        if !fallback {
+            return Vec::new();
+        }
         idx.methods_by_name
             .get(&(root, method.to_owned()))
             .cloned()

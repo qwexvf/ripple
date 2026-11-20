@@ -158,6 +158,10 @@ pub struct Workspace {
     /// it names a package directory under the root, not a third-party dependency.
     /// Without this the Go adapter treats every self-import as external. See #85.
     pub go_module: Option<(String, PathBuf)>,
+    /// Rust crate name (as code spells it, `-` read as `_`) → the crate's directory,
+    /// from every `Cargo.toml` under the root, so `use aegis_net::DiskCache` lands
+    /// in the workspace crate rather than reading as a third-party dependency.
+    pub rust_crates: HashMap<String, PathBuf>,
 }
 
 /// A language adapter. Tier 0 = grammar + tags query (required). Tier 1 =
@@ -213,6 +217,16 @@ pub trait LanguageAdapter: Send + Sync {
     /// still splits confidence `1/N` across genuine ambiguity.
     fn bare_calls_resolve_globally(&self) -> bool {
         false
+    }
+
+    /// May a member call whose receiver type is unknown resolve to every project
+    /// method of that name (at a split, low confidence)? Default: yes.
+    ///
+    /// Answer `false` where most receivers are values of types the graph does not
+    /// contain, so the guess is nearly always wrong: the call then resolves only
+    /// through a typed receiver, `self`, or a module.
+    fn member_calls_fall_back_by_name(&self) -> bool {
+        true
     }
 
     /// Which languages can call this one's definitions by name. A call is only ever
@@ -340,6 +354,19 @@ pub trait LanguageAdapter: Send + Sync {
     /// Default `None` — a language with no external binding pass is unchanged.
     fn external_dep_key(&self, _spec: &str) -> Option<String> {
         None
+    }
+
+    /// When an import resolved to a file that does not export the imported name,
+    /// may the resolver look for the name anywhere under that file's directory?
+    /// Default: no, an unexported name is unresolved.
+    ///
+    /// Answer `true` where `resolve_import` can only find a package's root and the
+    /// name usually lives in a submodule re-exported from it: Rust's
+    /// `use aegis_net::DiskCache` names `lib.rs`, while `DiskCache` is defined in
+    /// `cache.rs` behind a `pub use`. The resolver then binds the exported
+    /// definitions of that name under the directory, splitting confidence 1/N.
+    fn unexported_import_searches_package(&self) -> bool {
+        false
     }
 }
 

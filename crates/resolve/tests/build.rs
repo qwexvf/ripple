@@ -658,6 +658,46 @@ fn calls_do_not_resolve_across_languages_or_through_unindexed_packages() {
     );
 }
 
+/// A function brought in from another workspace crate with `use` and then called
+/// bare had no caller edge, and a type imported that way had no importer (#133,
+/// #146). The crate is found from its `Cargo.toml`, the name below its root.
+#[test]
+fn rust_use_binds_names_across_workspace_crates() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rust_workspace");
+    let r = resolve::build(&root).unwrap();
+    let main = SymbolId::of("cli/src/main.rs", "main");
+    let parse_file = SymbolId::of("lock/src/lib.rs", "parse_file");
+    let disk_cache = SymbolId::of("net/src/cache.rs", "DiskCache");
+
+    let called: Vec<(SymbolId, f32)> = r
+        .edges
+        .iter()
+        .filter(|e| e.src == main && e.kind == EdgeKind::Calls)
+        .map(|e| (e.dst, e.confidence))
+        .collect();
+    let conf = called
+        .iter()
+        .find(|(d, _)| *d == parse_file)
+        .map(|(_, c)| *c)
+        .unwrap_or_else(|| panic!("parse_file() through `use`: {called:?}"));
+    assert!(
+        conf > 0.9,
+        "one candidate keeps full confidence, got {conf}"
+    );
+
+    let importers: Vec<SymbolId> = r
+        .edges
+        .iter()
+        .filter(|e| e.dst == disk_cache && e.kind == EdgeKind::Imports)
+        .map(|e| e.src)
+        .collect();
+    assert_eq!(
+        importers,
+        vec![SymbolId::module("cli/src/main.rs")],
+        "`use aegis_net::DiskCache` reaches the re-exported struct"
+    );
+}
+
 #[test]
 fn deterministic_build() {
     let a = resolve::build(&fixture()).unwrap();
