@@ -390,6 +390,7 @@ fn extract_defs(
     let names = query.capture_names();
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(query, tree.root_node(), src);
+    let listed = adapter.export_lists(tree.root_node(), src);
 
     let mut nodes = Vec::new();
     while let Some(m) = matches.next() {
@@ -419,7 +420,7 @@ fn extract_defs(
                 module_path: module_path.to_owned(),
                 span: span_of(def_node),
                 extra_spans: Vec::new(),
-                is_exported: adapter.is_exported(def_node, src),
+                is_exported: adapter.is_exported_in(def_node, src, &listed),
                 is_test: false,
                 risk: ir::RiskScores::default(),
                 doc: adapter.doc(def_node, src),

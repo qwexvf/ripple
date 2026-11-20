@@ -25,7 +25,7 @@ pub mod svelte;
 pub mod typescript;
 pub mod vue;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// Leading-comment extraction shared by the default `LanguageAdapter::doc`.
@@ -187,6 +187,26 @@ pub trait LanguageAdapter: Send + Sync {
     /// nothing language-specific leaves the adapter. Default: none.
     fn test_scopes(&self, _root: tree_sitter::Node, _src: &[u8]) -> Vec<ir::Span> {
         Vec::new()
+    }
+
+    /// Facts about a whole file that `is_exported_in` needs for every definition in
+    /// it, computed once per file rather than once per definition. Default: none.
+    ///
+    /// TypeScript's `export { a, b }` list is the case: answering it per definition
+    /// rescanned every top-level statement, which made parsing quadratic in a file's
+    /// definition count (#128).
+    fn export_lists(&self, _root: tree_sitter::Node, _src: &[u8]) -> HashSet<String> {
+        HashSet::new()
+    }
+
+    /// `is_exported`, given the file's `export_lists`. Default: ignores them.
+    fn is_exported_in(
+        &self,
+        def: tree_sitter::Node,
+        src: &[u8],
+        _listed: &HashSet<String>,
+    ) -> bool {
+        self.is_exported(def, src)
     }
 
     /// Is a definition exported/public? Language-specific (TS `export`, Elixir

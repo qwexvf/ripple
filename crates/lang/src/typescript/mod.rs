@@ -6,6 +6,7 @@
 //! rendered component itself, and any call inside a JSX expression.
 
 use crate::{resolve_import, LanguageAdapter, Workspace};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 /// Is this definition named by a separate `export { … }` statement?
@@ -15,18 +16,15 @@ use std::path::{Path, PathBuf};
 /// because the export is a sibling statement, not a parent. Without this the
 /// component is not in the export table, so no importer can resolve it and a
 /// component's callers come back empty.
-fn exported_by_a_list(def: tree_sitter::Node, src: &[u8]) -> bool {
-    let Some(name) = def
-        .child_by_field_name("name")
+fn exported_by_a_list(def: tree_sitter::Node, src: &[u8], listed: &HashSet<String>) -> bool {
+    def.child_by_field_name("name")
         .and_then(|n| n.utf8_text(src).ok())
-    else {
-        return false;
-    };
-    // top-level statements only: a nested `export` is not a module export
-    let mut program = def;
-    while let Some(parent) = program.parent() {
-        program = parent;
-    }
+        .is_some_and(|name| listed.contains(name))
+}
+
+/// Every local name a top-level `export { … }` list exports. Top-level only: a
+/// nested `export` is not a module export.
+fn listed_exports(program: tree_sitter::Node, src: &[u8]) -> HashSet<String> {
     let mut cursor = program.walk();
     let statements: Vec<tree_sitter::Node> = program
         .named_children(&mut cursor)
@@ -34,7 +32,12 @@ fn exported_by_a_list(def: tree_sitter::Node, src: &[u8]) -> bool {
         .collect();
     statements
         .into_iter()
-        .any(|stmt| names_in_export_clause(stmt, src).any(|n| n == name))
+        .flat_map(|stmt| {
+            names_in_export_clause(stmt, src)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 /// The *local* names an `export { a, b as c }` statement re-exports. `b as c`
@@ -190,7 +193,21 @@ impl LanguageAdapter for Adapter {
     /// Exported if an ancestor is an `export_statement` (covers `export fn/class/
     /// const`, `export default`), or if a top-level `export { … }` list names it.
     /// A class member is never a module export.
+    fn export_lists(&self, root: tree_sitter::Node, src: &[u8]) -> HashSet<String> {
+        listed_exports(root, src)
+    }
+
+    /// Without the file's lists precomputed: collects them for this one call, so it
+    /// is correct but costs a scan of the file. `parse` uses `is_exported_in`.
     fn is_exported(&self, def: tree_sitter::Node, src: &[u8]) -> bool {
+        let mut program = def;
+        while let Some(parent) = program.parent() {
+            program = parent;
+        }
+        self.is_exported_in(def, src, &listed_exports(program, src))
+    }
+
+    fn is_exported_in(&self, def: tree_sitter::Node, src: &[u8], listed: &HashSet<String>) -> bool {
         let mut cur = def.parent();
         while let Some(n) = cur {
             if is_default_export_object(n) {
@@ -204,7 +221,7 @@ impl LanguageAdapter for Adapter {
             }
             cur = n.parent();
         }
-        exported_by_a_list(def, src)
+        exported_by_a_list(def, src, listed)
     }
 
     /// Methods/fields are qualified by their enclosing type (`Class.method`).
