@@ -1306,6 +1306,26 @@ fn edges_inside_a_root_survive_a_second_root() {
     );
 }
 
+/// A fixture written in another language sits in the host language's test layout:
+/// a Kotlin file under a Rust crate's `tests/`. Only the Kotlin adapter was asked,
+/// its `src/test/` rule did not fire, and the fixture outranked production code in
+/// review (#129).
+#[test]
+fn a_fixture_in_another_languages_test_layout_is_test_side() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/foreign_layout");
+    let indexed = resolve::build_incremental(
+        std::slice::from_ref(&root),
+        &std::collections::HashMap::new(),
+    )
+    .unwrap();
+    let scopes = resolve::TestScopes::of(&indexed.files, &indexed.roots, &lang::registry());
+    let mut nodes = indexed.result.nodes.clone();
+    resolve::mark_tests(&scopes, &mut nodes);
+    let flag = |name: &str| nodes.iter().find(|n| n.name == name).map(|n| n.is_test);
+    assert_eq!(flag("Util"), Some(true));
+    assert_eq!(flag("real"), Some(false));
+}
+
 /// `review` could not tell a capture helper from production code, because the only
 /// test signal in the graph was the `Tests` edge — and a helper the tests are built
 /// from exercises nothing, so no such edge names it. `mark_tests` stamps the scopes
