@@ -87,3 +87,30 @@
     function: (identifier) @_req
     arguments: (arguments (string (string_fragment) @import.source)))
   (#eq? @_req "require"))
+
+; Dynamic import read through `.then`: `import("./x").then((m) => m.X)` and the
+; code-splitting form `lazy(() => import("./x").then((m) => ({ default: m.X })))`.
+; The member the callback reads off the module is the imported name, so the
+; component reached only through a lazy route is not dead code (#145). A query
+; cannot search an arbitrary body, so only these two shapes are recognised.
+(call_expression
+  function: (member_expression
+    object: (call_expression
+      function: (import)
+      arguments: (arguments (string (string_fragment) @import.source)))
+    property: (property_identifier) @_then)
+  arguments: (arguments
+    (arrow_function
+      [parameter: (identifier) @_m
+       parameters: (formal_parameters
+         (required_parameter pattern: (identifier) @_m))]
+      body: [(member_expression
+               object: (identifier) @_obj
+               property: (property_identifier) @import.name)
+             (parenthesized_expression
+               (object (pair
+                 value: (member_expression
+                   object: (identifier) @_obj
+                   property: (property_identifier) @import.name))))]))
+  (#eq? @_then "then")
+  (#eq? @_m @_obj))

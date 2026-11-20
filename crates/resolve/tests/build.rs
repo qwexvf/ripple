@@ -754,6 +754,26 @@ fn default_export_object_members_are_reachable() {
     );
 }
 
+/// A component code-split behind `lazy(() => import("./x").then((m) => ({ default:
+/// m.X })))` had no production importer and looked test-only or dead (#145).
+#[test]
+fn dynamic_import_then_member_is_an_import() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/lazy_import");
+    let r = resolve::build(&root).unwrap();
+    let editor = SymbolId::of("src/v/editor.tsx", "VRChatFieldsEditor");
+    let importers: Vec<SymbolId> = r
+        .edges
+        .iter()
+        .filter(|e| e.dst == editor && e.kind == EdgeKind::Imports)
+        .map(|e| e.src)
+        .collect();
+    assert_eq!(
+        importers,
+        vec![SymbolId::module("src/index.tsx"); 2],
+        "the lazy() form and the plain .then(m => m.X) form"
+    );
+}
+
 #[test]
 fn deterministic_build() {
     let a = resolve::build(&fixture()).unwrap();
