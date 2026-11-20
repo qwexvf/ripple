@@ -247,9 +247,33 @@ Two other modes:
   with size and cross-file/cross-language coupling (measured 3.3× grep on a real Elixir API,
   2× on a TS app).
 
+  It also prices each answer in output tokens, estimated as characters / 4: ripple's is the
+  `impact` text down to its k-th distinct file; grep's is what `grep -rnw` for the seed's
+  names prints, cut to its top k files and in full. `~tokens/true file` divides that by the
+  co-changed files found in the top k. The grep query is every name the seed defines, more
+  than a person would type, so read grep's cost as an upper bound.
+
 This is how the numbers in the [dogfood log](../design/12-dogfood-log.md) were produced,
 including the ones that turned out to be wrong. When there is nothing to evaluate it says
 so rather than reporting `0.0%`.
+
+## `ripple stats`
+
+How ripple is used in practice, read from Claude Code transcripts (`~/.claude/projects` by
+default, or `--transcripts <dir>`; `--project` / `--exclude` filter by path substring,
+`--days N` by file age). It counts ripple lookups and text searches (grep, rg, find and
+the Grep/Glob tools; a `grep` reading a pipe is a filter and is not counted), the tokens
+their results cost (characters / 4), and what the agent did next:
+
+- **used**: a file the result named was read or edited within the next 8 tool calls,
+  before any other lookup;
+- **searched again**: another lookup came first;
+- **empty**: the result named no file.
+
+It also groups the lookups made before each edit and compares stretches that used ripple
+with those that did not. All of it is observational. "Used" says an answer was acted on,
+not that it was right, and ripple tends to be reached for on the harder tasks, which
+inflates its per-edit cost. `eval --vs-grep` is the controlled comparison.
 
 ## `ripple lsp doctor`
 
