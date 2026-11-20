@@ -181,6 +181,11 @@ about it — `impact` is the ranked version.
 
 Edge kinds surfaced: `Calls`, `Imports`, `ChangesWith`, `GraphqlCall`, `DbQuery`.
 
+`--in` on a type (a class, a struct, an Elixir module) also lists callers of its members
+from outside the type, each marked `→ member`, since code reaches a module by calling its
+functions. A name can be given as `Owner.member` or `Owner::member` when the member's own
+name is ambiguous.
+
 ## `ripple path <from> <to>`
 
 How does A reach B? Routes along the dependency direction, shortest first, each annotated
