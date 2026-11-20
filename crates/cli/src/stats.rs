@@ -95,13 +95,12 @@ fn classify_bash(command: &str) -> Kind {
         let mut i = 0;
         while i < words.len() {
             let w = words[i];
-            if w == "rtk" || w == "nice" || w == "time" || w == "timeout" || w.contains('=') {
-                i += 1;
-            } else if w.starts_with('-') || w.chars().all(|c| c.is_ascii_digit()) {
-                i += 1;
-            } else {
+            let wrapper = matches!(w, "rtk" | "nice" | "time" | "timeout") || w.contains('=');
+            let wrapper_arg = w.starts_with('-') || w.chars().all(|c| c.is_ascii_digit());
+            if !(wrapper || wrapper_arg) {
                 break;
             }
+            i += 1;
         }
         let Some(program) = words.get(i) else {
             continue;
@@ -361,10 +360,8 @@ impl Report {
                     stretch.lookups += 1;
                     stretch.chars += call.result_chars;
                 }
-                Kind::Edit(_) => {
-                    if stretch.lookups > 0 {
-                        self.stretches.push(std::mem::take(&mut stretch));
-                    }
+                Kind::Edit(_) if stretch.lookups > 0 => {
+                    self.stretches.push(std::mem::take(&mut stretch));
                 }
                 _ => {}
             }
