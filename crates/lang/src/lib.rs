@@ -158,6 +158,10 @@ pub struct Workspace {
     /// it names a package directory under the root, not a third-party dependency.
     /// Without this the Go adapter treats every self-import as external. See #85.
     pub go_module: Option<(String, PathBuf)>,
+    /// Rust crate name (as code spells it, `-` read as `_`) → the crate's directory,
+    /// from every `Cargo.toml` under the root, so `use aegis_net::DiskCache` lands
+    /// in the workspace crate rather than reading as a third-party dependency.
+    pub rust_crates: HashMap<String, PathBuf>,
 }
 
 /// A language adapter. Tier 0 = grammar + tags query (required). Tier 1 =
@@ -213,6 +217,27 @@ pub trait LanguageAdapter: Send + Sync {
     /// still splits confidence `1/N` across genuine ambiguity.
     fn bare_calls_resolve_globally(&self) -> bool {
         false
+    }
+
+    /// May a member call whose receiver type is unknown resolve to every project
+    /// method of that name (at a split, low confidence)? Default: yes.
+    ///
+    /// Answer `false` where most receivers are values of types the graph does not
+    /// contain, so the guess is nearly always wrong: the call then resolves only
+    /// through a typed receiver, `self`, or a module.
+    fn member_calls_fall_back_by_name(&self) -> bool {
+        true
+    }
+
+    /// Which languages can call this one's definitions by name. A call is only ever
+    /// resolved by name to a definition in the same family, so a Rust
+    /// `client.lookup()` cannot land on a Java fixture's `lookup` (#134).
+    ///
+    /// Defaults to the adapter's own id. Languages sharing one runtime and calling
+    /// each other directly share a family: TypeScript, JavaScript and the files
+    /// that embed them; C and C++; the JVM languages.
+    fn linkage_family(&self) -> &'static str {
+        self.id()
     }
 
     /// Does an *unqualified* call written inside a member function body mean
@@ -330,6 +355,19 @@ pub trait LanguageAdapter: Send + Sync {
     fn external_dep_key(&self, _spec: &str) -> Option<String> {
         None
     }
+
+    /// When an import resolved to a file that does not export the imported name,
+    /// may the resolver look for the name anywhere under that file's directory?
+    /// Default: no, an unexported name is unresolved.
+    ///
+    /// Answer `true` where `resolve_import` can only find a package's root and the
+    /// name usually lives in a submodule re-exported from it: Rust's
+    /// `use aegis_net::DiskCache` names `lib.rs`, while `DiskCache` is defined in
+    /// `cache.rs` behind a `pub use`. The resolver then binds the exported
+    /// definitions of that name under the directory, splitting confidence 1/N.
+    fn unexported_import_searches_package(&self) -> bool {
+        false
+    }
 }
 
 /// The GraphQL grammar (for parsing `.gql` operation documents in cross-service linking).
@@ -366,7 +404,7 @@ pub fn registry() -> Vec<Box<dyn LanguageAdapter>> {
 /// `embedded_regions`, `extract_cross`, `qualified_name`, `test_scopes`, etc. Query
 /// sources and grammar changes are caught automatically by `registry_fingerprint`;
 /// this is the escape hatch for the Rust that isn't a query string. See #71.
-const EXTRACT_LOGIC_VERSION: u32 = 1;
+const EXTRACT_LOGIC_VERSION: u32 = 2;
 
 /// A fingerprint of every adapter's extraction *inputs*: the `.scm` query sources,
 /// the grammar identity, and `EXTRACT_LOGIC_VERSION`.

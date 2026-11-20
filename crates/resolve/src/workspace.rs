@@ -90,6 +90,40 @@ impl Workspaces {
     }
 }
 
+/// Record a `Cargo.toml`'s `[package] name`, spelled the way `use` spells it.
+fn read_cargo_package(manifest: &Path, ws: &mut Workspace) {
+    let Ok(text) = std::fs::read_to_string(manifest) else {
+        return;
+    };
+    let Some(name) = cargo_package_name(&text) else {
+        return;
+    };
+    if let Some(dir) = manifest.parent().and_then(|d| d.canonicalize().ok()) {
+        ws.rust_crates.insert(name.replace('-', "_"), dir);
+    }
+}
+
+/// `name` under `[package]`, read line by line: enough for the manifests people
+/// write, without a TOML dependency. A workspace-only manifest has no `[package]`.
+fn cargo_package_name(text: &str) -> Option<String> {
+    let mut in_package = false;
+    for line in text.lines().map(str::trim) {
+        if line.starts_with('[') {
+            in_package = line == "[package]";
+            continue;
+        }
+        if !in_package {
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("name") else {
+            continue;
+        };
+        let value = rest.trim_start().strip_prefix('=')?.trim();
+        return Some(value.trim_matches(|c| c == '"' || c == '\'').to_owned());
+    }
+    None
+}
+
 /// Parse `compilerOptions.baseUrl` + `paths` from the root tsconfig.
 fn read_tsconfig(root: &Path, ws: &mut Workspace) {
     let Ok(text) = std::fs::read_to_string(root.join("tsconfig.json")) else {
@@ -127,9 +161,14 @@ fn read_tsconfig(root: &Path, ws: &mut Workspace) {
     }
 }
 
-/// Map every workspace `package.json` "name" to its directory (skips node_modules).
+/// Map every workspace `package.json` "name" and every `Cargo.toml` package name to
+/// its directory (skips node_modules). One walk serves both manifests.
 fn read_packages(root: &Path, ws: &mut Workspace) {
     for entry in crate::walk(root).filter_map(Result::ok) {
+        if entry.file_name() == "Cargo.toml" {
+            read_cargo_package(entry.path(), ws);
+            continue;
+        }
         if entry.file_name() != "package.json" {
             continue;
         }

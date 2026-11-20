@@ -207,7 +207,11 @@ pub fn build_incremental(
         Workspaces::discover_all(&used_roots)
     });
     let idx_span = ir::timing::start("index_defs");
-    let (index, mut nodes) = index_defs(&all_files, &file_root);
+    let file_family: Vec<&'static str> = all_files
+        .iter()
+        .map(|f| lang::adapter_for(&registry, &f.canonical).map_or("", |a| a.linkage_family()))
+        .collect();
+    let (index, mut nodes) = index_defs(&all_files, &file_root, &file_family);
     idx_span.stop(nodes.len());
 
     let link_span = ir::timing::start("link");
@@ -468,6 +472,11 @@ struct DefIndex {
     /// added later is a candidate until someone rules it out, which is the
     /// direction that fails loudly.
     uncallable: HashSet<SymbolId>,
+    /// [`lang::LanguageAdapter::linkage_family`] of the file each definition is in.
+    /// A call resolved by name keeps only candidates from its own family (#134).
+    family_of: HashMap<SymbolId, &'static str>,
+    /// the file each definition is in, for a search scoped to a package directory
+    file_of: HashMap<SymbolId, PathBuf>,
 }
 
 /// The trailing identifier of a qualified name or path — `Client` from
@@ -482,7 +491,11 @@ fn last_segment(path: &str) -> &str {
 
 /// Phase 2: emit def + module nodes and build the lookup tables. `file_root[i]` is
 /// which indexed root `files[i]` came from — one entry per file, in the same order.
-fn index_defs(files: &[CachedFile], file_root: &[usize]) -> (DefIndex, Vec<Node>) {
+fn index_defs(
+    files: &[CachedFile],
+    file_root: &[usize],
+    file_family: &[&'static str],
+) -> (DefIndex, Vec<Node>) {
     let mut idx = DefIndex::default();
     let mut nodes: Vec<Node> = Vec::new();
     // identity is (path, qualified name), so several definitions of one symbol share
@@ -494,9 +507,11 @@ fn index_defs(files: &[CachedFile], file_root: &[usize]) -> (DefIndex, Vec<Node>
     // a field and a function can collapse onto one id; that id is still callable
     let mut callable: HashSet<SymbolId> = HashSet::new();
 
-    for (f, &root) in files.iter().zip(file_root) {
+    for ((f, &root), &family) in files.iter().zip(file_root).zip(file_family) {
         let by_name = idx.file_defs.entry(f.canonical.clone()).or_default();
         for d in &f.extract.defs {
+            idx.family_of.insert(d.id, family);
+            idx.file_of.insert(d.id, f.canonical.clone());
             by_name.entry(d.name.clone()).or_default().push(d.id);
             if d.is_exported {
                 idx.export_table
@@ -519,13 +534,13 @@ fn index_defs(files: &[CachedFile], file_root: &[usize]) -> (DefIndex, Vec<Node>
                 }
             }
             if d.kind == NodeKind::Method {
-                if let Some((class, method)) = d.qualified_name.split_once('.') {
+                if let Some(class) = owner_of(&d.qualified_name, &d.name) {
                     idx.methods_by_class
-                        .entry((root, class.to_owned(), method.to_owned()))
+                        .entry((root, class.to_owned(), d.name.clone()))
                         .or_default()
                         .push(d.id);
                     idx.methods_by_name
-                        .entry((root, method.to_owned()))
+                        .entry((root, d.name.clone()))
                         .or_default()
                         .push(d.id);
                 }
@@ -604,6 +619,8 @@ fn link(
         let rules = CallRules {
             global_linkage: adapter.is_some_and(|a| a.bare_calls_resolve_globally()),
             self_calls: adapter.is_some_and(|a| a.bare_call_in_method_is_self_call()),
+            family: adapter.map_or("", |a| a.linkage_family()),
+            member_fallback: adapter.is_none_or(|a| a.member_calls_fall_back_by_name()),
         };
         resolve_calls(f, root, idx, module_id, &scope, rules, &mut sink);
     }
@@ -649,6 +666,14 @@ struct ImportScope {
     /// outside the roots (`import * as React from "react"`, `import os`). A member
     /// call on such a name binds to `dep.method`.
     ext_modules: HashMap<String, String>,
+    /// local names bound to a whole module this graph does not contain and has no
+    /// dependency node for (Go's `os`, `url`). A member call on one names that
+    /// module's function, so it must not fall back to same-named methods here (#134).
+    opaque_modules: HashSet<String>,
+    /// local name → the several project symbols an import could mean, when the
+    /// imported file does not export it and the adapter allows a package search.
+    /// A call through the name splits its confidence across them.
+    ambiguous: HashMap<String, Vec<SymbolId>>,
 }
 
 /// Id of the external module (dep-key) node. Kept in sync with
@@ -820,6 +845,9 @@ fn resolve_imports(
             // bare/unresolved specifier — bind it as an external package so a
             // call to it has a real target node (external-import binding pass)
             bind_external(adapter, imp, module_id, &mut scope, sink);
+            if imp.is_namespace() && !scope.ext_modules.contains_key(&imp.local_name) {
+                scope.opaque_modules.insert(imp.local_name.clone());
+            }
             continue;
         };
         if imp.is_namespace() {
@@ -852,19 +880,75 @@ fn resolve_imports(
                 MAX_REEXPORT_HOPS,
             )
         };
-        if let Some(sym) = resolved {
-            scope.bindings.insert(imp.local_name.clone(), sym);
+        let candidates = match resolved {
+            Some(sym) => vec![sym],
+            None if adapter.unexported_import_searches_package() => {
+                package_candidates(idx, root, &target, &imp.imported_name, adapter)
+            }
+            None => Vec::new(),
+        };
+        match candidates.as_slice() {
+            [] => continue,
+            [sym] => {
+                scope.bindings.insert(imp.local_name.clone(), *sym);
+            }
+            many => {
+                scope
+                    .ambiguous
+                    .insert(imp.local_name.clone(), many.to_vec());
+            }
+        }
+        let n = candidates.len() as f32;
+        for sym in candidates {
             sink.edges.push(Edge {
                 src: module_id,
                 dst: sym,
                 kind: EdgeKind::Imports,
-                confidence: cross_root_conf(idx, root, sym, CONF_IMPORT),
+                confidence: cross_root_conf(idx, root, sym, CONF_IMPORT / n),
                 site: imp.site,
                 source: EdgeSource::Extracted,
             });
         }
     }
     scope
+}
+
+/// Exported definitions named `name` anywhere under `target`'s directory, in the
+/// importing file's language family. For an import that reached a package root
+/// whose export table does not list the name: Rust re-exports a submodule's item
+/// with `pub use`, which is not modelled, so the item's own file is found by name.
+/// Too many candidates is no answer at all.
+fn package_candidates(
+    idx: &DefIndex,
+    root: usize,
+    target: &Path,
+    name: &str,
+    adapter: &dyn LanguageAdapter,
+) -> Vec<SymbolId> {
+    let Some(dir) = target.parent() else {
+        return Vec::new();
+    };
+    let family = adapter.linkage_family();
+    let mut found: Vec<SymbolId> = idx
+        .by_name
+        .get(&(root, name.to_owned()))
+        .into_iter()
+        .flatten()
+        .copied()
+        .filter(|id| idx.family_of.get(id) == Some(&family))
+        .filter(|id| {
+            idx.file_of.get(id).is_some_and(|file| {
+                file.starts_with(dir)
+                    && idx.export_table.get(&(file.clone(), name.to_owned())) == Some(id)
+            })
+        })
+        .collect();
+    found.sort_unstable();
+    found.dedup();
+    if found.len() > MAX_PATH_CANDIDATES {
+        return Vec::new();
+    }
+    found
 }
 
 /// What the calling file's language says about unqualified calls — the two
@@ -879,6 +963,11 @@ struct CallRules {
     /// [`lang::LanguageAdapter::bare_call_in_method_is_self_call`]: an unqualified
     /// call inside a member function means `this.m()`.
     self_calls: bool,
+    /// [`lang::LanguageAdapter::linkage_family`]: which definitions a call in this
+    /// file can name at all.
+    family: &'static str,
+    /// [`lang::LanguageAdapter::member_calls_fall_back_by_name`]
+    member_fallback: bool,
 }
 
 /// Resolve a file's call sites (bare + member) into Calls edges.
@@ -965,6 +1054,10 @@ fn resolve_calls(
                     } else {
                         (Vec::new(), CONF_KNOWN_RECEIVER)
                     }
+                } else if matches!(r.receiver.as_ref(), Some(Receiver::Ident(v))
+                    if !shadowed && scope.opaque_modules.contains(v))
+                {
+                    (Vec::new(), CONF_KNOWN_RECEIVER)
                 } else if let Some(dep) = ext_dep {
                     // `React.useState()` / `os.system()` — the receiver names an
                     // external module, so the method is that dep's `dep.method` symbol
@@ -978,6 +1071,7 @@ fn resolve_calls(
                         recv_type,
                         idx,
                         root,
+                        rules.member_fallback,
                     )
                 }
             }
@@ -989,6 +1083,10 @@ fn resolve_calls(
         if r.kind == RefKind::Call {
             targets.retain(|id| !idx.uncallable.contains(id));
         }
+        // a name shared across languages is a coincidence, not a call: the Rust
+        // tests calling `client.lookup()` linked to a Java fixture's `lookup` (#134).
+        // External symbols carry no family and are kept.
+        targets.retain(|id| idx.family_of.get(id).is_none_or(|f| *f == rules.family));
 
         // several definitions can share one id — Elixir's multi-clause functions
         // and default args all key to (module, name). They are one target, so
@@ -1042,6 +1140,9 @@ fn resolve_bare(
     }
     if let Some(&sym) = scope.bindings.get(name) {
         return (vec![sym], CONF_LOCAL_CALL);
+    }
+    if let Some(ids) = scope.ambiguous.get(name) {
+        return (ids.clone(), CONF_LOCAL_CALL);
     }
     if !global_linkage {
         return (Vec::new(), CONF_LOCAL_CALL);
@@ -1184,8 +1285,12 @@ fn resolve_member(
     recv_type: Option<&str>,
     idx: &DefIndex,
     root: usize,
+    fallback: bool,
 ) -> (Vec<SymbolId>, f32) {
     let candidates = || {
+        if !fallback {
+            return Vec::new();
+        }
         idx.methods_by_name
             .get(&(root, method.to_owned()))
             .cloned()
@@ -1391,11 +1496,21 @@ fn external_module_receiver(
 /// Python OOP codebase). Splitting on the first `.` matches how `methods_by_class` is
 /// keyed in `index_defs`.
 fn class_of(node: &Node) -> Option<&str> {
-    let (owner, method) = node.qualified_name.split_once('.')?;
-    // guard: the qualified name is genuinely `Owner.<this node's name>`, not some
-    // other dotted string — so a plain function is never mistaken for a member
-    (!owner.is_empty() && node.qualified_name.ends_with(&node.name) && method.ends_with(&node.name))
-        .then_some(owner)
+    owner_of(&node.qualified_name, &node.name)
+}
+
+/// The type a member belongs to, read off its qualified name: `Client` from
+/// `Client.send`, `pkg.Client.send` or `Client::send`. `None` unless the qualified
+/// name really is `<owner><separator><name>`, so a plain function is never mistaken
+/// for a member. Both separators are accepted because that is all the IR says: each
+/// adapter writes member paths the way its language does.
+fn owner_of<'a>(qualified: &'a str, name: &str) -> Option<&'a str> {
+    let prefix = qualified.strip_suffix(name)?;
+    if !(prefix.ends_with('.') || prefix.ends_with("::")) {
+        return None;
+    }
+    let owner = last_segment(prefix);
+    (!owner.is_empty()).then_some(owner)
 }
 
 fn module_symbol(module_path: &str) -> SymbolId {

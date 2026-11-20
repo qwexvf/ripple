@@ -1,4 +1,4 @@
-use ir::{EdgeKind, SymbolId};
+use ir::{EdgeKind, NodeKind, SymbolId};
 use std::path::Path;
 
 fn fixture() -> std::path::PathBuf {
@@ -547,6 +547,167 @@ fn resolves_rust_path_calls() {
         news.len(),
         2,
         "exactly the two `new`s we call, nothing dragged in by HashMap::new()"
+    );
+}
+
+/// Rust methods were indexed as plain functions, and member-call resolution keys off
+/// `NodeKind::Method`, so `site.step()` and `self.tick()` linked to nothing and
+/// `impact` on any method was empty (#138).
+#[test]
+fn rust_method_calls_reach_their_methods() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rust_methods");
+    let r = resolve::build(&root).unwrap();
+    let calls = |src: SymbolId| -> Vec<SymbolId> {
+        r.edges
+            .iter()
+            .filter(|e| e.src == src && e.kind == EdgeKind::Calls)
+            .map(|e| e.dst)
+            .collect()
+    };
+
+    let run = calls(SymbolId::of("app.rs", "run"));
+    assert!(
+        run.contains(&SymbolId::of("site.rs", "Site::step")),
+        "{run:?}"
+    );
+    assert!(
+        run.contains(&SymbolId::of("site.rs", "Site::stream")),
+        "{run:?}"
+    );
+
+    let step = calls(SymbolId::of("site.rs", "Site::step"));
+    assert_eq!(
+        step,
+        vec![SymbolId::of("site.rs", "Site::tick")],
+        "self.tick()"
+    );
+
+    let kind = |q: &str| {
+        r.nodes
+            .iter()
+            .find(|n| n.id == SymbolId::of("site.rs", q))
+            .map(|n| n.kind)
+    };
+    assert_eq!(kind("Site::step"), Some(NodeKind::Method));
+    assert_eq!(
+        kind("Stream::stream"),
+        Some(NodeKind::Method),
+        "a required trait method"
+    );
+}
+
+/// A macro's arguments are a token tree, so a call that only ever happens inside
+/// `assert!`/`assert_eq!` produced no edge and review marked the function untested
+/// (#150).
+#[test]
+fn rust_calls_inside_macro_arguments_link() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rust_macro_calls");
+    let r = resolve::build(&root).unwrap();
+    let calls = |src: SymbolId| -> Vec<(SymbolId, f32)> {
+        r.edges
+            .iter()
+            .filter(|e| e.src == src && e.kind == EdgeKind::Calls)
+            .map(|e| (e.dst, e.confidence))
+            .collect()
+    };
+
+    let test = calls(SymbolId::of("lib.rs", "parses"));
+    let parse = SymbolId::of("lib.rs", "parse");
+    let new = SymbolId::of("lib.rs", "Parser::new");
+    assert!(test.iter().any(|(d, _)| *d == parse), "{test:?}");
+    assert!(test.iter().any(|(d, _)| *d == new), "{test:?}");
+    // `Parser::new()` is one qualified call, not also a bare `new()`
+    assert_eq!(
+        test.iter().filter(|(d, _)| *d == new).count(),
+        1,
+        "{test:?}"
+    );
+
+    let check = calls(SymbolId::of("lib.rs", "check"));
+    assert!(
+        check
+            .iter()
+            .any(|(d, _)| *d == SymbolId::of("lib.rs", "self_check")),
+        "{check:?}"
+    );
+}
+
+/// A name shared across languages is a coincidence, and a call through a stdlib
+/// package (`os.ReadFile`) names that package. Both used to fall back to every
+/// same-named method in the repo (#134).
+#[test]
+fn calls_do_not_resolve_across_languages_or_through_unindexed_packages() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cross_lang");
+    let r = resolve::build(&root).unwrap();
+    let calls = |src: SymbolId| -> Vec<SymbolId> {
+        r.edges
+            .iter()
+            .filter(|e| e.src == src && e.kind == EdgeKind::Calls)
+            .map(|e| e.dst)
+            .collect()
+    };
+    let rust = calls(SymbolId::of("client.rs", "run"));
+    assert!(
+        !rust.contains(&SymbolId::of("JndiLookup.java", "JndiLookup.lookup")),
+        "{rust:?}"
+    );
+    let go = calls(SymbolId::of("fs/manifest.go", "readDeps"));
+    assert!(
+        go.is_empty(),
+        "os.ReadFile is stdlib, not HookFS.ReadFile: {go:?}"
+    );
+}
+
+/// A function brought in from another workspace crate with `use` and then called
+/// bare had no caller edge, and a type imported that way had no importer (#133,
+/// #146). The crate is found from its `Cargo.toml`, the name below its root.
+#[test]
+fn rust_use_binds_names_across_workspace_crates() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rust_workspace");
+    let r = resolve::build(&root).unwrap();
+    let main = SymbolId::of("cli/src/main.rs", "main");
+    let parse_file = SymbolId::of("lock/src/lib.rs", "parse_file");
+    let disk_cache = SymbolId::of("net/src/cache.rs", "DiskCache");
+
+    let called: Vec<(SymbolId, f32)> = r
+        .edges
+        .iter()
+        .filter(|e| e.src == main && e.kind == EdgeKind::Calls)
+        .map(|e| (e.dst, e.confidence))
+        .collect();
+    let conf = called
+        .iter()
+        .find(|(d, _)| *d == parse_file)
+        .map(|(_, c)| *c)
+        .unwrap_or_else(|| panic!("parse_file() through `use`: {called:?}"));
+    assert!(
+        conf > 0.9,
+        "one candidate keeps full confidence, got {conf}"
+    );
+
+    let mut importers: Vec<SymbolId> = r
+        .edges
+        .iter()
+        .filter(|e| e.dst == disk_cache && e.kind == EdgeKind::Imports)
+        .map(|e| e.src)
+        .collect();
+    importers.sort_unstable();
+    let mut expected = vec![
+        SymbolId::module("cli/src/main.rs"),
+        // the re-export itself: `pub use cache::DiskCache`
+        SymbolId::module("net/src/lib.rs"),
+    ];
+    expected.sort_unstable();
+    assert_eq!(
+        importers, expected,
+        "`use aegis_net::DiskCache` reaches the re-exported struct"
+    );
+    // `pub use cache::DiskCache` in lib.rs names the sibling module, not a crate
+    assert!(
+        !r.nodes
+            .iter()
+            .any(|n| n.kind == NodeKind::External && n.name == "cache"),
+        "a local module read as an external crate"
     );
 }
 

@@ -117,6 +117,10 @@ impl LanguageAdapter for Adapter {
         }
     }
 
+    fn linkage_family(&self) -> &'static str {
+        "js"
+    }
+
     fn grammar(&self) -> tree_sitter::Language {
         match self.flavour {
             Flavour::Ts => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
