@@ -147,9 +147,10 @@ with no `gleam.toml` gave 98.
 The front door for a task you can only describe, not name yet. Give it the task in plain
 words and it returns the symbols to start from, ranked across every indexed repo. It
 matches the words against symbol names, module paths, endpoint routes, and doc comments
-(splitting `camelCase` and `snake_case`, and a trailing plural), then fuses that lexical
-recall with graph centrality and per-symbol risk by Reciprocal Rank Fusion — so a word
-landing on a central, risky symbol beats a bare substring hit.
+(splitting `camelCase` and `snake_case`, and a trailing plural). The text match decides
+the order: a word counts more the fewer symbols in the graph match it, and a symbol that
+matches more of the task outranks one that matches a single word well. Graph centrality
+and per-symbol risk order the symbols the text cannot tell apart.
 
 Each seed line shows its kind, `file:line`, the fields that matched (`why`) and its
 dependent count, followed by the text of its definition line. `--touches` adds a one-hop

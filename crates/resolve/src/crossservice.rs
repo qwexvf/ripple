@@ -18,6 +18,12 @@ const CONF_GRAPHQL: f32 = 0.9; // TS operation ↔ Absinthe resolver, name-match
 const CONF_GRAPHQL_CONTEXT: f32 = 0.5;
 /// A call that names its target module, resolved through that module's FQN.
 const CONF_QUALIFIED_CALL: f32 = 0.9;
+/// A call that names a project module and a function that module does not define
+/// in its own source: `use Waffle.Definition` gives an uploader its `delete`,
+/// `use Oban.Worker` gives a worker its `new`. The module is as certain as in any
+/// qualified call; what is unknown is which definition runs, so the edge stops at
+/// the module and is priced one step below a resolved function.
+const CONF_QUALIFIED_MODULE: f32 = 0.7;
 const CONF_DB_QUERY: f32 = 0.85; // function → Ecto schema reference
 const CONF_IMPORTED_CALL: f32 = 0.9; // bare call resolved through an explicit `import`
 /// A consumer key matching a declared endpoint, before the match quality and how
@@ -454,8 +460,15 @@ pub fn link_cross_service(files: &[CachedFile], nodes: &[Node]) -> CrossEdges {
                 .collect();
             targets.sort_unstable();
             targets.dedup();
+            let mut base = CONF_QUALIFIED_CALL;
+            if targets.is_empty() {
+                // dropping the call here made every module used only through
+                // injected functions read as having no callers
+                targets = fqn_to_class.get(fqn.as_str()).cloned().unwrap_or_default();
+                base = CONF_QUALIFIED_MODULE;
+            }
             let (caller, grain) = caller_at(spans, &f.module_path, *line);
-            let conf = CONF_QUALIFIED_CALL / targets.len().max(1) as f32;
+            let conf = base / targets.len().max(1) as f32;
             for target in targets {
                 if emit(&mut edges, caller, target, EdgeKind::Calls, conf, *line) {
                     qualified_calls += 1;

@@ -610,11 +610,39 @@ fn singular(word: &str) -> String {
     }
 }
 
-/// Score `node` against task `terms`, recording which field carried each hit.
-/// Zero with no reasons means drop it. A route word weighs most (a URL is a
-/// deliberate name for a feature), then the symbol name, then module/qualified,
-/// then prose in the doc comment.
-fn locate_score(node: &Node, terms: &[(String, String)]) -> (u32, Vec<String>) {
+/// Is this task word written as a code identifier (`getAuthSession`, `run_ci`)
+/// rather than as prose? Decided by shape alone: an inner capital or an underscore.
+/// Short ones are left out, since `a_b` squashes to something any name could equal.
+fn is_identifier(word: &str) -> bool {
+    let chars: Vec<char> = word.chars().collect();
+    let shaped = chars.contains(&'_')
+        || chars
+            .windows(2)
+            .any(|p| p[0].is_lowercase() && p[1].is_uppercase());
+    shaped && chars.iter().filter(|c| c.is_alphanumeric()).count() >= 4
+}
+
+/// An identifier with its casing and separators removed, so one name compares
+/// equal across conventions: `UploadFileDialog`, `upload_file_dialog` and
+/// `upload-file-dialog` are all `uploadfiledialog`.
+fn squash(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// A path's file name without its extensions.
+fn file_stem(path: &str) -> &str {
+    let file = path.rsplit('/').next().unwrap_or(path);
+    file.split('.').next().unwrap_or(file)
+}
+
+/// Score `node` against each of the task `terms`: one entry per term, zero where
+/// it does not match, plus which field carried each hit. All zeros means drop it.
+/// A route word weighs most (a URL is a deliberate name for a feature), then the
+/// symbol name, then module/qualified, then prose in the doc comment.
+fn locate_score(node: &Node, terms: &[(String, String)]) -> (Vec<u32>, Vec<String>) {
     let name_tokens = tokenize(&node.name);
     let module_tokens = tokenize(&node.module_path);
     let route_tokens = node.route_path.as_deref().map(tokenize).unwrap_or_default();
@@ -622,7 +650,7 @@ fn locate_score(node: &Node, terms: &[(String, String)]) -> (u32, Vec<String>) {
     let name_lower = node.name.to_lowercase();
     let qualified_lower = node.qualified_name.to_lowercase();
 
-    let mut score = 0u32;
+    let mut points = Vec::with_capacity(terms.len());
     let mut why: Vec<String> = Vec::new();
     for (t, raw) in terms {
         let (pts, field) = if route_tokens.iter().any(|w| w == t) {
@@ -639,17 +667,22 @@ fn locate_score(node: &Node, terms: &[(String, String)]) -> (u32, Vec<String>) {
             (0, "")
         };
         if pts > 0 {
-            score += pts;
             why.push(format!("{field}:{raw}"));
         }
+        points.push(pts);
     }
-    (score, why)
+    (points, why)
 }
 
-/// Rank starting points for a natural-language task across the whole graph. Text
-/// recall is fused with graph centrality and risk by Reciprocal Rank Fusion, so a
-/// word landing on a central, risky symbol outranks a bare substring hit; the top
-/// `budget` seeds each carry a one-hop blast-radius preview. See docs/07.
+/// Rank starting points for a natural-language task across the whole graph.
+///
+/// The text match decides the order: each matched word counts by how rare it is
+/// in this graph, and a symbol matching more of the task outranks one matching a
+/// single word well. Centrality and risk only order symbols the text cannot tell
+/// apart. They used to be fused in as equals, which let a hub that matched one
+/// common word (`Error`, 19 000 dependents, `module:user`) outrank the one function
+/// whose name carried four of the task's words. The top `budget` seeds each carry
+/// a one-hop blast-radius preview. See docs/07.
 pub fn locate(graph: &InMemoryGraph, task: &str, budget: usize) -> Located {
     // stemmed for matching, raw kept alongside so a reason reads `name:focus`;
     // stopwords and lone letters are dropped so the sentence's grammar is not matched,
@@ -671,22 +704,29 @@ pub fn locate(graph: &InMemoryGraph, task: &str, budget: usize) -> Located {
 
     struct Cand<'a> {
         node: &'a Node,
-        lexical: u32,
+        points: Vec<u32>,
         why: Vec<String>,
         centrality: usize,
     }
-    let cands: Vec<Cand> = graph
-        .nodes()
-        .filter_map(|n| match locate_score(n, &terms) {
-            (0, _) => None,
-            (lexical, why) => Some(Cand {
-                node: n,
-                lexical,
-                why,
-                centrality: graph.in_edges(n.id).len(),
-            }),
-        })
-        .collect();
+    let mut graph_size = 0usize;
+    let mut matched_by = vec![0usize; terms.len()];
+    let mut cands: Vec<Cand> = Vec::new();
+    for n in graph.nodes() {
+        graph_size += 1;
+        let (points, why) = locate_score(n, &terms);
+        if points.iter().all(|&p| p == 0) {
+            continue;
+        }
+        for (count, &p) in matched_by.iter_mut().zip(&points) {
+            *count += usize::from(p > 0);
+        }
+        cands.push(Cand {
+            node: n,
+            points,
+            why,
+            centrality: graph.in_edges(n.id).len(),
+        });
+    }
     let total = cands.len();
     if cands.is_empty() {
         return Located {
@@ -696,19 +736,36 @@ pub fn locate(graph: &InMemoryGraph, task: &str, budget: usize) -> Located {
         };
     }
 
-    // RRF: each signal contributes 1/(K + rank). K dampens how much the top of any
-    // one ranking dominates. Ties are broken by SymbolId inside every sort so the
-    // ranks — and therefore the fused order — are reproducible run to run.
+    // a word half the graph matches (`get`, `page`, the project's own name) says
+    // little about where to start; one that five symbols match says a lot
+    let rarity: Vec<f32> = matched_by
+        .iter()
+        .map(|&m| (1.0 + graph_size as f32 / m.max(1) as f32).ln())
+        .collect();
+    // strength of the matches times how much of the task they cover, so four words
+    // matched beat one word matched in a stronger field
+    let text: Vec<f32> = cands
+        .iter()
+        .map(|c| {
+            let (mut strength, mut coverage) = (0f32, 0f32);
+            for (&p, &r) in c.points.iter().zip(&rarity) {
+                if p > 0 {
+                    strength += p as f32 * r;
+                    coverage += r;
+                }
+            }
+            strength * coverage
+        })
+        .collect();
+
+    // RRF over the two graph signals: each contributes 1/(K + rank). Competition
+    // ranking, not ordinal: candidates equal on a signal share a rank, so two
+    // indistinguishable matches get an identical score, which is what makes a tie
+    // detectable instead of silently broken by the sort's own arbitrary order.
     const K: f32 = 60.0;
     let n = cands.len();
-    let mut rrf = vec![0f32; n];
+    let mut structural = vec![0f32; n];
     let tie = |a: &Cand, b: &Cand| a.node.id.0.cmp(&b.node.id.0);
-
-    // Competition ranking, not ordinal: candidates equal on a signal share the same
-    // rank (the position where their run begins), so two indistinguishable matches
-    // get an identical fused score — which is what makes a tie detectable instead of
-    // silently broken by the sort's own arbitrary order. `cmp` orders (descending),
-    // `eq` decides who ties.
     let mut fuse = |cmp: &dyn Fn(&Cand, &Cand) -> Ordering, eq: &dyn Fn(&Cand, &Cand) -> bool| {
         let mut order: Vec<usize> = (0..n).collect();
         order.sort_by(|&a, &b| cmp(&cands[a], &cands[b]).then_with(|| tie(&cands[a], &cands[b])));
@@ -717,12 +774,9 @@ pub fn locate(graph: &InMemoryGraph, task: &str, budget: usize) -> Located {
             if pos > 0 && !eq(&cands[order[pos]], &cands[order[pos - 1]]) {
                 rank = pos;
             }
-            rrf[order[pos]] += 1.0 / (K + rank as f32);
+            structural[order[pos]] += 1.0 / (K + rank as f32);
         }
     };
-    fuse(&|a, b| b.lexical.cmp(&a.lexical), &|a, b| {
-        a.lexical == b.lexical
-    });
     fuse(&|a, b| b.centrality.cmp(&a.centrality), &|a, b| {
         a.centrality == b.centrality
     });
@@ -733,20 +787,42 @@ pub fn locate(graph: &InMemoryGraph, task: &str, budget: usize) -> Located {
 
     // a task that *is* a symbol's name asks for that symbol: `locate run_ci` split
     // into `run` + `ci` and let a dozen central test helpers named `run` bury the
-    // exact match (#135). Exact names go first, still in fused order among themselves.
+    // exact match (#135). Exact names go first, still in ranked order among themselves.
+    //
+    // The same holds for an identifier written inside a longer task: in
+    // `getAuthSession server session suspended player` the split words `get`,
+    // `auth`, `session` each match hundreds of symbols, and the one symbol spelled
+    // `getAuthSession` came back below `getFragmentData`. A file named for the
+    // identifier counts too (`UploadFileDialog` is `upload-file-dialog.tsx`).
     let query = task.trim();
-    let exact = |c: &Cand| c.node.name == query || c.node.qualified_name == query;
-    let mut order: Vec<usize> = (0..n).collect();
-    order.sort_by(|&a, &b| {
+    let identifiers: Vec<String> = task
+        .split_whitespace()
+        .filter(|w| is_identifier(w))
+        .map(squash)
+        .collect();
+    let exact = |c: &Cand| {
+        c.node.name == query
+            || c.node.qualified_name == query
+            || (!identifiers.is_empty() && {
+                let name = if c.node.kind == ir::NodeKind::Module {
+                    squash(file_stem(&c.node.module_path))
+                } else {
+                    squash(&c.node.name)
+                };
+                identifiers.contains(&name)
+            })
+    };
+    let key = |a: usize, b: usize| {
         exact(&cands[b])
             .cmp(&exact(&cands[a]))
-            .then(rrf[b].total_cmp(&rrf[a]))
-            .then_with(|| tie(&cands[a], &cands[b]))
-    });
+            .then(text[b].total_cmp(&text[a]))
+            .then(structural[b].total_cmp(&structural[a]))
+    };
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| key(a, b).then_with(|| tie(&cands[a], &cands[b])));
 
-    let ambiguous = budget >= 1
-        && n > budget
-        && (rrf[order[budget - 1]] - rrf[order[budget]]).abs() < f32::EPSILON;
+    let ambiguous =
+        budget >= 1 && n > budget && key(order[budget - 1], order[budget]) == Ordering::Equal;
 
     let seeds = order
         .iter()
@@ -767,7 +843,7 @@ pub fn locate(graph: &InMemoryGraph, task: &str, budget: usize) -> Located {
                 node: c.node.clone(),
                 why: c.why.clone(),
                 centrality: c.centrality,
-                lexical: c.lexical,
+                lexical: c.points.iter().sum(),
                 touches,
             }
         })
@@ -1229,6 +1305,83 @@ mod tests {
         let r = locate(&graph, "login", 2);
         assert_eq!(r.seeds[0].node.id, hub.id, "the hub outranks the leaf");
         assert_eq!(r.seeds[0].centrality, 2);
+    }
+
+    /// An identifier inside a longer task pins the symbol spelled that way: its
+    /// split words alone each match more central symbols.
+    #[test]
+    fn locate_puts_an_identifier_named_in_the_task_first() {
+        let target = node("src/server/fns/get-session.ts", "getAuthSession");
+        let hub = node("src/generated/fragment-masking.ts", "getSessionPlayer");
+        let mut file = node(
+            "src/components/upload-file-dialog.tsx",
+            "upload-file-dialog.tsx",
+        );
+        file.kind = NodeKind::Module;
+        let mut nodes = vec![target.clone(), hub.clone(), file.clone()];
+        let mut edges = Vec::new();
+        for i in 0..20 {
+            let caller = node("src/x.ts", &format!("c{i}"));
+            edges.push(calls(&caller, &hub));
+            nodes.push(caller);
+        }
+        let graph = InMemoryGraph::from_parts(nodes, edges);
+
+        let r = locate(&graph, "getAuthSession server session suspended player", 2);
+        assert_eq!(r.seeds[0].node.id, target.id);
+
+        // a file is found by the identifier it is named for, whatever its casing
+        let r = locate(&graph, "UploadFileDialog upload header", 1);
+        assert_eq!(r.seeds[0].node.id, file.id);
+
+        // prose words are not identifiers: `session` must not pin anything
+        assert!(!is_identifier("session"));
+        assert!(!is_identifier("a_b"));
+    }
+
+    /// A hub that matches one word of the task, and only through its path, used to
+    /// outrank the function whose name carries the task: centrality and risk were
+    /// fused in as equals of the text match.
+    #[test]
+    fn locate_ranks_the_text_match_above_a_hub() {
+        let target = node("auth/firebase.go", "verify_id_token");
+        let mut hub = node("user/errors.go", "Error");
+        hub.risk.composite = 0.9;
+        let mut nodes = vec![target.clone(), hub.clone()];
+        let mut edges = Vec::new();
+        for i in 0..40 {
+            let caller = node("pkg/x.go", &format!("c{i}"));
+            edges.push(calls(&caller, &hub));
+            nodes.push(caller);
+        }
+        let graph = InMemoryGraph::from_parts(nodes, edges);
+
+        let r = locate(&graph, "verify id token user", 2);
+        assert_eq!(r.seeds[0].node.id, target.id);
+        assert_eq!(r.seeds[1].node.id, hub.id, "the hub still surfaces, below");
+    }
+
+    /// A word most of the graph matches says little about where to start. With
+    /// `page` on every symbol, the one named for the rare word leads, although both
+    /// candidates match exactly one word in the same field.
+    #[test]
+    fn locate_weighs_a_rare_word_above_a_common_one() {
+        let rare = node("src/a.ts", "sitemap");
+        let mut nodes = vec![rare.clone()];
+        let mut edges = Vec::new();
+        for i in 0..10 {
+            nodes.push(node(&format!("src/p{i}.ts"), "page"));
+        }
+        // the common matches are the central ones, so only rarity can lift `sitemap`
+        let user = node("src/u.ts", "user");
+        for common in &nodes[1..] {
+            edges.push(calls(&user, common));
+        }
+        nodes.push(user);
+        let graph = InMemoryGraph::from_parts(nodes, edges);
+
+        let r = locate(&graph, "sitemap page", 3);
+        assert_eq!(r.seeds[0].node.id, rare.id);
     }
 
     /// `locate run_ci` split into `run` + `ci`, and central helpers named `run`
