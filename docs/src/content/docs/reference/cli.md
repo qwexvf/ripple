@@ -16,6 +16,8 @@ ripple review [<base>] [--budget N] [--root <path>] [--json] [--verify lsp]
 ripple path <from> <to> [--depth 6] [--limit 3] [--root <path>] [--json]
 ripple risk <symbol|file> [--root <path>] [--json]
 ripple mcp [--root <path>]
+ripple daemon [run] [--max-resident 8]
+ripple daemon register <path> | status | stop
 ripple eval [--commits N] [--skip N] [--weights <spec>] [--root <path>]
 ripple eval --risk | --review | --vs-grep | --oracle lsp [--sample N] [--granularity function|file]
 ripple lsp doctor [--root <path>] [--budget 10s] [--json]
@@ -94,8 +96,10 @@ convention, and the edge count alone could not say so.
 Re-running is incremental: unchanged files are reused from the content cache. The summary
 line reports added / changed / unchanged / removed alongside the node and edge counts.
 
-There is no watcher and no automatic re-index: after you edit code, re-index. What you do
-get is a warning. `impact`, `neighbors` and `review` hash the files their answer rests on
+The CLI has no watcher: after you edit code, re-index, or pass `--sync` to `impact` and
+`review` to answer from the working tree without writing anything. A running
+[`ripple daemon`](daemon.md) re-indexes the projects registered with it on save, which keeps
+`.ripple/graph.redb` current for every command here. Either way you get a warning. `impact`, `neighbors` and `review` hash the files their answer rests on
 and compare against the index, so an answer built from edited code says so on stderr —
 
 ```
@@ -186,6 +190,14 @@ from outside the type, each marked `→ member`, since code reaches a module by 
 functions. A name can be given as `Owner.member` or `Owner::member` when the member's own
 name is ambiguous.
 
+`--json` prints one object, `{direction, lookup, neighbors}`, however many symbols the name
+matched. Each row names the matched symbol it answers about in `target` / `target_module`.
+
+When a name matches loosely or more than once, the note saying so goes to stderr. In `--json`
+output `impact` and `path` carry it as `lookups` and `neighbors` as `lookup`: the match rule
+(`exact`, `qualified_suffix`, `substring`), the candidate count, `ambiguous`, and the first
+matched symbols.
+
 ## `ripple path <from> <to>`
 
 How does A reach B? Routes along the dependency direction, shortest first, each annotated
@@ -218,6 +230,12 @@ if a symbol is missing from `impact`, check whether it was ever extracted.
 
 Speaks MCP over stdio for AI agents. Indexes first if the graph is missing. See the
 [MCP reference](mcp.md).
+
+## `ripple daemon`
+
+A resident, file-watching index server. `ripple daemon register <path>` builds a project and
+watches it; every save re-indexes it and rewrites `.ripple/graph.redb`. Registrations persist
+across restarts. See the [daemon reference](daemon.md).
 
 ## `ripple eval`
 
