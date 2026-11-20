@@ -3283,8 +3283,13 @@ fn cmd_neighbors(args: &[String]) -> Result<()> {
     };
     for start in matches {
         let hops = graph.neighbors(start.id, dir, Some(&NEIGHBOR_KINDS), depth);
+        let via_members = if dir == Dir::In {
+            member_callers(&graph, start)
+        } else {
+            Vec::new()
+        };
         if json {
-            let out: Vec<_> = hops
+            let mut out: Vec<_> = hops
                 .iter()
                 .map(|h| {
                     serde_json::json!({
@@ -3297,6 +3302,14 @@ fn cmd_neighbors(args: &[String]) -> Result<()> {
                     })
                 })
                 .collect();
+            out.extend(via_members.iter().map(|(h, member)| {
+                serde_json::json!({
+                    "name": h.node.name, "kind": format!("{:?}", h.node.kind),
+                    "edge": format!("{:?}", h.edge.kind), "confidence": h.edge.confidence,
+                    "module": h.node.module_path, "depth": 1,
+                    "from": member.name, "via_member": member.name,
+                })
+            }));
             println!("{}", serde_json::to_string_pretty(&out)?);
         } else {
             println!(
@@ -3320,9 +3333,40 @@ fn cmd_neighbors(args: &[String]) -> Result<()> {
                     h.edge.kind, h.edge.confidence, h.node.name, h.node.module_path
                 );
             }
+            for (h, member) in &via_members {
+                println!(
+                    "  {:?}<{:.2}> {} ({}) → {}",
+                    h.edge.kind, h.edge.confidence, h.node.name, h.node.module_path, member.name
+                );
+            }
         }
     }
     Ok(())
+}
+
+/// Callers of a type's members from outside the type, for `neighbors --in` on the
+/// type. Code names a module or class by calling into it (`QueryComposer.escape_like`),
+/// so the edges land on the member and the type itself looked unreferenced: every
+/// Elixir module read as dead (#144). Calls between the type's own members are left
+/// out; they say nothing about who uses it.
+fn member_callers<'g>(
+    graph: &'g InMemoryGraph,
+    container: &ir::Node,
+) -> Vec<(store::Hop, &'g ir::Node)> {
+    let members = graph.members_of(container);
+    if members.is_empty() {
+        return Vec::new();
+    }
+    let ids: HashSet<ir::SymbolId> = members.iter().map(|m| m.id).collect();
+    let mut rows = Vec::new();
+    for member in members {
+        for hop in graph.neighbors(member.id, Dir::In, Some(&NEIGHBOR_KINDS), 1) {
+            if !ids.contains(&hop.node.id) && hop.node.id != container.id {
+                rows.push((hop, member));
+            }
+        }
+    }
+    rows
 }
 
 #[cfg(test)]
@@ -3674,6 +3718,47 @@ mod tests {
             doc: None,
             route_path: None,
         }
+    }
+
+    /// Code reaches an Elixir module by calling its functions, so `--in` on the module
+    /// itself was empty and every module read as dead (#144).
+    #[test]
+    fn a_types_callers_include_its_members_callers() {
+        let span = |a: u32, b: u32| ir::Span {
+            start_line: a,
+            start_col: 1,
+            end_line: b,
+            end_col: 80,
+        };
+        let mut module = named("Composer", "composer.ex");
+        module.kind = ir::NodeKind::Class;
+        module.span = span(1, 20);
+        let mut escape = named("escape_like", "composer.ex");
+        escape.span = span(3, 6);
+        let mut helper = named("helper", "composer.ex");
+        helper.span = span(8, 10);
+        let mut caller = named("search", "games.ex");
+        caller.span = span(1, 5);
+        let call = |src: &ir::Node, dst: &ir::Node| ir::Edge {
+            src: src.id,
+            dst: dst.id,
+            kind: ir::EdgeKind::Calls,
+            confidence: 0.9,
+            site: span(2, 2),
+            source: ir::EdgeSource::Extracted,
+        };
+        let edges = vec![call(&caller, &escape), call(&helper, &escape)];
+        let graph = InMemoryGraph::from_parts(vec![module.clone(), escape, helper, caller], edges);
+        let rows = member_callers(&graph, &module);
+        let names: Vec<(&str, &str)> = rows
+            .iter()
+            .map(|(h, m)| (h.node.name.as_str(), m.name.as_str()))
+            .collect();
+        assert_eq!(
+            names,
+            vec![("search", "escape_like")],
+            "the in-module call is not a user"
+        );
     }
 
     /// Six unrelated `run`s in three languages used to be seeded as one symbol,

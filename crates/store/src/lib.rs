@@ -3,7 +3,7 @@
 //! SQL/disk. v0/M1 backend: `redb` (pure-Rust KV). `SamyamaStore` lands in M3.
 
 use anyhow::{Context, Result};
-use ir::{Edge, EdgeKind, Node, SymbolId};
+use ir::{Edge, EdgeKind, Node, NodeKind, SymbolId};
 use parse::CachedFile;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
@@ -574,12 +574,63 @@ impl InMemoryGraph {
         if !suffix.is_empty() {
             return Some((suffix, Match::QualifiedSuffix));
         }
+        let owned = self.owner_member(query);
+        if !owned.is_empty() {
+            return Some((owned, Match::QualifiedSuffix));
+        }
         let lower = query.to_lowercase();
         let substring = self.matching(|n| {
             n.name.to_lowercase().contains(&lower)
                 || n.qualified_name.to_lowercase().contains(&lower)
         });
         (!substring.is_empty()).then_some((substring, Match::Substring))
+    }
+
+    /// `Owner.member` / `Owner::member` where the member's own qualified name does not
+    /// say its owner: an Elixir function is stored as `changeset` inside the module
+    /// `FiveNoobs.Events.Event`, so `Event.changeset` found nothing (#148). The owner
+    /// matches exactly or as a qualified suffix; the member is any definition of that
+    /// name inside the owner's span.
+    fn owner_member(&self, query: &str) -> Vec<&Node> {
+        let split = query
+            .rfind("::")
+            .map(|i| (&query[..i], &query[i + 2..]))
+            .or_else(|| query.rfind('.').map(|i| (&query[..i], &query[i + 1..])));
+        let Some((owner, member)) = split.filter(|(o, m)| !o.is_empty() && !m.is_empty()) else {
+            return Vec::new();
+        };
+        let owners = self.matching(|n| {
+            n.kind != NodeKind::Module
+                && n.kind != NodeKind::File
+                && (n.qualified_name == owner
+                    || n.qualified_name.ends_with(&format!(".{owner}"))
+                    || n.qualified_name.ends_with(&format!("::{owner}")))
+        });
+        let mut found: Vec<&Node> = owners
+            .into_iter()
+            .flat_map(|o| self.members_of(o))
+            .filter(|n| n.name == member)
+            .collect();
+        found.sort_by_key(|n| (n.module_path.clone(), n.span.start_line));
+        found.dedup_by_key(|n| n.id);
+        found
+    }
+
+    /// Definitions written inside `container`'s span in its own file: a class's
+    /// methods, an Elixir module's functions. Nested deeper is still inside.
+    pub fn members_of(&self, container: &Node) -> Vec<&Node> {
+        let inside = |n: &Node| {
+            container.definition_spans().any(|c| {
+                (c.start_line, c.start_col) <= (n.span.start_line, n.span.start_col)
+                    && (n.span.end_line, n.span.end_col) <= (c.end_line, c.end_col)
+            })
+        };
+        self.matching(|n| {
+            n.id != container.id
+                && n.module_path == container.module_path
+                && !matches!(n.kind, NodeKind::Module | NodeKind::File)
+                && inside(n)
+        })
     }
 
     /// Nodes satisfying `pred`, in a stable order (module path, then line).
