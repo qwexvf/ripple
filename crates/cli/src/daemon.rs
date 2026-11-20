@@ -59,6 +59,68 @@ pub fn socket_path() -> PathBuf {
         .join("daemon.sock")
 }
 
+/// Where the daemon remembers which projects were registered, so a restart (a
+/// reboot, `systemctl --user restart`) resumes watching them instead of silently
+/// dropping every registration (#143). `RIPPLE_STATE_DIR` overrides; otherwise
+/// `$XDG_STATE_HOME/ripple`, falling back to `~/.local/state/ripple`.
+pub fn registrations_path() -> PathBuf {
+    let dir = if let Some(explicit) = std::env::var_os("RIPPLE_STATE_DIR") {
+        PathBuf::from(explicit)
+    } else if let Some(state) = std::env::var_os("XDG_STATE_HOME") {
+        PathBuf::from(state).join("ripple")
+    } else if let Some(home) = std::env::var_os("HOME") {
+        PathBuf::from(home).join(".local/state/ripple")
+    } else {
+        std::env::temp_dir().join("ripple-state")
+    };
+    dir.join("daemon-projects")
+}
+
+/// The registered roots, one absolute path per line. A missing file is an empty
+/// list, not an error: a fresh machine has registered nothing.
+fn read_registrations(path: &Path) -> Vec<PathBuf> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut roots: Vec<PathBuf> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(PathBuf::from)
+        .collect();
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+/// Rewrite the registrations file atomically (write a sibling, then rename), so
+/// a crash mid-write cannot leave a truncated list behind.
+fn write_registrations(path: &Path, roots: &[PathBuf]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
+    }
+    let mut body = String::new();
+    for root in roots {
+        body.push_str(&root.to_string_lossy());
+        body.push('\n');
+    }
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, body).with_context(|| format!("write {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("rename to {}", path.display()))?;
+    Ok(())
+}
+
+/// Add `root` to the persisted registrations unless it is already there.
+fn remember(path: &Path, root: &Path) -> Result<()> {
+    let mut roots = read_registrations(path);
+    if roots.iter().any(|r| r == root) {
+        return Ok(());
+    }
+    roots.push(root.to_path_buf());
+    roots.sort();
+    write_registrations(path, &roots)
+}
+
 // ── wire protocol: newline-delimited JSON ──────────────────────────────────
 
 /// One request from a client. `root` is the project directory; the daemon
@@ -137,17 +199,20 @@ pub struct Registry {
     /// burst of file events for one project collapses to one rebuild.
     queue: Sender<PathBuf>,
     pending: Mutex<HashSet<PathBuf>>,
+    /// The registrations file; `None` keeps a registry purely in memory (tests).
+    state: Option<PathBuf>,
 }
 
 impl Registry {
     /// Build the registry and spawn its single reindex worker.
-    fn new(cap: usize) -> Arc<Self> {
+    fn new(cap: usize, state: Option<PathBuf>) -> Arc<Self> {
         let (tx, rx) = std::sync::mpsc::channel();
         let registry = Arc::new(Registry {
             projects: Mutex::new(HashMap::new()),
             cap,
             queue: tx,
             pending: Mutex::new(HashSet::new()),
+            state,
         });
         spawn_worker(Arc::clone(&registry), rx);
         registry
@@ -199,6 +264,11 @@ impl Registry {
         }
         let graph = build_graph(root).map_err(|e| e.to_string())?;
         let watcher = start_watcher(root, Arc::clone(self)).map_err(|e| e.to_string())?;
+        if let Some(path) = &self.state {
+            if let Err(e) = remember(path, root) {
+                eprintln!("ripple daemon: could not persist registration: {e:#}");
+            }
+        }
         let project = Arc::new(Project {
             graph: RwLock::new(Arc::new(graph)),
             last_access: Mutex::new(Instant::now()),
@@ -394,8 +464,10 @@ pub fn run(cap: Option<usize>) -> Result<()> {
         let _ = std::fs::remove_file(&sock);
     }
     let listener = UnixListener::bind(&sock).with_context(|| format!("bind {}", sock.display()))?;
-    let registry = Registry::new(cap.unwrap_or(DEFAULT_MAX_RESIDENT));
+    let state = registrations_path();
+    let registry = Registry::new(cap.unwrap_or(DEFAULT_MAX_RESIDENT), Some(state.clone()));
     eprintln!("ripple daemon: listening on {}", sock.display());
+    restore_registrations(&registry, &state);
 
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
@@ -410,6 +482,37 @@ pub fn run(cap: Option<usize>) -> Result<()> {
         });
     }
     Ok(())
+}
+
+/// Re-register every remembered project in the background, so the socket answers
+/// immediately while the rebuilds run. A root that has since been deleted or lost
+/// its project marker is dropped from the file rather than retried forever.
+fn restore_registrations(registry: &Arc<Registry>, state: &Path) {
+    let roots = read_registrations(state);
+    if roots.is_empty() {
+        return;
+    }
+    let (live, gone): (Vec<_>, Vec<_>) = roots.into_iter().partition(|r| is_project_root(r));
+    if !gone.is_empty() {
+        for root in &gone {
+            eprintln!(
+                "ripple daemon: forgetting {} (no longer a project root)",
+                root.display()
+            );
+        }
+        if let Err(e) = write_registrations(state, &live) {
+            eprintln!("ripple daemon: could not rewrite registrations: {e:#}");
+        }
+    }
+    let registry = Arc::clone(registry);
+    std::thread::spawn(move || {
+        for root in live {
+            match registry.register(&root) {
+                Ok(()) => eprintln!("ripple daemon: restored {}", root.display()),
+                Err(e) => eprintln!("ripple daemon: restore {} failed: {e}", root.display()),
+            }
+        }
+    });
 }
 
 #[derive(PartialEq)]
@@ -639,6 +742,34 @@ mod tests {
         assert!(!is_project_root(dir.path()), "bare dir is not a project");
         std::fs::write(dir.path().join("Cargo.toml"), "[package]").unwrap();
         assert!(is_project_root(dir.path()), "a marker makes it a project");
+    }
+
+    #[test]
+    fn registrations_roundtrip_and_dedup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state/daemon-projects");
+        assert!(
+            read_registrations(&path).is_empty(),
+            "missing file is empty"
+        );
+        remember(&path, Path::new("/b")).unwrap();
+        remember(&path, Path::new("/a")).unwrap();
+        remember(&path, Path::new("/b")).unwrap();
+        assert_eq!(
+            read_registrations(&path),
+            vec![PathBuf::from("/a"), PathBuf::from("/b")]
+        );
+    }
+
+    #[test]
+    fn restore_forgets_roots_that_are_no_longer_projects() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("daemon-projects");
+        let gone = dir.path().join("deleted-repo");
+        write_registrations(&state, &[gone]).unwrap();
+        let registry = Registry::new(2, Some(state.clone()));
+        restore_registrations(&registry, &state);
+        assert!(read_registrations(&state).is_empty());
     }
 
     #[test]

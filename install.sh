@@ -83,7 +83,8 @@ or changing code, orient with it instead of grepping blind:
   first — it returns risk-ranked entrypoints with a blast-radius preview. Start there.
 - **Before changing a symbol**: `ripple impact <symbol>` (what breaks) and
   `ripple neighbors <symbol> --in` (callers).
-- **After editing**: `ripple reindex` (or `ripple index .`) — the graph is stale until you do.
+- **After editing**: `ripple index .` (or `--sync` on `impact`/`review`). The graph is stale
+  until you do, unless a running `ripple daemon` has this repo registered.
 
 See the `ripple-orient` skill for the full workflow.
 <!-- ripple:end -->

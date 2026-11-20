@@ -69,3 +69,34 @@ fn an_unknown_flag_is_an_error_not_a_default() {
         "the error must name the flag"
     );
 }
+
+/// An ambiguous name used to print one JSON array per match, back to back, which
+/// no JSON parser accepts (#130). The caveat goes to stderr and into the document.
+#[test]
+fn ambiguous_neighbors_json_is_one_document() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    std::fs::create_dir(&src).unwrap();
+    std::fs::write(
+        src.join("a.ts"),
+        "export function handle() { return 1; }\nexport function go() { return handle(); }\n",
+    )
+    .unwrap();
+    std::fs::write(src.join("b.ts"), "export function handle() { return 2; }\n").unwrap();
+    let root = tmp.path().to_str().unwrap();
+    assert!(ripple(&["index", root]).status.success());
+
+    let out = ripple(&["neighbors", "handle", "--in", "--json", "--root", root]);
+    assert!(out.status.success());
+    let doc: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout is one JSON document");
+    assert_eq!(doc["lookup"]["candidates"], 2);
+    assert_eq!(doc["lookup"]["ambiguous"], true);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("matches 2 symbols"));
+
+    let human = ripple(&["path", "go", "handl", "--root", root]);
+    assert!(
+        !String::from_utf8_lossy(&human.stdout).contains("no exact match"),
+        "the lookup caveat belongs on stderr"
+    );
+}

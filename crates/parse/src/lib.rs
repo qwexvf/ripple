@@ -374,9 +374,48 @@ fn parse_region(
 }
 
 /// Convenience for one-off use (compiles queries each call). Not for hot loops.
+///
+/// Embedded regions (an HTML `<script>`) are extracted too, so this agrees with what
+/// `index` sees for the same file (#131). Only the adapters the file actually embeds
+/// get their queries compiled, which keeps a plain file as cheap as before.
 pub fn extract(source: &str, adapter: &dyn LanguageAdapter) -> Result<Vec<Node>> {
     let queries = Queries::compile(adapter)?;
-    Ok(extract_file(source, adapter, "<file>", &queries, None)?.defs)
+    let embedded = embedded_ids(source, adapter);
+    if embedded.is_empty() {
+        return Ok(extract_file(source, adapter, "<file>", &queries, None)?.defs);
+    }
+    let registry: Vec<Box<dyn LanguageAdapter>> = lang::registry()
+        .into_iter()
+        .filter(|a| embedded.contains(&a.id()))
+        .collect();
+    let mut compiled = HashMap::new();
+    for a in &registry {
+        compiled.insert(a.id(), Queries::compile(a.as_ref())?);
+    }
+    let embed = EmbedCtx {
+        registry: &registry,
+        queries: &compiled,
+    };
+    Ok(extract_file(source, adapter, "<file>", &queries, Some(&embed))?.defs)
+}
+
+/// Which adapters `source` embeds regions of, by id. Empty for most languages.
+fn embedded_ids(source: &str, adapter: &dyn LanguageAdapter) -> Vec<&'static str> {
+    let mut parser = Parser::new();
+    if parser.set_language(&adapter.grammar()).is_err() {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(source, None) else {
+        return Vec::new();
+    };
+    let mut ids: Vec<&'static str> = adapter
+        .embedded_regions(tree.root_node(), source.as_bytes())
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
 }
 
 fn extract_defs(
@@ -806,6 +845,17 @@ fn span_of(node: TsNode) -> Span {
 #[cfg(test)]
 mod tests {
     use super::{is_ignored_at, merge_regions};
+
+    /// `ripple parse page.html` used to report 0 symbols for a file whose
+    /// `<script>` index resolved fine, because `extract` never passed an embed
+    /// context (#131).
+    #[test]
+    fn extract_sees_embedded_script_regions() {
+        let html = "<html><body>\n<script type=\"module\">\nexport function boot() {}\n</script>\n</body></html>\n";
+        let adapter = lang::for_path(std::path::Path::new("page.html")).expect("html adapter");
+        let defs = super::extract(html, adapter.as_ref()).expect("extract");
+        assert!(defs.iter().any(|d| d.name == "boot"), "{defs:?}");
+    }
 
     #[test]
     fn merged_ignore_regions_answer_containment() {
