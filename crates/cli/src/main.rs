@@ -291,6 +291,12 @@ fn index_project(roots: &[PathBuf], lsp_calls: Option<std::time::Duration>) -> R
     let git_span = ir::timing::start("git_overlay_mine");
     let mut git = overlay::GitOverlay::default();
     for (tag, root) in &indexed.roots {
+        if let Some(why) = overlay::history_caveat(overlay::history(root)) {
+            eprintln!(
+                "⚠ {}: {why}; churn, bug-density and ownership will read as unknown",
+                root.display()
+            );
+        }
         let o = overlay::mine_cached(root);
         for (k, v) in o.file_risk {
             git.file_risk.insert(resolve::namespace(tag, &k), v);
@@ -3230,24 +3236,39 @@ fn cmd_risk(args: &[String]) -> Result<()> {
         bail!("no symbol or file matching: {query}");
     }
 
+    // without history the git terms are 0.00, which reads as "least risky"; say
+    // "unknown" instead (#124)
+    let caveat = overlay::history_caveat(overlay::history(&root));
+    let git_term = |v: f32| caveat.is_none().then_some(v);
+    if let Some(why) = &caveat {
+        eprintln!("⚠ {why}: churn, bug-density and ownership are unknown, not low");
+    }
+
     if json {
         let out: Vec<_> = hits
             .iter()
             .map(|(name, module, r)| {
                 serde_json::json!({
                     "name": name, "module": module,
-                    "composite": r.composite, "churn": r.churn,
-                    "bug_density": r.bug_density, "ownership": r.ownership,
+                    "composite": r.composite, "churn": git_term(r.churn),
+                    "bug_density": git_term(r.bug_density), "ownership": git_term(r.ownership),
                     "fanout": r.fanout, "test_proximity": r.test_proximity,
+                    "git_signals_unknown": caveat,
                 })
             })
             .collect();
         println!("{}", serde_json::to_string_pretty(&out)?);
     } else {
+        let shown = |v: f32| git_term(v).map_or_else(|| "?".to_owned(), |v| format!("{v:.2}"));
         for (name, module, r) in &hits {
             println!(
-                "{name} ({module})\n  composite {:.2} | churn {:.2} bug {:.2} ownership {:.2} fanout {:.2} tested {:.2}",
-                r.composite, r.churn, r.bug_density, r.ownership, r.fanout, r.test_proximity
+                "{name} ({module})\n  composite {:.2} | churn {} bug {} ownership {} fanout {:.2} tested {:.2}",
+                r.composite,
+                shown(r.churn),
+                shown(r.bug_density),
+                shown(r.ownership),
+                r.fanout,
+                r.test_proximity
             );
         }
     }

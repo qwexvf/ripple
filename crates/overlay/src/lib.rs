@@ -83,6 +83,61 @@ pub fn mine(root: &Path) -> GitOverlay {
     try_mine(root).unwrap_or_default()
 }
 
+/// How much history `mine` had to work with. Churn, bug-density and ownership are
+/// all derived from it, and with too little of it they come out `0.00`, the value
+/// for *least risky*, so callers must be able to tell "low" from "unknown" (#124).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct History {
+    /// Non-merge commits with a parent reachable from HEAD, capped at the mining
+    /// window. These are the only commits `mine` learns from: the root commit is
+    /// skipped because diffing it against the empty tree touches every file.
+    pub usable_commits: usize,
+    /// `git rev-parse --is-shallow-repository`: history was cut off by the clone.
+    pub shallow: bool,
+}
+
+/// What history `root` has, or `None` when it is not in a git repository or HEAD
+/// has no commits.
+pub fn history(root: &Path) -> Option<History> {
+    let repo = git2::Repository::discover(root).ok()?;
+    let mut revwalk = repo.revwalk().ok()?;
+    revwalk.push_head().ok()?;
+    let mut usable_commits = 0;
+    for oid in revwalk.take(COMMIT_WINDOW) {
+        let Ok(oid) = oid else { continue };
+        let Ok(commit) = repo.find_commit(oid) else {
+            continue;
+        };
+        if commit.parent_count() == 1 {
+            usable_commits += 1;
+        }
+    }
+    Some(History {
+        usable_commits,
+        shallow: repo.is_shallow(),
+    })
+}
+
+/// Fewer commits than this and the git-derived terms say nothing: one or two
+/// commits give every touched file the same churn and no fix to count.
+pub const MIN_USABLE_COMMITS: usize = 5;
+
+/// Why the git-derived risk terms of `root` cannot be read as measurements, or
+/// `None` when there is enough history for them to mean something.
+pub fn history_caveat(history: Option<History>) -> Option<String> {
+    let Some(h) = history else {
+        return Some("no git history".to_owned());
+    };
+    if h.usable_commits >= MIN_USABLE_COMMITS {
+        return None;
+    }
+    let shallow = if h.shallow { "shallow clone, " } else { "" };
+    Some(format!(
+        "{shallow}only {} usable commit(s) of history (need {MIN_USABLE_COMMITS})",
+        h.usable_commits
+    ))
+}
+
 /// The overlay cache: the HEAD it was mined at, plus the overlay itself.
 #[derive(Serialize, Deserialize)]
 struct CachedOverlay {
@@ -1097,6 +1152,29 @@ mod tests {
             &parents.iter().collect::<Vec<_>>(),
         )
         .expect("commit");
+    }
+
+    #[test]
+    fn history_caveat_separates_unknown_from_low() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(history(dir.path()).is_none(), "not a repo");
+        assert_eq!(history_caveat(None).as_deref(), Some("no git history"));
+
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        commit(&repo, 0, &["a.txt"]);
+        let one = history(dir.path()).expect("repo with HEAD");
+        assert_eq!(
+            one.usable_commits, 0,
+            "the root commit teaches mine nothing"
+        );
+        assert!(history_caveat(Some(one)).is_some());
+
+        for n in 1..=MIN_USABLE_COMMITS as u32 {
+            commit(&repo, n, &["a.txt"]);
+        }
+        let enough = history(dir.path()).expect("history");
+        assert_eq!(enough.usable_commits, MIN_USABLE_COMMITS);
+        assert!(history_caveat(Some(enough)).is_none());
     }
 
     /// Write `content` to `path` and commit it at a fixed day offset, so escape
