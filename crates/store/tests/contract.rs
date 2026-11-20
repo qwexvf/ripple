@@ -212,3 +212,43 @@ fn a_missing_index_says_so_and_a_lock_is_not_confused_with_it() {
     assert!(s.read_roots().unwrap().is_empty());
     assert!(s.read_file_stamps().unwrap().is_empty());
 }
+
+fn spanned(mut n: Node, start: u32, end: u32) -> Node {
+    n.span.start_line = start;
+    n.span.end_line = end;
+    n.span.end_col = 80;
+    n
+}
+
+/// An Elixir function is stored by its bare name inside its module, so the name a
+/// human types, `Event.changeset`, matched nothing (#148).
+#[test]
+fn owner_dot_member_finds_a_member_inside_its_owner() {
+    use store::{InMemoryGraph, Match};
+
+    let mut event = spanned(
+        node("events/event.ex", "FiveNoobs.Events.Event", NodeKind::Class),
+        1,
+        20,
+    );
+    event.qualified_name = "FiveNoobs.Events.Event".to_owned();
+    let changeset = spanned(
+        node("events/event.ex", "changeset", NodeKind::Function),
+        5,
+        9,
+    );
+    let elsewhere = spanned(node("other.ex", "changeset", NodeKind::Function), 2, 4);
+    let graph = InMemoryGraph::from_parts(vec![event, changeset, elsewhere], Vec::new());
+
+    for query in ["Event.changeset", "FiveNoobs.Events.Event.changeset"] {
+        let (hit, how) = graph.lookup(query).expect(query);
+        assert_eq!(how, Match::QualifiedSuffix, "{query}");
+        assert_eq!(
+            hit.iter()
+                .map(|n| n.module_path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["events/event.ex"],
+            "{query}: only the changeset inside Event"
+        );
+    }
+}

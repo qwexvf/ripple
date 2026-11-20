@@ -731,10 +731,16 @@ pub fn locate(graph: &InMemoryGraph, task: &str, budget: usize) -> Located {
         &|a, b| a.node.risk.composite.total_cmp(&b.node.risk.composite) == Ordering::Equal,
     );
 
+    // a task that *is* a symbol's name asks for that symbol: `locate run_ci` split
+    // into `run` + `ci` and let a dozen central test helpers named `run` bury the
+    // exact match (#135). Exact names go first, still in fused order among themselves.
+    let query = task.trim();
+    let exact = |c: &Cand| c.node.name == query || c.node.qualified_name == query;
     let mut order: Vec<usize> = (0..n).collect();
     order.sort_by(|&a, &b| {
-        rrf[b]
-            .total_cmp(&rrf[a])
+        exact(&cands[b])
+            .cmp(&exact(&cands[a]))
+            .then(rrf[b].total_cmp(&rrf[a]))
             .then_with(|| tie(&cands[a], &cands[b]))
     });
 
@@ -1223,5 +1229,32 @@ mod tests {
         let r = locate(&graph, "login", 2);
         assert_eq!(r.seeds[0].node.id, hub.id, "the hub outranks the leaf");
         assert_eq!(r.seeds[0].centrality, 2);
+    }
+
+    /// `locate run_ci` split into `run` + `ci`, and central helpers named `run`
+    /// outranked the one symbol actually called `run_ci` (#135).
+    #[test]
+    fn locate_puts_an_exactly_named_symbol_first() {
+        let target = node("src/commands.rs", "run_ci");
+        let mut nodes = vec![target.clone()];
+        let mut edges = Vec::new();
+        // helpers that share the `run` token and are more central and riskier
+        for (h, file) in ["tests/cli.rs", "tests/gate.rs", "tests/ci_flow.rs"]
+            .iter()
+            .enumerate()
+        {
+            let mut helper = node(file, "run");
+            helper.risk.composite = 0.5;
+            for i in 0..(5 + h) {
+                let user = node(file, &format!("t{i}"));
+                edges.push(calls(&user, &helper));
+                nodes.push(user);
+            }
+            nodes.push(helper);
+        }
+        let graph = InMemoryGraph::from_parts(nodes, edges);
+
+        let r = locate(&graph, "run_ci", 3);
+        assert_eq!(r.seeds[0].node.id, target.id);
     }
 }

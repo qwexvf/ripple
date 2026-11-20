@@ -83,6 +83,28 @@ pub fn mine(root: &Path) -> GitOverlay {
     try_mine(root).unwrap_or_default()
 }
 
+/// Is `path` (relative to `root`) tracked in the git index of the repository
+/// holding `root`? `false` when there is no repository.
+pub fn is_tracked(root: &Path, path: &str) -> bool {
+    let Ok(repo) = git2::Repository::discover(root) else {
+        return false;
+    };
+    let (Some(workdir), Ok(index)) = (repo.workdir(), repo.index()) else {
+        return false;
+    };
+    let abs = root
+        .canonicalize()
+        .unwrap_or_else(|_| root.to_path_buf())
+        .join(path);
+    let workdir = workdir
+        .canonicalize()
+        .unwrap_or_else(|_| workdir.to_path_buf());
+    let Ok(rel) = abs.strip_prefix(&workdir) else {
+        return false;
+    };
+    index.get_path(rel, 0).is_some()
+}
+
 /// How much history `mine` had to work with. Churn, bug-density and ownership are
 /// all derived from it, and with too little of it they come out `0.00`, the value
 /// for *least risky*, so callers must be able to tell "low" from "unknown" (#124).

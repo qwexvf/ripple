@@ -46,7 +46,7 @@ Builds the graph and writes it to `<root>/.ripple/graph.redb`. Defaults to `.` w
 path is given.
 
 Languages: TypeScript, TSX, Python, Rust, Elixir, Go, Gleam, Ruby, PHP, Java, Scala,
-Kotlin, C#, C, C++, Svelte, Vue, HTML, GraphQL. Go and Gleam need `--calls lsp` for
+Kotlin, C#, C, C++, Svelte, Vue, HTML, GraphQL, GDScript. Go and Gleam need `--calls lsp` for
 their call graph, and GraphQL has no call query (a schema declares types, it does not
 call anything); the rest resolve calls from the source.
 OpenAPI and Swagger documents are read too — as endpoint declarations, not as code.
@@ -185,6 +185,11 @@ about it — `impact` is the ranked version.
 
 Edge kinds surfaced: `Calls`, `Imports`, `ChangesWith`, `GraphqlCall`, `DbQuery`.
 
+`--in` on a type (a class, a struct, an Elixir module) also lists callers of its members
+from outside the type, each marked `→ member`, since code reaches a module by calling its
+functions. A name can be given as `Owner.member` or `Owner::member` when the member's own
+name is ambiguous.
+
 `--json` prints one object, `{direction, lookup, neighbors}`, however many symbols the name
 matched. Each row names the matched symbol it answers about in `target` / `target_module`.
 
@@ -260,9 +265,43 @@ Two other modes:
   with size and cross-file/cross-language coupling (measured 3.3× grep on a real Elixir API,
   2× on a TS app).
 
+  It also prices each answer in output tokens, estimated as characters / 4: ripple's is the
+  `impact` text down to its k-th distinct file; grep's is what `grep -rnw` for the seed's
+  names prints, cut to its top k files and in full. `~tokens/true file` divides that by the
+  co-changed files found in the top k. The grep query is every name the seed defines, more
+  than a person would type, so read grep's cost as an upper bound.
+
 This is how the numbers in the [dogfood log](../design/12-dogfood-log.md) were produced,
 including the ones that turned out to be wrong. When there is nothing to evaluate it says
 so rather than reporting `0.0%`.
+
+## `ripple stats`
+
+How ripple is used in practice, read from Claude Code transcripts (`~/.claude/projects` by
+default, or `--transcripts <dir>`; `--project` / `--exclude` filter by path substring,
+`--days N` by file age). It counts ripple lookups and text searches (grep, rg, find and
+the Grep/Glob tools; a `grep` reading a pipe is a filter and is not counted), the tokens
+their results cost (characters / 4), and what the agent did next:
+
+- **used**: a file the result named was read or edited within the next 8 tool calls,
+  before any other lookup;
+- **searched again**: another lookup came first;
+- **empty**: the result named no file.
+
+It also groups the lookups made before each edit and compares stretches that used ripple
+with those that did not. All of it is observational. "Used" says an answer was acted on,
+not that it was right, and ripple tends to be reached for on the harder tasks, which
+inflates its per-edit cost. `eval --vs-grep` is the controlled comparison.
+
+To compare fairly on real work, assign sessions at random. `--arms <file>` (default
+`$XDG_STATE_HOME/ripple/ab.jsonl` when it exists) reads lines of
+`{"session_id": "...", "arm": "..."}`, written by a session-start hook that also keeps
+ripple out of `holdout` sessions. The latest row for a session wins, so a holdout session
+switched back to ripple mid-way can be logged under its own arm (`switched`). The report then adds one row per arm: edits, the
+model's context and output tokens per edit (from each message's `usage`, subagents
+included), lookups per edit, and ripple calls (which should be zero in the holdout arm).
+Edits are counted from the file-editing tools only (Edit, MultiEdit, Write, NotebookEdit),
+so a session that edits through the shell is undercounted in either arm.
 
 ## `ripple lsp doctor`
 

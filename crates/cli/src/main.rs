@@ -5,6 +5,7 @@
 
 mod daemon;
 mod riskeval;
+mod stats;
 mod verify;
 
 use anyhow::{bail, Context, Result};
@@ -48,12 +49,16 @@ fn main() -> Result<()> {
         Some("daemon") => cmd_daemon(&args[1..]),
         Some("eval") => cmd_eval(&args[1..]),
         Some("lsp") => cmd_lsp(&args[1..]),
+        Some("stats") => {
+            let rest = &args[1..];
+            stats::run(rest, |f| flag_value(rest, f).map(str::to_owned))
+        }
         Some(other) => bail!("unknown command: {other}\n{USAGE}"),
         None => bail!("{USAGE}"),
     }
 }
 
-const USAGE: &str = "usage:\n  ripple parse <file> [--json]\n  ripple index <path>... [--calls lsp [--calls-budget 120s]] [--debug]   (--calls lsp: call edges from a language server; --debug: per-phase timings to stderr)\n  ripple neighbors <symbol> [--in|--out] [--depth N] [--in-file <substr>] [--root <path>] [--json]\n  ripple locate <task words...> [--budget N] [--root <path>] [--json] [--debug]   (where do I start for this task?)\n  ripple impact <symbol>... [--budget N] [--in-file <substr>] [--root <path>] [--json] [--verify lsp] [--sync]\n  ripple review [<base>] [--budget N] [--root <path>] [--json] [--verify lsp] [--sync]\n    --sync   (rebuild from the working tree in memory before answering, so edits since the last index are reflected — no re-index, nothing persisted)\n    --verify lsp [--verify-budget 2s] [--floor-contradicted|--drop-contradicted]  (upgrade call edges from a language server)\n  ripple path <from> <to> [--depth 6] [--limit 3] [--root <path>] [--json]   (how does A reach B?)\n  ripple risk <symbol|file> [--root <path>] [--json]\n  ripple mcp [--root <path>]   (MCP server over stdio for AI agents)\n  ripple daemon [run] [--max-resident 8]   (resident, file-watching index server; systemd-friendly)\n    ripple daemon register <path> | status | stop   (talk to a running daemon over its socket)\n  ripple eval [--commits N] [--skip N] [--weights <spec>] [--root <path>]   (held-out co-change recall)\n    --risk                                        (do the risk terms rank the files a later fix touched?)\n    --review [--budget N] [--cases N] [--converge 0.6] [--escape-days 7] [--max-introducer-files 40]   (does review rank the defective symbol within the change that introduced it? bulk introducers dropped)\n    --vs-grep [--budget N] [--commits N]   (does the blast radius beat grep at predicting co-change?)\n    --oracle lsp [--sample N] [--granularity function|file]   (agree with a language server?)\n  ripple lsp doctor [--root <path>] [--budget 10s] [--json]   (are language servers usable here?)\n  ripple lsp trust [--root <path>]   (allow this repo's own .ripple/lsp.json to launch servers)\n  ripple --help\n  ripple --version";
+const USAGE: &str = "usage:\n  ripple parse <file> [--json]\n  ripple index <path>... [--calls lsp [--calls-budget 120s]] [--debug]   (--calls lsp: call edges from a language server; --debug: per-phase timings to stderr)\n  ripple neighbors <symbol> [--in|--out] [--depth N] [--in-file <substr>] [--root <path>] [--json]\n  ripple locate <task words...> [--budget N] [--root <path>] [--json] [--debug]   (where do I start for this task?)\n  ripple impact <symbol>... [--budget N] [--in-file <substr>] [--root <path>] [--json] [--verify lsp] [--sync]\n  ripple review [<base>] [--budget N] [--root <path>] [--json] [--verify lsp] [--sync]\n    --sync   (rebuild from the working tree in memory before answering, so edits since the last index are reflected — no re-index, nothing persisted)\n    --verify lsp [--verify-budget 2s] [--floor-contradicted|--drop-contradicted]  (upgrade call edges from a language server)\n  ripple path <from> <to> [--depth 6] [--limit 3] [--root <path>] [--json]   (how does A reach B?)\n  ripple risk <symbol|file> [--root <path>] [--json]\n  ripple mcp [--root <path>]   (MCP server over stdio for AI agents)\n  ripple daemon [run] [--max-resident 8]   (resident, file-watching index server; systemd-friendly)\n    ripple daemon register <path> | status | stop   (talk to a running daemon over its socket)\n  ripple eval [--commits N] [--skip N] [--weights <spec>] [--root <path>]   (held-out co-change recall)\n    --risk                                        (do the risk terms rank the files a later fix touched?)\n    --review [--budget N] [--cases N] [--converge 0.6] [--escape-days 7] [--max-introducer-files 40]   (does review rank the defective symbol within the change that introduced it? bulk introducers dropped)\n    --vs-grep [--budget N] [--commits N]   (does the blast radius beat grep at predicting co-change, and at what token cost?)\n    --oracle lsp [--sample N] [--granularity function|file]   (agree with a language server?)\n  ripple stats [--transcripts <dir>] [--project <substr>] [--exclude <substr>] [--days N] [--arms <file>] [--json]   (ripple vs text search in Claude Code transcripts: tokens read, results used)\n  ripple lsp doctor [--root <path>] [--budget 10s] [--json]   (are language servers usable here?)\n  ripple lsp trust [--root <path>]   (allow this repo's own .ripple/lsp.json to launch servers)\n  ripple --help\n  ripple --version";
 
 /// Where `root`'s own database would live.
 fn own_db_path(root: &Path) -> PathBuf {
@@ -382,6 +387,9 @@ fn index_project(roots: &[PathBuf], lsp_calls: Option<std::time::Duration>) -> R
         store.write_index(&nodes, &edges, &indexed.files, &indexed.roots)
     })?;
     write_index_pointers(&roots[0], &indexed.roots)?;
+    for (_, root) in &indexed.roots {
+        keep_index_out_of_git(root);
+    }
     for root in &dropped {
         let _ = std::fs::remove_file(root.join(".ripple").join(INDEX_POINTER));
     }
@@ -820,13 +828,7 @@ fn cmd_impact(args: &[String]) -> Result<()> {
             result.reached
         );
         for h in hits {
-            println!(
-                "  {:.2}  {:?}<{:.2}> {}",
-                h.score,
-                h.via,
-                h.weight,
-                hit_name(&h.node)
-            );
+            println!("{}", impact_line(h));
         }
     }
     Ok(())
@@ -1087,6 +1089,30 @@ fn warn_if_stale(store: &RedbStore, modules: &HashSet<&str>) {
 ///
 /// Best-effort per root: a read-only checkout is a reason to lose the shortcut,
 /// not a reason to fail an index that already succeeded.
+/// Make `.ripple/` ignore itself, and say so when the graph is already committed.
+///
+/// A committed `graph.redb` is restored by every checkout with a fresh mtime and
+/// old contents: files added since read as missing, and unchanged files hash as
+/// "changed since indexing" (#139). The ignore file is only created, never
+/// rewritten, so a project that wants a different rule keeps it.
+fn keep_index_out_of_git(root: &Path) {
+    let dir = root.join(".ripple");
+    let ignore = dir.join(".gitignore");
+    if dir.is_dir() && !ignore.exists() {
+        let _ = std::fs::write(
+            &ignore,
+            "# written by ripple: the index is local state\n*\n",
+        );
+    }
+    if overlay::is_tracked(root, ".ripple/graph.redb") {
+        eprintln!(
+            "⚠ {}: .ripple/graph.redb is committed to git, so every checkout restores a stale index; \
+             untrack it with `git rm -r --cached .ripple`",
+            root.display()
+        );
+    }
+}
+
 fn write_index_pointers(primary: &Path, roots: &[(String, PathBuf)]) -> Result<()> {
     let primary = primary
         .canonicalize()
@@ -1395,6 +1421,18 @@ fn clone_hop(h: &store::Hop) -> store::Hop {
 ///
 /// Everything else carries its line, because two same-named symbols in one file
 /// otherwise print as byte-identical blocks with different contents (#37).
+/// One line of `impact`'s human output. Shared with `eval --vs-grep`, which prices
+/// the answer by the text an agent reads.
+fn impact_line(h: &query::ImpactHit) -> String {
+    format!(
+        "  {:.2}  {:?}<{:.2}> {}",
+        h.score,
+        h.via,
+        h.weight,
+        hit_name(&h.node)
+    )
+}
+
 fn hit_name(node: &ir::Node) -> String {
     if node.kind == ir::NodeKind::Module {
         format!("[file] {}", node.module_path)
@@ -2246,6 +2284,20 @@ fn cmd_eval_review(args: &[String]) -> Result<()> {
 
 /// Identifier-like tokens in a blob of source, deduped. The grep baseline's whole
 /// vocabulary: which names does this file mention, textually, in any language.
+/// Characters `grep -rnw -e <name>… .` prints for one file: `path:line:text` and a
+/// newline per line that mentions any of `names` as a whole word.
+fn grep_output_chars(path: &str, src: &[u8], names: &[String]) -> usize {
+    String::from_utf8_lossy(src)
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| {
+            let toks = identifier_tokens(line.as_bytes());
+            names.iter().any(|n| toks.contains(n))
+        })
+        .map(|(i, line)| path.len() + (i + 1).to_string().len() + line.len() + 3)
+        .sum()
+}
+
 fn identifier_tokens(src: &[u8]) -> std::collections::HashSet<String> {
     let mut out = std::collections::HashSet::new();
     let mut cur = String::new();
@@ -2297,6 +2349,12 @@ fn reciprocal_rank(ranked: &[String], truth: &HashSet<String>) -> f32 {
 /// without ripple would grep for). Both get the same budget `k`; recall@k and MRR
 /// say which fills those slots with the files that actually changed. This is the
 /// "with ripple vs without" number, against a real baseline rather than chance.
+///
+/// It also prices each answer in output tokens, which is what an agent pays to read
+/// it: ripple's is the `impact` text down to its k-th distinct file; grep's is what
+/// `grep -rnw` for the seed's names prints, both in full and cut to its top k files.
+/// Tokens are estimated as characters / 4, the usual rule of thumb for code and
+/// English with BPE tokenizers; no tokenizer is run.
 fn cmd_eval_vs_grep(args: &[String]) -> Result<()> {
     let root: PathBuf = flag_value(args, "--root").map_or_else(|| ".".into(), PathBuf::from);
     let k: usize = flag_value(args, "--budget")
@@ -2318,6 +2376,7 @@ fn cmd_eval_vs_grep(args: &[String]) -> Result<()> {
     // namespaced module path, so they line up with co-change and the graph.
     let mut defines: HashMap<String, Vec<String>> = HashMap::new();
     let mut mentions: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut sources: HashMap<String, Vec<u8>> = HashMap::new();
     for cf in extracts.values() {
         let names: Vec<String> = cf
             .extract
@@ -2331,24 +2390,39 @@ fn cmd_eval_vs_grep(args: &[String]) -> Result<()> {
         }
         if let Ok(bytes) = std::fs::read(&cf.canonical) {
             mentions.insert(cf.module_path.clone(), identifier_tokens(&bytes));
+            sources.insert(cf.module_path.clone(), bytes);
         }
     }
     let candidate_files: Vec<&String> = mentions.keys().collect();
 
     // ripple's ranked files for a seed: the blast radius of the seed's symbols,
     // deduped to distinct files in impact-score order (the seed itself dropped).
-    let ripple_rank = |seed: &str| -> Vec<String> {
+    // ... and the characters of the `impact` lines an agent reads to see k of them
+    let ripple_rank = |seed: &str| -> (Vec<String>, usize) {
         let seeds: Vec<ir::SymbolId> = graph.nodes_in_file(seed).iter().map(|n| n.id).collect();
         let imp = query::impact(&graph, &seeds, usize::MAX);
         let mut seen = HashSet::new();
         let mut out = Vec::new();
+        let mut chars = format!(
+            "blast radius of {seed} — {k} of {} hits (ranked):\n",
+            imp.reached
+        )
+        .len();
         for h in imp.hits {
+            if out.len() < k {
+                chars += impact_line(&h).len() + 1;
+            }
             let f = h.node.module_path;
             if f != seed && seen.insert(f.clone()) {
                 out.push(f);
             }
         }
-        out
+        (out, chars)
+    };
+    let grep_chars = |file: &str, names: &[String]| -> usize {
+        sources
+            .get(file)
+            .map_or(0, |bytes| grep_output_chars(file, bytes, names))
     };
 
     // grep's ranked files for a seed: every other file, scored by how many of the
@@ -2374,6 +2448,10 @@ fn cmd_eval_vs_grep(args: &[String]) -> Result<()> {
 
     let split = overlay::holdout(&root, commits);
     let (mut r_recall, mut g_recall, mut r_mrr, mut g_mrr) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+    // output characters, summed over seeds: ripple, grep cut to k files, grep in full
+    let (mut r_chars, mut gk_chars, mut g_chars) = (0usize, 0usize, 0usize);
+    // true co-changed files found inside the top k, summed over seeds
+    let (mut r_found, mut g_found) = (0usize, 0usize);
     let mut seeds = 0usize;
     let mut truth_total = 0usize;
     for tc in &split.test {
@@ -2391,8 +2469,19 @@ fn cmd_eval_vs_grep(args: &[String]) -> Result<()> {
             if truth.is_empty() {
                 continue;
             }
-            let rr = ripple_rank(seed);
+            let (rr, rc) = ripple_rank(seed);
             let gr = grep_rank(seed);
+            let empty = Vec::new();
+            let names = defines.get(seed).unwrap_or(&empty);
+            r_chars += rc;
+            gk_chars += gr
+                .iter()
+                .take(k)
+                .map(|f| grep_chars(f, names))
+                .sum::<usize>();
+            g_chars += gr.iter().map(|f| grep_chars(f, names)).sum::<usize>();
+            r_found += rr.iter().take(k).filter(|f| truth.contains(*f)).count();
+            g_found += gr.iter().take(k).filter(|f| truth.contains(*f)).count();
             r_recall += recall_at_k(&rr, &truth, k);
             g_recall += recall_at_k(&gr, &truth, k);
             r_mrr += reciprocal_rank(&rr, &truth);
@@ -2423,9 +2512,36 @@ fn cmd_eval_vs_grep(args: &[String]) -> Result<()> {
         split.test.len(),
         truth_total as f32 / n
     );
-    println!("                recall@{k}   MRR");
-    println!("  ripple        {:>6.1}%   {:.3}", pct(r_recall), r_mrr / n);
-    println!("  grep          {:>6.1}%   {:.3}", pct(g_recall), g_mrr / n);
+    // tokens ≈ chars / 4 (see the doc comment); per seed, and per true file found
+    #[allow(clippy::cast_precision_loss)]
+    let tok = |chars: usize| chars as f32 / 4.0;
+    #[allow(clippy::cast_precision_loss)]
+    let per_found = |chars: usize, found: usize| {
+        if found == 0 {
+            "—".to_owned()
+        } else {
+            format!("{:.0}", tok(chars) / found as f32)
+        }
+    };
+    println!("                recall@{k}   MRR    ~tokens/seed  ~tokens/true file");
+    println!(
+        "  ripple        {:>6.1}%   {:.3}  {:>12.0}  {:>17}",
+        pct(r_recall),
+        r_mrr / n,
+        tok(r_chars) / n,
+        per_found(r_chars, r_found)
+    );
+    println!(
+        "  grep (top {k})  {:>6.1}%   {:.3}  {:>12.0}  {:>17}",
+        pct(g_recall),
+        g_mrr / n,
+        tok(gk_chars) / n,
+        per_found(gk_chars, g_found)
+    );
+    println!(
+        "  grep (all)          —        —  {:>12.0}         —",
+        tok(g_chars) / n
+    );
     println!("  random floor  {floor:>6.1}%     —");
     let delta = pct(r_recall) - pct(g_recall);
     println!(
@@ -3307,6 +3423,11 @@ fn cmd_neighbors(args: &[String]) -> Result<()> {
     let mut json_rows: Vec<Value> = Vec::new();
     for start in matches {
         let hops = graph.neighbors(start.id, dir, Some(&NEIGHBOR_KINDS), depth);
+        let via_members = if dir == Dir::In {
+            member_callers(&graph, start)
+        } else {
+            Vec::new()
+        };
         if json {
             json_rows.extend(hops.iter().map(|h| {
                 serde_json::json!({
@@ -3317,6 +3438,15 @@ fn cmd_neighbors(args: &[String]) -> Result<()> {
                     // a flat list and the chain can't be reconstructed
                     "from": parent_of(h, dir).and_then(|p| graph.get(p)).map(|n| n.name.clone()),
                     // which matched symbol this row answers about, when the name was ambiguous
+                    "target": start.name, "target_module": start.module_path,
+                })
+            }));
+            json_rows.extend(via_members.iter().map(|(h, member)| {
+                serde_json::json!({
+                    "name": h.node.name, "kind": format!("{:?}", h.node.kind),
+                    "edge": format!("{:?}", h.edge.kind), "confidence": h.edge.confidence,
+                    "module": h.node.module_path, "depth": 1,
+                    "from": member.name, "via_member": member.name,
                     "target": start.name, "target_module": start.module_path,
                 })
             }));
@@ -3342,6 +3472,12 @@ fn cmd_neighbors(args: &[String]) -> Result<()> {
                     h.edge.kind, h.edge.confidence, h.node.name, h.node.module_path
                 );
             }
+            for (h, member) in &via_members {
+                println!(
+                    "  {:?}<{:.2}> {} ({}) → {}",
+                    h.edge.kind, h.edge.confidence, h.node.name, h.node.module_path, member.name
+                );
+            }
         }
     }
     if json {
@@ -3357,11 +3493,46 @@ fn cmd_neighbors(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Callers of a type's members from outside the type, for `neighbors --in` on the
+/// type. Code names a module or class by calling into it (`QueryComposer.escape_like`),
+/// so the edges land on the member and the type itself looked unreferenced: every
+/// Elixir module read as dead (#144). Calls between the type's own members are left
+/// out; they say nothing about who uses it.
+fn member_callers<'g>(
+    graph: &'g InMemoryGraph,
+    container: &ir::Node,
+) -> Vec<(store::Hop, &'g ir::Node)> {
+    let members = graph.members_of(container);
+    if members.is_empty() {
+        return Vec::new();
+    }
+    let ids: HashSet<ir::SymbolId> = members.iter().map(|m| m.id).collect();
+    let mut rows = Vec::new();
+    for member in members {
+        for hop in graph.neighbors(member.id, Dir::In, Some(&NEIGHBOR_KINDS), 1) {
+            if !ids.contains(&hop.node.id) && hop.node.id != container.id {
+                rows.push((hop, member));
+            }
+        }
+    }
+    rows
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     fn v(a: &[&str]) -> Vec<String> {
         a.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn grep_output_is_priced_like_grep_rnw() {
+        let src = b"fn load() {}\nlet x = loader();\nload();\n";
+        let names = v(&["load"]);
+        // `a.rs:1:fn load() {}` and `a.rs:3:load();`, each with a newline;
+        // `loader` is not a whole-word match
+        let expected = "a.rs:1:fn load() {}\n".len() + "a.rs:3:load();\n".len();
+        assert_eq!(grep_output_chars("a.rs", src, &names), expected);
     }
 
     #[test]
@@ -3706,6 +3877,47 @@ mod tests {
             doc: None,
             route_path: None,
         }
+    }
+
+    /// Code reaches an Elixir module by calling its functions, so `--in` on the module
+    /// itself was empty and every module read as dead (#144).
+    #[test]
+    fn a_types_callers_include_its_members_callers() {
+        let span = |a: u32, b: u32| ir::Span {
+            start_line: a,
+            start_col: 1,
+            end_line: b,
+            end_col: 80,
+        };
+        let mut module = named("Composer", "composer.ex");
+        module.kind = ir::NodeKind::Class;
+        module.span = span(1, 20);
+        let mut escape = named("escape_like", "composer.ex");
+        escape.span = span(3, 6);
+        let mut helper = named("helper", "composer.ex");
+        helper.span = span(8, 10);
+        let mut caller = named("search", "games.ex");
+        caller.span = span(1, 5);
+        let call = |src: &ir::Node, dst: &ir::Node| ir::Edge {
+            src: src.id,
+            dst: dst.id,
+            kind: ir::EdgeKind::Calls,
+            confidence: 0.9,
+            site: span(2, 2),
+            source: ir::EdgeSource::Extracted,
+        };
+        let edges = vec![call(&caller, &escape), call(&helper, &escape)];
+        let graph = InMemoryGraph::from_parts(vec![module.clone(), escape, helper, caller], edges);
+        let rows = member_callers(&graph, &module);
+        let names: Vec<(&str, &str)> = rows
+            .iter()
+            .map(|(h, m)| (h.node.name.as_str(), m.name.as_str()))
+            .collect();
+        assert_eq!(
+            names,
+            vec![("search", "escape_like")],
+            "the in-module call is not a user"
+        );
     }
 
     /// `--json` consumers never see stderr, so the caveat has to be in the document (#132).

@@ -711,6 +711,69 @@ fn rust_use_binds_names_across_workspace_crates() {
     );
 }
 
+/// A Go package is a directory: a bare call to a function in a sibling file needs
+/// no import and was dropped (#136). A same-named function in another package is
+/// not in scope.
+#[test]
+fn go_bare_calls_reach_the_same_package() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/go_package");
+    let r = resolve::build(&root).unwrap();
+    let snapshot = SymbolId::of("usecase/snapshot.go", "Snapshot");
+    let mut called: Vec<SymbolId> = r
+        .edges
+        .iter()
+        .filter(|e| e.src == snapshot && e.kind == EdgeKind::Calls)
+        .map(|e| e.dst)
+        .collect();
+    called.sort_unstable();
+    let mut expected = vec![
+        SymbolId::of("usecase/usage_full.go", "AnalyzeUsage"),
+        SymbolId::of("usecase/usage_full.go", "helper"),
+    ];
+    expected.sort_unstable();
+    assert_eq!(called, expected);
+}
+
+/// `export default { async fetch() {} }` is how a Cloudflare Worker is written, and
+/// its test calls `worker.fetch()` through a default import. The method had no
+/// owner, so the call bound to nothing and review marked it untested (#149).
+#[test]
+fn default_export_object_members_are_reachable() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/default_object");
+    let r = resolve::build(&root).unwrap();
+    let fetch = SymbolId::of("src/worker.js", "default.fetch");
+    let callers: Vec<SymbolId> = r
+        .edges
+        .iter()
+        .filter(|e| e.dst == fetch && e.kind == EdgeKind::Calls)
+        .map(|e| e.src)
+        .collect();
+    assert_eq!(
+        callers,
+        vec![SymbolId::of("test/worker.test.ts", "fetchIt")]
+    );
+}
+
+/// A component code-split behind `lazy(() => import("./x").then((m) => ({ default:
+/// m.X })))` had no production importer and looked test-only or dead (#145).
+#[test]
+fn dynamic_import_then_member_is_an_import() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/lazy_import");
+    let r = resolve::build(&root).unwrap();
+    let editor = SymbolId::of("src/v/editor.tsx", "VRChatFieldsEditor");
+    let importers: Vec<SymbolId> = r
+        .edges
+        .iter()
+        .filter(|e| e.dst == editor && e.kind == EdgeKind::Imports)
+        .map(|e| e.src)
+        .collect();
+    assert_eq!(
+        importers,
+        vec![SymbolId::module("src/index.tsx"); 2],
+        "the lazy() form and the plain .then(m => m.X) form"
+    );
+}
+
 #[test]
 fn deterministic_build() {
     let a = resolve::build(&fixture()).unwrap();
@@ -1241,6 +1304,26 @@ fn edges_inside_a_root_survive_a_second_root() {
         named(&together, "proj/"),
         "adding a second root changed the first one's edges"
     );
+}
+
+/// A fixture written in another language sits in the host language's test layout:
+/// a Kotlin file under a Rust crate's `tests/`. Only the Kotlin adapter was asked,
+/// its `src/test/` rule did not fire, and the fixture outranked production code in
+/// review (#129).
+#[test]
+fn a_fixture_in_another_languages_test_layout_is_test_side() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/foreign_layout");
+    let indexed = resolve::build_incremental(
+        std::slice::from_ref(&root),
+        &std::collections::HashMap::new(),
+    )
+    .unwrap();
+    let scopes = resolve::TestScopes::of(&indexed.files, &indexed.roots, &lang::registry());
+    let mut nodes = indexed.result.nodes.clone();
+    resolve::mark_tests(&scopes, &mut nodes);
+    let flag = |name: &str| nodes.iter().find(|n| n.name == name).map(|n| n.is_test);
+    assert_eq!(flag("Util"), Some(true));
+    assert_eq!(flag("real"), Some(false));
 }
 
 /// `review` could not tell a capture helper from production code, because the only

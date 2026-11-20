@@ -53,8 +53,13 @@ impl TestScopes {
                     || f.module_path.clone(),
                     |p| p.to_string_lossy().replace('\\', "/"),
                 );
-            let is_test_file =
-                lang::adapter_for(registry, &f.canonical).is_some_and(|a| a.is_test_path(&rel));
+            // any adapter's convention, not just the file's own: a Kotlin fixture under
+            // a Rust crate's `tests/` is test data, though Kotlin's own layout rule
+            // (`src/test/`) cannot see it, and it outranked production changes in
+            // review (#129). The cost is that every language's convention applies to
+            // every file: a production `src/spec/` directory reads as test-side through
+            // Ruby's rule, which only lowers its rank in review.
+            let is_test_file = registry.iter().any(|a| a.is_test_path(&rel));
 
             if is_test_file {
                 let module = SymbolId::module(&f.module_path);

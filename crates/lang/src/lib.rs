@@ -7,6 +7,7 @@ pub mod cpp;
 pub mod cross;
 pub mod csharp;
 pub mod elixir;
+pub mod gdscript;
 pub mod gleam;
 pub mod go;
 pub mod graphql;
@@ -25,7 +26,7 @@ pub mod svelte;
 pub mod typescript;
 pub mod vue;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// Leading-comment extraction shared by the default `LanguageAdapter::doc`.
@@ -189,6 +190,26 @@ pub trait LanguageAdapter: Send + Sync {
         Vec::new()
     }
 
+    /// Facts about a whole file that `is_exported_in` needs for every definition in
+    /// it, computed once per file rather than once per definition. Default: none.
+    ///
+    /// TypeScript's `export { a, b }` list is the case: answering it per definition
+    /// rescanned every top-level statement, which made parsing quadratic in a file's
+    /// definition count (#128).
+    fn export_lists(&self, _root: tree_sitter::Node, _src: &[u8]) -> HashSet<String> {
+        HashSet::new()
+    }
+
+    /// `is_exported`, given the file's `export_lists`. Default: ignores them.
+    fn is_exported_in(
+        &self,
+        def: tree_sitter::Node,
+        src: &[u8],
+        _listed: &HashSet<String>,
+    ) -> bool {
+        self.is_exported(def, src)
+    }
+
     /// Is a definition exported/public? Language-specific (TS `export`, Elixir
     /// `def` vs `defp`, Go capitalization, …). Default: not exported.
     fn is_exported(&self, _def: tree_sitter::Node, _src: &[u8]) -> bool {
@@ -216,6 +237,16 @@ pub trait LanguageAdapter: Send + Sync {
     /// so a `static` function in another file is correctly unreachable, and it
     /// still splits confidence `1/N` across genuine ambiguity.
     fn bare_calls_resolve_globally(&self) -> bool {
+        false
+    }
+
+    /// Does a bare call see every top-level definition in the calling file's
+    /// directory, exported or not? Default: no.
+    ///
+    /// `true` for Go, where a package is a directory of files sharing one
+    /// namespace: `AnalyzeUsage(…)` in `snapshot.go` names the function in
+    /// `usage_full.go` with no import at all (#136).
+    fn bare_calls_see_package(&self) -> bool {
         false
     }
 
@@ -397,6 +428,7 @@ pub fn registry() -> Vec<Box<dyn LanguageAdapter>> {
         Box::new(cpp::Adapter::new()),
         Box::new(svelte::Adapter::new()),
         Box::new(vue::Adapter::new()),
+        Box::new(gdscript::Adapter::new()),
     ]
 }
 
@@ -404,7 +436,7 @@ pub fn registry() -> Vec<Box<dyn LanguageAdapter>> {
 /// `embedded_regions`, `extract_cross`, `qualified_name`, `test_scopes`, etc. Query
 /// sources and grammar changes are caught automatically by `registry_fingerprint`;
 /// this is the escape hatch for the Rust that isn't a query string. See #71.
-const EXTRACT_LOGIC_VERSION: u32 = 2;
+const EXTRACT_LOGIC_VERSION: u32 = 3;
 
 /// A fingerprint of every adapter's extraction *inputs*: the `.scm` query sources,
 /// the grammar identity, and `EXTRACT_LOGIC_VERSION`.

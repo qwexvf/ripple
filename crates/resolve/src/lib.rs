@@ -441,6 +441,9 @@ struct DefIndex {
     /// files sharing one namespace, so a `config.Foo()` call resolves against every
     /// file in `internal/config/`, not one. Keyed by the file's parent dir. See #85.
     pkg_exports: HashMap<(PathBuf, String), Vec<SymbolId>>,
+    /// (directory, name) → top-level definitions, exported or not, for a language
+    /// whose package is its directory ([`lang::LanguageAdapter::bare_calls_see_package`]).
+    pkg_defs: HashMap<(PathBuf, String), Vec<SymbolId>>,
     /// (root, class, method) → symbols
     methods_by_class: HashMap<(usize, String, String), Vec<SymbolId>>,
     /// (root, method) → symbols (candidate fallback)
@@ -512,6 +515,14 @@ fn index_defs(
         for d in &f.extract.defs {
             idx.family_of.insert(d.id, family);
             idx.file_of.insert(d.id, f.canonical.clone());
+            if d.qualified_name == d.name {
+                if let Some(dir) = f.canonical.parent() {
+                    idx.pkg_defs
+                        .entry((dir.to_path_buf(), d.name.clone()))
+                        .or_default()
+                        .push(d.id);
+                }
+            }
             by_name.entry(d.name.clone()).or_default().push(d.id);
             if d.is_exported {
                 idx.export_table
@@ -621,6 +632,7 @@ fn link(
             self_calls: adapter.is_some_and(|a| a.bare_call_in_method_is_self_call()),
             family: adapter.map_or("", |a| a.linkage_family()),
             member_fallback: adapter.is_none_or(|a| a.member_calls_fall_back_by_name()),
+            package: adapter.is_some_and(|a| a.bare_calls_see_package()),
         };
         resolve_calls(f, root, idx, module_id, &scope, rules, &mut sink);
     }
@@ -674,6 +686,9 @@ struct ImportScope {
     /// imported file does not export it and the adapter allows a package search.
     /// A call through the name splits its confidence across them.
     ambiguous: HashMap<String, Vec<SymbolId>>,
+    /// local name → the file whose default export it imports, so `worker.fetch()`
+    /// can reach a member of an `export default { fetch() {} }` object (#149)
+    default_imports: HashMap<String, PathBuf>,
 }
 
 /// Id of the external module (dep-key) node. Kept in sync with
@@ -867,6 +882,11 @@ fn resolve_imports(
             }
             continue;
         }
+        if imp.imported_name == "default" {
+            scope
+                .default_imports
+                .insert(imp.local_name.clone(), target.clone());
+        }
         let resolved = if imp.imported_name == "default" {
             default_export(idx, &target)
         } else {
@@ -968,6 +988,8 @@ struct CallRules {
     family: &'static str,
     /// [`lang::LanguageAdapter::member_calls_fall_back_by_name`]
     member_fallback: bool,
+    /// [`lang::LanguageAdapter::bare_calls_see_package`]
+    package: bool,
 }
 
 /// Resolve a file's call sites (bare + member) into Calls edges.
@@ -1020,7 +1042,7 @@ fn resolve_calls(
                     None => {
                         resolve_self_call(&r.name, enclosing, local, idx, root, rules.self_calls)
                             .unwrap_or_else(|| {
-                                resolve_bare(&r.name, local, scope, idx, root, rules.global_linkage)
+                                resolve_bare(&r.name, &f.canonical, local, scope, idx, root, rules)
                             })
                     }
                 }
@@ -1046,7 +1068,16 @@ fn resolve_calls(
                 // target is a single file (a TS `import * as ns`) or a package
                 // directory (a Go import); try the file export table, then the
                 // directory-keyed package exports (#85).
-                if let Some(target) = module_receiver(r.receiver.as_ref(), &scope.modules) {
+                let default_member = match r.receiver.as_ref() {
+                    Some(Receiver::Ident(v)) if !shadowed => scope
+                        .default_imports
+                        .get(v)
+                        .map(|file| default_members(idx, root, file, &r.name)),
+                    _ => None,
+                };
+                if let Some(found) = default_member.filter(|f| !f.is_empty()) {
+                    (found, CONF_KNOWN_RECEIVER)
+                } else if let Some(target) = module_receiver(r.receiver.as_ref(), &scope.modules) {
                     if let Some(sym) = idx.export_table.get(&(target.clone(), r.name.clone())) {
                         (vec![*sym], CONF_KNOWN_RECEIVER)
                     } else if let Some(syms) = idx.pkg_exports.get(&(target, r.name.clone())) {
@@ -1127,11 +1158,12 @@ fn resolve_calls(
 /// spraying, and the caller divides confidence by the number that survive.
 fn resolve_bare(
     name: &str,
+    file: &Path,
     local: &HashMap<String, Vec<SymbolId>>,
     scope: &ImportScope,
     idx: &DefIndex,
     root: usize,
-    global_linkage: bool,
+    rules: CallRules,
 ) -> (Vec<SymbolId>, f32) {
     if let Some(ids) = local.get(name) {
         if !ids.is_empty() {
@@ -1144,7 +1176,17 @@ fn resolve_bare(
     if let Some(ids) = scope.ambiguous.get(name) {
         return (ids.clone(), CONF_LOCAL_CALL);
     }
-    if !global_linkage {
+    // a Go package is its directory: another file's top-level name is in scope
+    // with no import (#136)
+    if rules.package {
+        let in_package = file
+            .parent()
+            .and_then(|dir| idx.pkg_defs.get(&(dir.to_path_buf(), name.to_owned())));
+        if let Some(ids) = in_package.filter(|ids| !ids.is_empty()) {
+            return (ids.clone(), CONF_LOCAL_CALL);
+        }
+    }
+    if !rules.global_linkage {
         return (Vec::new(), CONF_LOCAL_CALL);
     }
     let mut candidates: Vec<SymbolId> = idx
@@ -1318,8 +1360,14 @@ fn resolve_member(
             None => (candidates(), CONF_CANDIDATE),
         },
         Some(Receiver::New(ctor)) => by_class(ctor, CONF_KNOWN_RECEIVER),
-        Some(Receiver::Ident(_)) => match recv_type {
+        Some(Receiver::Ident(v)) => match recv_type {
             Some(class) => by_class(class, CONF_TYPED_RECEIVER),
+            // `Inventory.add()`: a capitalized receiver with no binding is the class
+            // itself (a static call, a GDScript `class_name`). Only when that class
+            // really has the method; otherwise it is some other value.
+            None if v.starts_with(char::is_uppercase) && !in_class(v).is_empty() => {
+                (in_class(v), CONF_KNOWN_RECEIVER)
+            }
             None => (candidates(), CONF_CANDIDATE),
         },
         _ => (candidates(), CONF_CANDIDATE),
@@ -1576,6 +1624,18 @@ fn is_container(kind: NodeKind) -> bool {
 fn contains(outer: Span, inner: Span) -> bool {
     (outer.start_line, outer.start_col) <= (inner.start_line, inner.start_col)
         && (outer.end_line, outer.end_col) >= (inner.end_line, inner.end_col)
+}
+
+/// Members named `name` of the default-exported object in `file`: definitions owned
+/// by `default` that live in that file.
+fn default_members(idx: &DefIndex, root: usize, file: &Path, name: &str) -> Vec<SymbolId> {
+    idx.by_owner
+        .get(&(root, "default".to_owned(), name.to_owned()))
+        .into_iter()
+        .flatten()
+        .copied()
+        .filter(|id| idx.file_of.get(id).is_some_and(|f| f == file))
+        .collect()
 }
 
 fn default_export(idx: &DefIndex, target: &Path) -> Option<SymbolId> {

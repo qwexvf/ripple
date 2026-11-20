@@ -38,7 +38,7 @@ and returning it within a size budget an agent can work with. More on that in
 
 ## Languages
 
-TypeScript · TSX · Python · Go · Ruby · PHP · Rust · Elixir · Gleam · Java · Scala · Kotlin · C# · C · C++ · Svelte · Vue · GraphQL · HTML
+TypeScript · TSX · Python · Go · Ruby · PHP · Rust · Elixir · Gleam · Java · Scala · Kotlin · C# · C · C++ · Svelte · Vue · GraphQL · HTML · GDScript
 
 Adding a language only touches `crates/lang/`: a module, some `.scm` query files, and one
 registry line. Nothing above the [IR boundary](docs/src/content/docs/design/04-architecture.md)
