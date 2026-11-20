@@ -1427,8 +1427,15 @@ struct Sources {
     files: HashMap<String, Option<Vec<String>>>,
 }
 
-/// Longest line text a row carries; the rest is cut with `…`.
-const SNIPPET_CHARS: usize = 100;
+/// Longest line text a row carries; the rest is cut with `…`. Enough for a call
+/// with its arguments or a signature up to its parameters, which is what decides
+/// whether the agent opens the file.
+const SNIPPET_CHARS: usize = 80;
+
+/// Below this a callee is one of several by-name guesses, and its definition line
+/// says nothing about whether the guess is right; it is left bare to save tokens.
+/// A caller keeps its call-site line at any confidence: that line is the evidence.
+const SNIPPET_MIN_CONFIDENCE: f32 = 0.5;
 
 impl Sources {
     fn new(roots: Vec<(String, PathBuf)>, fallback: &Path) -> Self {
@@ -1485,8 +1492,12 @@ impl Sources {
     }
 }
 
-/// `(path:line)` and, when the file still has it, `  text` after it.
+/// `(path:line)` and, when the file still has it, `  text` after it. A node with no
+/// position (an external package) is just `(path)`.
 fn located_line(sources: &mut Sources, module_path: &str, line: u32) -> String {
+    if line == 0 {
+        return format!("({module_path})");
+    }
     match sources.line(module_path, line) {
         Some(text) => format!("({module_path}:{line})  {text}"),
         None => format!("({module_path}:{line})"),
@@ -3586,12 +3597,17 @@ fn cmd_neighbors(args: &[String]) -> Result<()> {
                     String::new()
                 };
                 let indent = "  ".repeat(h.depth);
-                println!(
-                    "{indent}{:?}<{:.2}>{times} {} {}",
-                    h.edge.kind,
-                    h.edge.confidence,
-                    h.node.name,
+                let at = if dir == Dir::In || h.edge.confidence >= SNIPPET_MIN_CONFIDENCE {
                     located_line(&mut sources, &h.node.module_path, row_line(h, dir))
+                } else {
+                    match row_line(h, dir) {
+                        0 => format!("({})", h.node.module_path),
+                        line => format!("({}:{line})", h.node.module_path),
+                    }
+                };
+                println!(
+                    "{indent}{:?}<{:.2}>{times} {} {at}",
+                    h.edge.kind, h.edge.confidence, h.node.name,
                 );
             }
             for (h, member) in &via_members {
