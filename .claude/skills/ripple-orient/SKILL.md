@@ -94,7 +94,7 @@ shell, every tool except `search`/`locate`-first-time is also a CLI subcommand w
 2. impact <seed>                           → full risk-ranked blast radius of changing it
 3. neighbors <sym> --in | path <a> <b>     → drill: exact callers, or how A reaches B
 4. …make the edit…
-5. reindex                                 → the graph is now stale until you do
+5. reindex (MCP) / ripple index . (CLI)    → the graph is now stale until you do
 6. review [<base>]                         → rank the changed hunks to check first;
                                               flags untested changes + missing co-change
 ```
@@ -115,7 +115,7 @@ change" do 5→6.
 | `review_focus` | `base` (default = working tree vs HEAD), `budget` | Changed symbols ranked by review priority, + untested + missing-co-change flags. |
 | `risk` | `target` (symbol or file) | churn / bug-density / ownership / composite. |
 | `explain_edge` | `from`, `to` | Why two nodes connect: edge kind, confidence, provenance, site. Use when an edge looks wrong. |
-| `reindex` | — | Rebuild from current source. **Call after editing** — staleness is never auto-detected. |
+| `reindex` | — | Rebuild from current source. **Call after editing.** CLI `impact`/`neighbors`/`review` warn on stderr when files changed since indexing. |
 
 CLI names differ slightly: the CLI tool is `ripple review` (not `review_focus`);
 `reindex` and `explain_edge` are MCP-only; everything else is a `ripple <name>`
@@ -139,8 +139,10 @@ subcommand. Every CLI query takes `--root <p>` and `--json`.
 
 ## Honest limits
 
-- **Staleness is not detected.** After any edit the graph is whatever `index`/`reindex`
-  last wrote. `reindex` before trusting a post-edit answer.
+- **Staleness is warned about, not fixed.** After any edit the graph is whatever
+  `index`/`reindex` last wrote; CLI queries say so on stderr. Re-index (or pass `--sync` to
+  `impact`/`review`) before trusting a post-edit answer. A running `ripple daemon` re-indexes
+  registered projects on save.
 - **Call resolution depth varies by language.** Usable for TypeScript and Elixir;
   thinner for Rust, Go, GraphQL. Thin is not empty — file-level signals still work, but
   function-level `impact` will be shallower. `ripple lsp doctor` shows what is indexed.
@@ -161,7 +163,7 @@ locate "rate limit login endpoint"
   → seed: sign_in  web/src/auth/api.ts  [name:login]           touches: LoginForm
 impact guard --budget 10        # everything that depends on the handler you'll change
 # …edit guard + add the missing test the review flags…
-reindex
+reindex                         # MCP; on the CLI, `ripple index .`
 review                          # is the change ranked where the danger is? untested?
 ```
 

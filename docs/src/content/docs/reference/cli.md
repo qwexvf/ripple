@@ -16,6 +16,8 @@ ripple review [<base>] [--budget N] [--root <path>] [--json] [--verify lsp]
 ripple path <from> <to> [--depth 6] [--limit 3] [--root <path>] [--json]
 ripple risk <symbol|file> [--root <path>] [--json]
 ripple mcp [--root <path>]
+ripple daemon [run] [--max-resident 8]
+ripple daemon register <path> | status | stop
 ripple eval [--commits N] [--skip N] [--weights <spec>] [--root <path>]
 ripple eval --risk | --review | --vs-grep | --oracle lsp [--sample N] [--granularity function|file]
 ripple lsp doctor [--root <path>] [--budget 10s] [--json]
@@ -94,8 +96,10 @@ convention, and the edge count alone could not say so.
 Re-running is incremental: unchanged files are reused from the content cache. The summary
 line reports added / changed / unchanged / removed alongside the node and edge counts.
 
-There is no watcher and no automatic re-index: after you edit code, re-index. What you do
-get is a warning. `impact`, `neighbors` and `review` hash the files their answer rests on
+The CLI has no watcher: after you edit code, re-index, or pass `--sync` to `impact` and
+`review` to answer from the working tree without writing anything. A running
+[`ripple daemon`](daemon.md) re-indexes the projects registered with it on save, which keeps
+`.ripple/graph.redb` current for every command here. Either way you get a warning. `impact`, `neighbors` and `review` hash the files their answer rests on
 and compare against the index, so an answer built from edited code says so on stderr —
 
 ```
@@ -148,11 +152,21 @@ the order: a word counts more the fewer symbols in the graph match it, and a sym
 matches more of the task outranks one that matches a single word well. Graph centrality
 and per-symbol risk order the symbols the text cannot tell apart.
 
-Each seed line shows its kind, the fields that matched (`why`), its dependent count, and a
-one-hop blast-radius preview of what it touches. `--budget` defaults to 10; when the cut
+Each seed line shows its kind, `file:line`, the fields that matched (`why`) and its
+dependent count, followed by the text of its definition line. `--touches` adds a one-hop
+preview of what each seed touches; it is off by default because it made up most of an
+answer's size and `impact` gives the same thing ranked. `--budget` defaults to 10; when the cut
 falls inside a run of equally-ranked candidates it says so, so a thin ranking is never
 mistaken for a confident one. Use this before `impact`/`neighbors`, which want the exact
 name `locate` hands you.
+
+## `ripple search <words...>`
+
+Symbols by name, best match first: a whole word of the name outranks a prefix, which
+outranks a substring, which outranks a hit on the module path. The same ranking as the MCP
+`search` tool. Each row is `Kind name (file:line)  <definition line>`. `--budget` defaults
+to 20 and the cut is reported. Use it when you know roughly what a symbol is called;
+`locate` is for a task you can only describe.
 
 ## `ripple impact <symbol>...`
 
@@ -172,7 +186,8 @@ substring, and no match is an error rather than an empty answer.
 
 Ranks the symbols changed in a diff by review priority — risk × downstream reach — with a
 reason on each line. With no `<base>` it diffs the working tree against `HEAD`; give it a
-rev (`HEAD~3`, a branch, a merge base) to review a range.
+rev (`HEAD~3`, a branch, a merge base) to review a range. Each row gives the symbol's line
+range (`file:start-end`), which is the hunk to open.
 
 ## `ripple neighbors <symbol>`
 
@@ -180,12 +195,23 @@ One hop, unranked. `--in` for callers and importers, `--out` for callees and imp
 `--depth N` to go further. Use this when you want the raw graph rather than a judgement
 about it — `impact` is the ranked version.
 
+Each row ends with `(file:line)` and that line's text: for a caller (`--in`) the call site,
+for a callee (`--out`) its definition. `--json` carries the same `line`.
+
 Edge kinds surfaced: `Calls`, `Imports`, `ChangesWith`, `GraphqlCall`, `DbQuery`.
 
 `--in` on a type (a class, a struct, an Elixir module) also lists callers of its members
 from outside the type, each marked `→ member`, since code reaches a module by calling its
 functions. A name can be given as `Owner.member` or `Owner::member` when the member's own
 name is ambiguous.
+
+`--json` prints one object, `{direction, lookup, neighbors}`, however many symbols the name
+matched. Each row names the matched symbol it answers about in `target` / `target_module`.
+
+When a name matches loosely or more than once, the note saying so goes to stderr. In `--json`
+output `impact` and `path` carry it as `lookups` and `neighbors` as `lookup`: the match rule
+(`exact`, `qualified_suffix`, `substring`), the candidate count, `ambiguous`, and the first
+matched symbols.
 
 ## `ripple path <from> <to>`
 
@@ -219,6 +245,12 @@ if a symbol is missing from `impact`, check whether it was ever extracted.
 
 Speaks MCP over stdio for AI agents. Indexes first if the graph is missing. See the
 [MCP reference](mcp.md).
+
+## `ripple daemon`
+
+A resident, file-watching index server. `ripple daemon register <path>` builds a project and
+watches it; every save re-indexes it and rewrites `.ripple/graph.redb`. Registrations persist
+across restarts. See the [daemon reference](daemon.md).
 
 ## `ripple eval`
 

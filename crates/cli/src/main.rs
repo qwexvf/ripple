@@ -41,6 +41,7 @@ fn main() -> Result<()> {
         Some("index") => cmd_index(&args[1..]),
         Some("neighbors") => cmd_neighbors(&args[1..]),
         Some("locate") => cmd_locate(&args[1..]),
+        Some("search") => cmd_search(&args[1..]),
         Some("impact") => cmd_impact(&args[1..]),
         Some("review") => cmd_review(&args[1..]),
         Some("path") => cmd_path(&args[1..]),
@@ -58,7 +59,7 @@ fn main() -> Result<()> {
     }
 }
 
-const USAGE: &str = "usage:\n  ripple parse <file> [--json]\n  ripple index <path>... [--calls lsp [--calls-budget 120s]] [--debug]   (--calls lsp: call edges from a language server; --debug: per-phase timings to stderr)\n  ripple neighbors <symbol> [--in|--out] [--depth N] [--in-file <substr>] [--root <path>] [--json]\n  ripple locate <task words...> [--budget N] [--root <path>] [--json] [--debug]   (where do I start for this task?)\n  ripple impact <symbol>... [--budget N] [--in-file <substr>] [--root <path>] [--json] [--verify lsp] [--sync]\n  ripple review [<base>] [--budget N] [--root <path>] [--json] [--verify lsp] [--sync]\n    --sync   (rebuild from the working tree in memory before answering, so edits since the last index are reflected — no re-index, nothing persisted)\n    --verify lsp [--verify-budget 2s] [--floor-contradicted|--drop-contradicted]  (upgrade call edges from a language server)\n  ripple path <from> <to> [--depth 6] [--limit 3] [--root <path>] [--json]   (how does A reach B?)\n  ripple risk <symbol|file> [--root <path>] [--json]\n  ripple mcp [--root <path>]   (MCP server over stdio for AI agents)\n  ripple daemon [run] [--max-resident 8]   (resident, file-watching index server; systemd-friendly)\n    ripple daemon register <path> | status | stop   (talk to a running daemon over its socket)\n  ripple eval [--commits N] [--skip N] [--weights <spec>] [--root <path>]   (held-out co-change recall)\n    --risk                                        (do the risk terms rank the files a later fix touched?)\n    --review [--budget N] [--cases N] [--converge 0.6] [--escape-days 7] [--max-introducer-files 40]   (does review rank the defective symbol within the change that introduced it? bulk introducers dropped)\n    --vs-grep [--budget N] [--commits N]   (does the blast radius beat grep at predicting co-change, and at what token cost?)\n    --oracle lsp [--sample N] [--granularity function|file]   (agree with a language server?)\n  ripple stats [--transcripts <dir>] [--project <substr>] [--exclude <substr>] [--days N] [--arms <file>] [--json]   (ripple vs text search in Claude Code transcripts: tokens read, results used)\n  ripple lsp doctor [--root <path>] [--budget 10s] [--json]   (are language servers usable here?)\n  ripple lsp trust [--root <path>]   (allow this repo's own .ripple/lsp.json to launch servers)\n  ripple --help\n  ripple --version";
+const USAGE: &str = "usage:\n  ripple parse <file> [--json]\n  ripple index <path>... [--calls lsp [--calls-budget 120s]] [--debug]   (--calls lsp: call edges from a language server; --debug: per-phase timings to stderr)\n  ripple neighbors <symbol> [--in|--out] [--depth N] [--in-file <substr>] [--root <path>] [--json]\n  ripple locate <task words...> [--budget N] [--root <path>] [--json] [--touches] [--debug]   (where do I start for this task? --touches: one-hop preview per hit)\n  ripple search <words...> [--budget N] [--root <path>] [--json]   (symbols by name, best first)\n  ripple impact <symbol>... [--budget N] [--in-file <substr>] [--root <path>] [--json] [--verify lsp] [--sync]\n  ripple review [<base>] [--budget N] [--root <path>] [--json] [--verify lsp] [--sync]\n    --sync   (rebuild from the working tree in memory before answering, so edits since the last index are reflected — no re-index, nothing persisted)\n    --verify lsp [--verify-budget 2s] [--floor-contradicted|--drop-contradicted]  (upgrade call edges from a language server)\n  ripple path <from> <to> [--depth 6] [--limit 3] [--root <path>] [--json]   (how does A reach B?)\n  ripple risk <symbol|file> [--root <path>] [--json]\n  ripple mcp [--root <path>]   (MCP server over stdio for AI agents)\n  ripple daemon [run] [--max-resident 8]   (resident, file-watching index server; systemd-friendly)\n    ripple daemon register <path> | status | stop   (talk to a running daemon over its socket)\n  ripple eval [--commits N] [--skip N] [--weights <spec>] [--root <path>]   (held-out co-change recall)\n    --risk                                        (do the risk terms rank the files a later fix touched?)\n    --review [--budget N] [--cases N] [--converge 0.6] [--escape-days 7] [--max-introducer-files 40]   (does review rank the defective symbol within the change that introduced it? bulk introducers dropped)\n    --vs-grep [--budget N] [--commits N]   (does the blast radius beat grep at predicting co-change, and at what token cost?)\n    --oracle lsp [--sample N] [--granularity function|file]   (agree with a language server?)\n  ripple stats [--transcripts <dir>] [--project <substr>] [--exclude <substr>] [--days N] [--arms <file>] [--json]   (ripple vs text search in Claude Code transcripts: tokens read, results used)\n  ripple lsp doctor [--root <path>] [--budget 10s] [--json]   (are language servers usable here?)\n  ripple lsp trust [--root <path>]   (allow this repo's own .ripple/lsp.json to launch servers)\n  ripple --help\n  ripple --version";
 
 /// Where `root`'s own database would live.
 fn own_db_path(root: &Path) -> PathBuf {
@@ -296,6 +297,12 @@ fn index_project(roots: &[PathBuf], lsp_calls: Option<std::time::Duration>) -> R
     let git_span = ir::timing::start("git_overlay_mine");
     let mut git = overlay::GitOverlay::default();
     for (tag, root) in &indexed.roots {
+        if let Some(why) = overlay::history_caveat(overlay::history(root)) {
+            eprintln!(
+                "⚠ {}: {why}; churn, bug-density and ownership will read as unknown",
+                root.display()
+            );
+        }
         let o = overlay::mine_cached(root);
         for (k, v) in o.file_risk {
             git.file_risk.insert(resolve::namespace(tag, &k), v);
@@ -760,9 +767,11 @@ fn cmd_impact(args: &[String]) -> Result<()> {
     let mut store = RedbStore::open(db_path(&root)?);
     let mut graph = load_current(&store, &root, args.iter().any(|a| a == "--sync"))?;
     let mut seeds: Vec<ir::SymbolId> = Vec::new();
+    let mut lookups: Vec<Value> = Vec::new();
     for s in &symbols {
-        let matches = lookup_or_bail(&graph, s, json, args)?;
+        let (matches, described) = lookup_or_bail(&graph, s, args)?;
         seeds.extend(matches.iter().map(|n| n.id));
+        lookups.push(described);
     }
     graph = verify_upgrade(&mut store, graph, &root, args, &seeds, json)?;
 
@@ -802,6 +811,7 @@ fn cmd_impact(args: &[String]) -> Result<()> {
             serde_json::to_string_pretty(&serde_json::json!({
                 "shown": hits.len(),
                 "reached": result.reached,
+                "lookups": lookups,
                 "hits": out,
             }))?
         );
@@ -848,6 +858,8 @@ fn cmd_locate(args: &[String]) -> Result<()> {
     let graph = store.load()?;
     load_span.stop(graph.node_count());
     let tags = store.read_roots()?;
+    let mut sources = Sources::new(tags.clone(), &root);
+    let show_touches = args.iter().any(|a| a == "--touches");
     let locate_span = ir::timing::start("locate");
     let located = query::locate(&graph, &task, budget);
     locate_span.stop(located.total);
@@ -855,7 +867,7 @@ fn cmd_locate(args: &[String]) -> Result<()> {
     if json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&locate_payload(&located, &tags))?
+            serde_json::to_string_pretty(&locate_payload(&located, &tags, &mut sources))?
         );
         return Ok(());
     }
@@ -895,8 +907,15 @@ fn cmd_locate(args: &[String]) -> Result<()> {
             s.why.join(", "),
             s.centrality
         );
-        for t in &s.touches {
-            println!("      ← {:?} {}", t.via, hit_name(&t.node));
+        if let Some(text) = definition_text(&mut sources, &s.node) {
+            println!("      {text}");
+        }
+        // the one-hop preview was 64% of a locate answer's characters in the
+        // transcripts and rarely what the agent acted on; `impact` gives it ranked
+        if show_touches {
+            for t in &s.touches {
+                println!("      ← {:?} {}", t.via, hit_name(&t.node));
+            }
         }
     }
     Ok(())
@@ -915,7 +934,11 @@ fn repo_of(module_path: &str, tags: &[(String, PathBuf)]) -> String {
 /// Shared JSON for `locate`, over CLI and MCP. Flat ranked list (a global order is
 /// more useful than per-repo buckets), each seed tagged with its repo, its reasons,
 /// its centrality, and a one-hop blast preview. Truncation is declared.
-fn locate_payload(located: &query::Located, tags: &[(String, PathBuf)]) -> serde_json::Value {
+fn locate_payload(
+    located: &query::Located,
+    tags: &[(String, PathBuf)],
+    sources: &mut Sources,
+) -> serde_json::Value {
     let seeds: Vec<_> = located
         .seeds
         .iter()
@@ -923,6 +946,8 @@ fn locate_payload(located: &query::Located, tags: &[(String, PathBuf)]) -> serde
             serde_json::json!({
                 "symbol": s.node.name,
                 "module": s.node.module_path,
+                "line": s.node.span.start_line,
+                "text": definition_text(sources, &s.node),
                 "repo": repo_of(&s.node.module_path, tags),
                 "kind": format!("{:?}", s.node.kind),
                 "why": s.why,
@@ -956,12 +981,15 @@ fn locate_payload(located: &query::Located, tags: &[(String, PathBuf)]) -> serde
 /// An *exact* name matching several symbols is the more dangerous case and used to
 /// pass silently: six unrelated `run`s across three languages were seeded as one,
 /// and the union reads exactly like one symbol's blast radius (#37).
+/// Resolve a symbol argument, or fail naming it. The note about an inexact or
+/// ambiguous match goes to stderr in both modes, so stdout stays the answer alone
+/// and pipes cleanly (#132). The returned JSON describes the same caveat for
+/// `--json` consumers, who never see stderr.
 fn lookup_or_bail<'a>(
     graph: &'a InMemoryGraph,
     query: &str,
-    json: bool,
     args: &[String],
-) -> Result<Vec<&'a ir::Node>> {
+) -> Result<(Vec<&'a ir::Node>, Value)> {
     let Some((nodes, how)) = graph.lookup(query) else {
         bail!("no symbol matched: {query}");
     };
@@ -969,13 +997,31 @@ fn lookup_or_bail<'a>(
     // so a note about symbols the user already excluded is noise
     let nodes = narrow_to_file(nodes, query, args)?;
     if let Some(note) = lookup_note(query, &nodes, how) {
-        if json {
-            eprintln!("{note}");
-        } else {
-            println!("{note}");
-        }
+        eprintln!("{note}");
     }
-    Ok(nodes)
+    let described = lookup_json(query, &nodes, how);
+    Ok((nodes, described))
+}
+
+/// The machine-readable form of `lookup_note`: which rule matched the query, how
+/// many symbols it matched, and the first few of them. `ambiguous` is true whenever
+/// the answer is about anything other than one exactly-named symbol.
+fn lookup_json(query: &str, nodes: &[&ir::Node], how: store::Match) -> Value {
+    const SHOWN: usize = 10;
+    let rule = match how {
+        store::Match::Exact => "exact",
+        store::Match::QualifiedSuffix => "qualified_suffix",
+        store::Match::Substring => "substring",
+    };
+    json!({
+        "query": query,
+        "match": rule,
+        "candidates": nodes.len(),
+        "ambiguous": how != store::Match::Exact || nodes.len() > 1,
+        "matched": nodes.iter().take(SHOWN).map(|n| json!({
+            "name": n.name, "module": n.module_path, "kind": format!("{:?}", n.kind),
+        })).collect::<Vec<_>>(),
+    })
 }
 
 /// What to say about a lookup whose answer isn't one exactly-named symbol.
@@ -1112,6 +1158,7 @@ fn review_payload(r: &query::ReviewResult) -> Value {
     json!({
         "focus": r.focus.iter().map(|f| json!({
             "symbol": f.node.name, "module": f.node.module_path,
+            "lines": [f.node.span.start_line, f.node.span.end_line],
             "priority": f.review_priority, "downstream": f.downstream,
             "changed_lines": f.changed_lines,
             "reasons": f.reasons,
@@ -1203,8 +1250,8 @@ fn cmd_path(args: &[String]) -> Result<()> {
 
     let graph = RedbStore::open(db_path(&root)?).load()?;
     // no --in-file here: one filter over two endpoints has no unambiguous meaning
-    let starts = lookup_or_bail(&graph, from, json, &[])?;
-    let targets = lookup_or_bail(&graph, to, json, &[])?;
+    let (starts, from_lookup) = lookup_or_bail(&graph, from, &[])?;
+    let (targets, to_lookup) = lookup_or_bail(&graph, to, &[])?;
 
     let mut routes: Vec<(String, String, query::Route)> = Vec::new();
     for s in &starts {
@@ -1245,7 +1292,10 @@ fn cmd_path(args: &[String]) -> Result<()> {
             .collect();
         println!(
             "{}",
-            serde_json::to_string_pretty(&json!({ "routes": out }))?
+            serde_json::to_string_pretty(&json!({
+                "lookups": [from_lookup, to_lookup],
+                "routes": out,
+            }))?
         );
         return Ok(());
     }
@@ -1398,6 +1448,110 @@ fn impact_line(h: &query::ImpactHit) -> String {
         h.weight,
         hit_name(&h.node)
     )
+}
+
+/// Source lines read back from the indexed files, so a result row can carry the line
+/// it points at. Without the text an agent greps for the line it was just given the
+/// number of: in the transcripts, 11% of the searches that followed a ripple answer
+/// were exactly that.
+struct Sources {
+    roots: Vec<(String, PathBuf)>,
+    fallback: PathBuf,
+    files: HashMap<String, Option<Vec<String>>>,
+}
+
+/// Longest line text a row carries; the rest is cut with `…`. Enough for a call
+/// with its arguments or a signature up to its parameters, which is what decides
+/// whether the agent opens the file.
+const SNIPPET_CHARS: usize = 80;
+
+/// Below this a callee is one of several by-name guesses, and its definition line
+/// says nothing about whether the guess is right; it is left bare to save tokens.
+/// A caller keeps its call-site line at any confidence: that line is the evidence.
+const SNIPPET_MIN_CONFIDENCE: f32 = 0.5;
+
+/// Rows per answer that get line text. Past this the answer is already too broad
+/// to read row by row (an ambiguous `New` in a Go repo: thousands of tokens), and
+/// text on every row made it 60% bigger; the first rows keep it.
+const SNIPPET_ROWS: usize = 30;
+
+impl Sources {
+    fn new(roots: Vec<(String, PathBuf)>, fallback: &Path) -> Self {
+        Sources {
+            roots,
+            fallback: fallback.to_path_buf(),
+            files: HashMap::new(),
+        }
+    }
+
+    /// The file behind a (possibly tag-namespaced) module path.
+    fn path_of(&self, module_path: &str) -> PathBuf {
+        for (tag, root) in &self.roots {
+            if tag.is_empty() {
+                continue;
+            }
+            if let Some(rel) = module_path.strip_prefix(&format!("{tag}/")) {
+                return root.join(rel);
+            }
+        }
+        let bare = self
+            .roots
+            .iter()
+            .find(|(t, _)| t.is_empty())
+            .map_or(&self.fallback, |(_, r)| r);
+        bare.join(module_path)
+    }
+
+    /// Line `line` (1-based) of `module_path`, trimmed and capped; `None` when the
+    /// file is gone or the line does not exist (an index older than the file).
+    fn line(&mut self, module_path: &str, line: u32) -> Option<String> {
+        if line == 0 {
+            return None;
+        }
+        let path = self.path_of(module_path);
+        let lines = self
+            .files
+            .entry(module_path.to_owned())
+            .or_insert_with(|| {
+                std::fs::read_to_string(&path)
+                    .ok()
+                    .map(|t| t.lines().map(str::to_owned).collect())
+            })
+            .as_ref()?;
+        let text = lines.get(line as usize - 1)?.trim();
+        if text.is_empty() {
+            return None;
+        }
+        Some(if text.chars().count() > SNIPPET_CHARS {
+            format!("{}…", text.chars().take(SNIPPET_CHARS).collect::<String>())
+        } else {
+            text.to_owned()
+        })
+    }
+}
+
+/// `(path:line)` and, when the file still has it, `  text` after it. A node with no
+/// position (an external package) is just `(path)`.
+fn located_line(sources: &mut Sources, module_path: &str, line: u32) -> String {
+    if line == 0 {
+        return format!("({module_path})");
+    }
+    match sources.line(module_path, line) {
+        Some(text) => format!("({module_path}:{line})  {text}"),
+        None => format!("({module_path}:{line})"),
+    }
+}
+
+/// A node's definition line, unless it only restates the name (`defmodule X do`,
+/// `pub struct X {`): then it costs tokens and tells the agent nothing new.
+fn definition_text(sources: &mut Sources, node: &ir::Node) -> Option<String> {
+    let text = sources.line(&node.module_path, node.span.start_line)?;
+    let rest = text.replace(node.name.as_str(), "");
+    let words = rest
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|w| !w.is_empty())
+        .count();
+    (words > 2).then_some(text)
 }
 
 fn hit_name(node: &ir::Node) -> String {
@@ -2962,6 +3116,92 @@ fn search_terms(query: &str) -> Vec<String> {
         .collect()
 }
 
+/// Every node that matches `query`, best first; the name/path pair keeps equal
+/// scores in a fixed order.
+fn search_hits<'g>(graph: &'g InMemoryGraph, query: &str) -> Vec<(u32, &'g ir::Node)> {
+    let terms = search_terms(query);
+    let mut hits: Vec<_> = graph
+        .nodes()
+        .filter_map(|n| match search_score(n, &terms) {
+            0 => None,
+            s => Some((s, n)),
+        })
+        .collect();
+    hits.sort_by(|(sa, a), (sb, b)| {
+        sb.cmp(sa).then_with(|| {
+            (a.module_path.as_str(), a.name.as_str())
+                .cmp(&(b.module_path.as_str(), b.name.as_str()))
+        })
+    });
+    hits
+}
+
+/// `ripple search <words...>`: symbols by name, the same ranking as the MCP `search`
+/// tool. The CLI lacked it while the docs pointed agents at it, so the call failed
+/// with "unknown command" and the agent fell back to grep.
+fn cmd_search(args: &[String]) -> Result<()> {
+    let json = args.iter().any(|a| a == "--json");
+    let root: PathBuf = flag_value(args, "--root").map_or_else(|| ".".into(), PathBuf::from);
+    let budget: usize = flag_value(args, "--budget")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20);
+    let query = positionals(args)
+        .iter()
+        .map(|s| s.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if query.trim().is_empty() {
+        bail!("{USAGE}");
+    }
+    let store = RedbStore::open(db_path(&root)?);
+    let graph = store.load()?;
+    let mut sources = Sources::new(store.read_roots()?, &root);
+    let hits = search_hits(&graph, &query);
+    let shown: Vec<_> = hits.iter().take(budget).collect();
+    if json {
+        let out: Vec<_> = shown
+            .iter()
+            .map(|(score, n)| {
+                json!({
+                    "symbol": n.name, "qualified": n.qualified_name, "module": n.module_path,
+                    "line": n.span.start_line, "kind": format!("{:?}", n.kind), "score": score,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(
+                &json!({ "shown": out.len(), "total": hits.len(), "results": out })
+            )?
+        );
+        return Ok(());
+    }
+    if hits.is_empty() {
+        println!("no symbol matched: {query}");
+        return Ok(());
+    }
+    let cut = hits.len() - shown.len();
+    let note = if cut > 0 {
+        format!(" — {cut} more cut by --budget {budget}")
+    } else {
+        String::new()
+    };
+    println!(
+        "symbols matching \"{query}\" — {} of {}{note}:",
+        shown.len(),
+        hits.len()
+    );
+    for (_, n) in shown {
+        println!(
+            "  {:?} {} {}",
+            n.kind,
+            n.name,
+            located_line(&mut sources, &n.module_path, n.span.start_line)
+        );
+    }
+    Ok(())
+}
+
 /// How well a node answers a query, summed over its terms. Zero means no term
 /// matched at all and the node is dropped.
 ///
@@ -3048,25 +3288,12 @@ fn mcp_call(session: &mut McpSession, params: Option<&Value>) -> Result<Value, S
             let store = RedbStore::open(db_path(root).map_err(|e| e.to_string())?);
             let tags = store.read_roots().map_err(|e| e.to_string())?;
             let located = query::locate(graph, &task, budget);
-            Ok(mcp_text(locate_payload(&located, &tags)))
+            let mut sources = Sources::new(tags.clone(), root);
+            Ok(mcp_text(locate_payload(&located, &tags, &mut sources)))
         }
         "search" => {
-            let terms = search_terms(&str_arg("query").ok_or("query required")?);
+            let hits = search_hits(graph, &str_arg("query").ok_or("query required")?);
             let limit = usize_arg("limit", 30);
-            let mut hits: Vec<_> = graph
-                .nodes()
-                .filter_map(|n| match search_score(n, &terms) {
-                    0 => None,
-                    s => Some((s, n)),
-                })
-                .collect();
-            // best match first; the name/path pair keeps equal scores in a fixed order
-            hits.sort_by(|(sa, a), (sb, b)| {
-                sb.cmp(sa).then_with(|| {
-                    (a.module_path.as_str(), a.name.as_str())
-                        .cmp(&(b.module_path.as_str(), b.name.as_str()))
-                })
-            });
             let total = hits.len();
             let out: Vec<_> = hits
                 .iter()
@@ -3273,10 +3500,12 @@ fn cmd_review(args: &[String]) -> Result<()> {
         );
         for f in &r.focus {
             println!(
-                "  {:.2}  {} ({})  — {}",
+                "  {:.2}  {} ({}:{}-{})  — {}",
                 f.review_priority,
                 f.node.name,
                 f.node.module_path,
+                f.node.span.start_line,
+                f.node.span.end_line,
                 if f.reasons.is_empty() {
                     "—".into()
                 } else {
@@ -3319,24 +3548,39 @@ fn cmd_risk(args: &[String]) -> Result<()> {
         bail!("no symbol or file matching: {query}");
     }
 
+    // without history the git terms are 0.00, which reads as "least risky"; say
+    // "unknown" instead (#124)
+    let caveat = overlay::history_caveat(overlay::history(&root));
+    let git_term = |v: f32| caveat.is_none().then_some(v);
+    if let Some(why) = &caveat {
+        eprintln!("⚠ {why}: churn, bug-density and ownership are unknown, not low");
+    }
+
     if json {
         let out: Vec<_> = hits
             .iter()
             .map(|(name, module, r)| {
                 serde_json::json!({
                     "name": name, "module": module,
-                    "composite": r.composite, "churn": r.churn,
-                    "bug_density": r.bug_density, "ownership": r.ownership,
+                    "composite": r.composite, "churn": git_term(r.churn),
+                    "bug_density": git_term(r.bug_density), "ownership": git_term(r.ownership),
                     "fanout": r.fanout, "test_proximity": r.test_proximity,
+                    "git_signals_unknown": caveat,
                 })
             })
             .collect();
         println!("{}", serde_json::to_string_pretty(&out)?);
     } else {
+        let shown = |v: f32| git_term(v).map_or_else(|| "?".to_owned(), |v| format!("{v:.2}"));
         for (name, module, r) in &hits {
             println!(
-                "{name} ({module})\n  composite {:.2} | churn {:.2} bug {:.2} ownership {:.2} fanout {:.2} tested {:.2}",
-                r.composite, r.churn, r.bug_density, r.ownership, r.fanout, r.test_proximity
+                "{name} ({module})\n  composite {:.2} | churn {} bug {} ownership {} fanout {:.2} tested {:.2}",
+                r.composite,
+                shown(r.churn),
+                shown(r.bug_density),
+                shown(r.ownership),
+                r.fanout,
+                r.test_proximity
             );
         }
     }
@@ -3358,8 +3602,9 @@ fn cmd_neighbors(args: &[String]) -> Result<()> {
 
     let store = RedbStore::open(db_path(&root)?);
     let graph = store.load()?;
+    let mut sources = Sources::new(store.read_roots()?, &root);
 
-    let matches = lookup_or_bail(&graph, &symbol, json, args)?;
+    let (matches, lookup) = lookup_or_bail(&graph, &symbol, args)?;
     warn_if_stale(
         &store,
         &matches.iter().map(|n| n.module_path.as_str()).collect(),
@@ -3370,6 +3615,11 @@ fn cmd_neighbors(args: &[String]) -> Result<()> {
     } else {
         "neighbors of"
     };
+    // one document per invocation, however many symbols the name matched: one
+    // array per match printed back to back is not parseable JSON (#130)
+    let mut json_rows: Vec<Value> = Vec::new();
+    // shared by every symbol the name matched: the cap is per answer
+    let mut snippets = SNIPPET_ROWS;
     for start in matches {
         let hops = graph.neighbors(start.id, dir, Some(&NEIGHBOR_KINDS), depth);
         let via_members = if dir == Dir::In {
@@ -3378,28 +3628,27 @@ fn cmd_neighbors(args: &[String]) -> Result<()> {
             Vec::new()
         };
         if json {
-            let mut out: Vec<_> = hops
-                .iter()
-                .map(|h| {
-                    serde_json::json!({
-                        "name": h.node.name, "kind": format!("{:?}", h.node.kind),
-                        "edge": format!("{:?}", h.edge.kind), "confidence": h.edge.confidence,
-                        "module": h.node.module_path, "depth": h.depth,
-                        // which node this hop hangs off — without it a depth-3 walk is
-                        // a flat list and the chain can't be reconstructed
-                        "from": parent_of(h, dir).and_then(|p| graph.get(p)).map(|n| n.name.clone()),
-                    })
-                })
-                .collect();
-            out.extend(via_members.iter().map(|(h, member)| {
+            json_rows.extend(hops.iter().map(|h| {
                 serde_json::json!({
                     "name": h.node.name, "kind": format!("{:?}", h.node.kind),
                     "edge": format!("{:?}", h.edge.kind), "confidence": h.edge.confidence,
-                    "module": h.node.module_path, "depth": 1,
-                    "from": member.name, "via_member": member.name,
+                    "module": h.node.module_path, "line": row_line(h, dir), "depth": h.depth,
+                    // which node this hop hangs off — without it a depth-3 walk is
+                    // a flat list and the chain can't be reconstructed
+                    "from": parent_of(h, dir).and_then(|p| graph.get(p)).map(|n| n.name.clone()),
+                    // which matched symbol this row answers about, when the name was ambiguous
+                    "target": start.name, "target_module": start.module_path,
                 })
             }));
-            println!("{}", serde_json::to_string_pretty(&out)?);
+            json_rows.extend(via_members.iter().map(|(h, member)| {
+                serde_json::json!({
+                    "name": h.node.name, "kind": format!("{:?}", h.node.kind),
+                    "edge": format!("{:?}", h.edge.kind), "confidence": h.edge.confidence,
+                    "module": h.node.module_path, "line": row_line(h, Dir::In), "depth": 1,
+                    "from": member.name, "via_member": member.name,
+                    "target": start.name, "target_module": start.module_path,
+                })
+            }));
         } else {
             println!(
                 "{arrow} {} ({}) [{}]",
@@ -3417,20 +3666,58 @@ fn cmd_neighbors(args: &[String]) -> Result<()> {
                     String::new()
                 };
                 let indent = "  ".repeat(h.depth);
+                let wanted = dir == Dir::In || h.edge.confidence >= SNIPPET_MIN_CONFIDENCE;
+                let at = if wanted && snippets > 0 {
+                    snippets -= 1;
+                    located_line(&mut sources, &h.node.module_path, row_line(h, dir))
+                } else {
+                    match row_line(h, dir) {
+                        0 => format!("({})", h.node.module_path),
+                        line => format!("({}:{line})", h.node.module_path),
+                    }
+                };
                 println!(
-                    "{indent}{:?}<{:.2}>{times} {} ({})",
-                    h.edge.kind, h.edge.confidence, h.node.name, h.node.module_path
+                    "{indent}{:?}<{:.2}>{times} {} {at}",
+                    h.edge.kind, h.edge.confidence, h.node.name,
                 );
             }
             for (h, member) in &via_members {
+                let line = row_line(h, Dir::In);
+                let at = if snippets > 0 {
+                    snippets -= 1;
+                    located_line(&mut sources, &h.node.module_path, line)
+                } else {
+                    format!("({}:{line})", h.node.module_path)
+                };
                 println!(
-                    "  {:?}<{:.2}> {} ({}) → {}",
-                    h.edge.kind, h.edge.confidence, h.node.name, h.node.module_path, member.name
+                    "  {:?}<{:.2}> {} → {} {at}",
+                    h.edge.kind, h.edge.confidence, h.node.name, member.name,
                 );
             }
         }
     }
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "direction": if dir == Dir::In { "in" } else { "out" },
+                "lookup": lookup,
+                "neighbors": json_rows,
+            }))?
+        );
+    }
     Ok(())
+}
+
+/// The line a neighbors row points at. A caller (`--in`) is shown at its call site,
+/// which is the line an agent opens next; a callee (`--out`) at its definition. An
+/// edge with no recorded site (an import, a file-level edge) falls back to the node.
+fn row_line(h: &store::Hop, dir: Dir) -> u32 {
+    if dir == Dir::In && h.edge.site.start_line > 0 && h.edge.src == h.node.id {
+        h.edge.site.start_line
+    } else {
+        h.node.span.start_line
+    }
 }
 
 /// Callers of a type's members from outside the type, for `neighbors --in` on the
@@ -3463,6 +3750,55 @@ mod tests {
     use super::*;
     fn v(a: &[&str]) -> Vec<String> {
         a.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn a_definition_line_that_only_restates_the_name_is_dropped() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("a.ex"),
+            "defmodule App.Events do\n  def register(event, player_id, opts \\\\ []) do\n",
+        )
+        .unwrap();
+        let mut sources = Sources::new(Vec::new(), tmp.path());
+        let node = |name: &str, line: u32| {
+            let mut n = sym(name, "a.ex");
+            n.span.start_line = line;
+            n
+        };
+        assert_eq!(definition_text(&mut sources, &node("App.Events", 1)), None);
+        assert_eq!(
+            definition_text(&mut sources, &node("register", 2)).as_deref(),
+            Some("def register(event, player_id, opts \\\\ []) do")
+        );
+    }
+
+    #[test]
+    fn source_lines_follow_the_root_tag_and_are_capped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let web = tmp.path().join("web");
+        std::fs::create_dir_all(&web).unwrap();
+        let long = "x".repeat(SNIPPET_CHARS + 20);
+        std::fs::write(web.join("a.ts"), format!("  first  \n\n{long}\n")).unwrap();
+        let mut sources = Sources::new(vec![("web".into(), web.clone())], tmp.path());
+        assert_eq!(sources.line("web/a.ts", 1).as_deref(), Some("first"));
+        assert_eq!(
+            sources.line("web/a.ts", 2),
+            None,
+            "a blank line has no text"
+        );
+        assert_eq!(
+            sources.line("web/a.ts", 3).map(|t| t.chars().count()),
+            Some(SNIPPET_CHARS + 1),
+            "cut, with the ellipsis"
+        );
+        assert_eq!(
+            sources.line("web/a.ts", 9),
+            None,
+            "past the end of the file"
+        );
+        assert_eq!(sources.line("web/gone.ts", 1), None);
+        assert_eq!(sources.line("web/a.ts", 0), None);
     }
 
     #[test]
@@ -3858,6 +4194,21 @@ mod tests {
             vec![("search", "escape_like")],
             "the in-module call is not a user"
         );
+    }
+
+    /// `--json` consumers never see stderr, so the caveat has to be in the document (#132).
+    #[test]
+    fn lookup_json_marks_inexact_and_ambiguous_matches() {
+        let (a, b) = (named("run", "verify.rs"), named("run", "b.ts"));
+        let one = lookup_json("run", &[&a], store::Match::Exact);
+        assert_eq!(one["ambiguous"], false);
+        assert_eq!(one["candidates"], 1);
+        let two = lookup_json("run", &[&a, &b], store::Match::Exact);
+        assert_eq!(two["ambiguous"], true);
+        assert_eq!(two["matched"].as_array().map(Vec::len), Some(2));
+        let loose = lookup_json("ru", &[&a], store::Match::Substring);
+        assert_eq!(loose["ambiguous"], true);
+        assert_eq!(loose["match"], "substring");
     }
 
     /// Six unrelated `run`s in three languages used to be seeded as one symbol,

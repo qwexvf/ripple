@@ -10,7 +10,11 @@ sidebar:
 re-indexes them as their files change. It exists to remove the one real cost of a CLI
 query — **startup**. Every cold `ripple` invocation compiles all thirteen adapters'
 tree-sitter queries (~0.8s) before it can answer; the daemon pays that once and keeps the
-resident graph hot, so a query becomes a socket round-trip.
+resident graph hot, so a query over its socket is a round-trip.
+
+The `ripple` CLI query commands (`impact`, `neighbors`, `review`, ...) do not talk to the
+daemon. They read `.ripple/graph.redb`, which the daemon rewrites on every re-index, so what
+they gain from a running daemon is a current graph, not a faster answer.
 
 ## Why one daemon for many projects
 
@@ -43,6 +47,12 @@ ripple daemon stop                # ask the daemon to exit
 
 The socket lives at `$RIPPLE_SOCKET`, else `$XDG_RUNTIME_DIR/ripple/daemon.sock`, else a
 temp path. Clients (the `register`/`status`/`stop` subcommands) find it the same way.
+
+Registrations survive a restart. Each registered root is written to
+`$RIPPLE_STATE_DIR/daemon-projects`, else `$XDG_STATE_HOME/ripple/daemon-projects`, else
+`~/.local/state/ripple/daemon-projects`, and a starting daemon re-registers them in the
+background. A root that no longer exists or has lost its project marker is dropped from the
+file. To stop watching a project for good, delete its line.
 
 ## Wire protocol
 

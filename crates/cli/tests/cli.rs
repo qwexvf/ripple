@@ -81,3 +81,82 @@ fn index_directory_ignores_itself() {
     let ignore = std::fs::read_to_string(tmp.path().join(".ripple/.gitignore")).unwrap();
     assert!(ignore.lines().any(|l| l == "*"), "{ignore}");
 }
+
+/// An ambiguous name used to print one JSON array per match, back to back, which
+/// no JSON parser accepts (#130). The caveat goes to stderr and into the document.
+#[test]
+fn ambiguous_neighbors_json_is_one_document() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    std::fs::create_dir(&src).unwrap();
+    std::fs::write(
+        src.join("a.ts"),
+        "export function handle() { return 1; }\nexport function go() { return handle(); }\n",
+    )
+    .unwrap();
+    std::fs::write(src.join("b.ts"), "export function handle() { return 2; }\n").unwrap();
+    let root = tmp.path().to_str().unwrap();
+    assert!(ripple(&["index", root]).status.success());
+
+    let out = ripple(&["neighbors", "handle", "--in", "--json", "--root", root]);
+    assert!(out.status.success());
+    let doc: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout is one JSON document");
+    assert_eq!(doc["lookup"]["candidates"], 2);
+    assert_eq!(doc["lookup"]["ambiguous"], true);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("matches 2 symbols"));
+
+    let human = ripple(&["path", "go", "handl", "--root", root]);
+    assert!(
+        !String::from_utf8_lossy(&human.stdout).contains("no exact match"),
+        "the lookup caveat belongs on stderr"
+    );
+}
+
+/// Result rows carry the line they point at and its text, so an agent does not
+/// grep for a line it was already given the number of.
+#[test]
+fn rows_carry_their_line_and_its_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("a.ts"),
+        "export function loadUser(id: string) {}\n\nexport function main() {\n  loadUser(\"a\");\n}\n",
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_ripple"))
+            .args(args)
+            .current_dir(tmp.path())
+            .output()
+            .expect("run ripple");
+        assert!(out.status.success(), "{args:?}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    run(&["index", "."]);
+
+    let callers = run(&["neighbors", "loadUser", "--in"]);
+    assert!(
+        callers.contains("main (a.ts:4)  loadUser(\"a\");"),
+        "a caller is shown at its call site:\n{callers}"
+    );
+    let callees = run(&["neighbors", "main", "--out"]);
+    assert!(
+        callees.contains("loadUser (a.ts:1)  export function loadUser(id: string) {}"),
+        "a callee is shown at its definition:\n{callees}"
+    );
+    let found = run(&["search", "load", "user"]);
+    assert!(
+        found.contains("loadUser (a.ts:1)  export function loadUser(id: string) {}"),
+        "{found}"
+    );
+    let located = run(&["locate", "load", "user"]);
+    assert!(
+        located.contains("      export function loadUser(id: string) {}"),
+        "{located}"
+    );
+    assert!(
+        !located.contains('←'),
+        "the one-hop preview is opt-in:\n{located}"
+    );
+    assert!(run(&["locate", "load", "user", "--touches"]).contains('←'));
+}
