@@ -31,6 +31,10 @@ impl LanguageAdapter for Adapter {
         "java"
     }
 
+    fn linkage_family(&self) -> &'static str {
+        "jvm"
+    }
+
     fn grammar(&self) -> tree_sitter::Language {
         tree_sitter_java::LANGUAGE.into()
     }

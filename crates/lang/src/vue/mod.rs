@@ -40,6 +40,10 @@ impl LanguageAdapter for Adapter {
         "vue"
     }
 
+    fn linkage_family(&self) -> &'static str {
+        "js"
+    }
+
     fn grammar(&self) -> tree_sitter::Language {
         tree_sitter_vue_vendored::language()
     }

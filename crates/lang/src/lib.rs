@@ -215,6 +215,17 @@ pub trait LanguageAdapter: Send + Sync {
         false
     }
 
+    /// Which languages can call this one's definitions by name. A call is only ever
+    /// resolved by name to a definition in the same family, so a Rust
+    /// `client.lookup()` cannot land on a Java fixture's `lookup` (#134).
+    ///
+    /// Defaults to the adapter's own id. Languages sharing one runtime and calling
+    /// each other directly share a family: TypeScript, JavaScript and the files
+    /// that embed them; C and C++; the JVM languages.
+    fn linkage_family(&self) -> &'static str {
+        self.id()
+    }
+
     /// Does an *unqualified* call written inside a member function body mean
     /// `this.m()` — a call on the enclosing class — rather than a free function?
     /// Default: no.
@@ -366,7 +377,7 @@ pub fn registry() -> Vec<Box<dyn LanguageAdapter>> {
 /// `embedded_regions`, `extract_cross`, `qualified_name`, `test_scopes`, etc. Query
 /// sources and grammar changes are caught automatically by `registry_fingerprint`;
 /// this is the escape hatch for the Rust that isn't a query string. See #71.
-const EXTRACT_LOGIC_VERSION: u32 = 1;
+const EXTRACT_LOGIC_VERSION: u32 = 2;
 
 /// A fingerprint of every adapter's extraction *inputs*: the `.scm` query sources,
 /// the grammar identity, and `EXTRACT_LOGIC_VERSION`.

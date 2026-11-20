@@ -31,6 +31,10 @@ impl LanguageAdapter for Adapter {
         "html"
     }
 
+    fn linkage_family(&self) -> &'static str {
+        "js"
+    }
+
     fn grammar(&self) -> tree_sitter::Language {
         tree_sitter_html::LANGUAGE.into()
     }

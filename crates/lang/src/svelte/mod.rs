@@ -34,6 +34,10 @@ impl LanguageAdapter for Adapter {
         "svelte"
     }
 
+    fn linkage_family(&self) -> &'static str {
+        "js"
+    }
+
     fn grammar(&self) -> tree_sitter::Language {
         tree_sitter_svelte_next::LANGUAGE.into()
     }

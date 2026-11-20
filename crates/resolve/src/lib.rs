@@ -207,7 +207,11 @@ pub fn build_incremental(
         Workspaces::discover_all(&used_roots)
     });
     let idx_span = ir::timing::start("index_defs");
-    let (index, mut nodes) = index_defs(&all_files, &file_root);
+    let file_family: Vec<&'static str> = all_files
+        .iter()
+        .map(|f| lang::adapter_for(&registry, &f.canonical).map_or("", |a| a.linkage_family()))
+        .collect();
+    let (index, mut nodes) = index_defs(&all_files, &file_root, &file_family);
     idx_span.stop(nodes.len());
 
     let link_span = ir::timing::start("link");
@@ -468,6 +472,9 @@ struct DefIndex {
     /// added later is a candidate until someone rules it out, which is the
     /// direction that fails loudly.
     uncallable: HashSet<SymbolId>,
+    /// [`lang::LanguageAdapter::linkage_family`] of the file each definition is in.
+    /// A call resolved by name keeps only candidates from its own family (#134).
+    family_of: HashMap<SymbolId, &'static str>,
 }
 
 /// The trailing identifier of a qualified name or path — `Client` from
@@ -482,7 +489,11 @@ fn last_segment(path: &str) -> &str {
 
 /// Phase 2: emit def + module nodes and build the lookup tables. `file_root[i]` is
 /// which indexed root `files[i]` came from — one entry per file, in the same order.
-fn index_defs(files: &[CachedFile], file_root: &[usize]) -> (DefIndex, Vec<Node>) {
+fn index_defs(
+    files: &[CachedFile],
+    file_root: &[usize],
+    file_family: &[&'static str],
+) -> (DefIndex, Vec<Node>) {
     let mut idx = DefIndex::default();
     let mut nodes: Vec<Node> = Vec::new();
     // identity is (path, qualified name), so several definitions of one symbol share
@@ -494,9 +505,10 @@ fn index_defs(files: &[CachedFile], file_root: &[usize]) -> (DefIndex, Vec<Node>
     // a field and a function can collapse onto one id; that id is still callable
     let mut callable: HashSet<SymbolId> = HashSet::new();
 
-    for (f, &root) in files.iter().zip(file_root) {
+    for ((f, &root), &family) in files.iter().zip(file_root).zip(file_family) {
         let by_name = idx.file_defs.entry(f.canonical.clone()).or_default();
         for d in &f.extract.defs {
+            idx.family_of.insert(d.id, family);
             by_name.entry(d.name.clone()).or_default().push(d.id);
             if d.is_exported {
                 idx.export_table
@@ -604,6 +616,7 @@ fn link(
         let rules = CallRules {
             global_linkage: adapter.is_some_and(|a| a.bare_calls_resolve_globally()),
             self_calls: adapter.is_some_and(|a| a.bare_call_in_method_is_self_call()),
+            family: adapter.map_or("", |a| a.linkage_family()),
         };
         resolve_calls(f, root, idx, module_id, &scope, rules, &mut sink);
     }
@@ -649,6 +662,10 @@ struct ImportScope {
     /// outside the roots (`import * as React from "react"`, `import os`). A member
     /// call on such a name binds to `dep.method`.
     ext_modules: HashMap<String, String>,
+    /// local names bound to a whole module this graph does not contain and has no
+    /// dependency node for (Go's `os`, `url`). A member call on one names that
+    /// module's function, so it must not fall back to same-named methods here (#134).
+    opaque_modules: HashSet<String>,
 }
 
 /// Id of the external module (dep-key) node. Kept in sync with
@@ -820,6 +837,9 @@ fn resolve_imports(
             // bare/unresolved specifier — bind it as an external package so a
             // call to it has a real target node (external-import binding pass)
             bind_external(adapter, imp, module_id, &mut scope, sink);
+            if imp.is_namespace() && !scope.ext_modules.contains_key(&imp.local_name) {
+                scope.opaque_modules.insert(imp.local_name.clone());
+            }
             continue;
         };
         if imp.is_namespace() {
@@ -879,6 +899,9 @@ struct CallRules {
     /// [`lang::LanguageAdapter::bare_call_in_method_is_self_call`]: an unqualified
     /// call inside a member function means `this.m()`.
     self_calls: bool,
+    /// [`lang::LanguageAdapter::linkage_family`]: which definitions a call in this
+    /// file can name at all.
+    family: &'static str,
 }
 
 /// Resolve a file's call sites (bare + member) into Calls edges.
@@ -965,6 +988,10 @@ fn resolve_calls(
                     } else {
                         (Vec::new(), CONF_KNOWN_RECEIVER)
                     }
+                } else if matches!(r.receiver.as_ref(), Some(Receiver::Ident(v))
+                    if !shadowed && scope.opaque_modules.contains(v))
+                {
+                    (Vec::new(), CONF_KNOWN_RECEIVER)
                 } else if let Some(dep) = ext_dep {
                     // `React.useState()` / `os.system()` — the receiver names an
                     // external module, so the method is that dep's `dep.method` symbol
@@ -989,6 +1016,10 @@ fn resolve_calls(
         if r.kind == RefKind::Call {
             targets.retain(|id| !idx.uncallable.contains(id));
         }
+        // a name shared across languages is a coincidence, not a call: the Rust
+        // tests calling `client.lookup()` linked to a Java fixture's `lookup` (#134).
+        // External symbols carry no family and are kept.
+        targets.retain(|id| idx.family_of.get(id).is_none_or(|f| *f == rules.family));
 
         // several definitions can share one id — Elixir's multi-clause functions
         // and default args all key to (module, name). They are one target, so

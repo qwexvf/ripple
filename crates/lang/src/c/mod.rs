@@ -30,6 +30,10 @@ impl LanguageAdapter for Adapter {
         "c"
     }
 
+    fn linkage_family(&self) -> &'static str {
+        "c"
+    }
+
     fn grammar(&self) -> tree_sitter::Language {
         tree_sitter_c::LANGUAGE.into()
     }

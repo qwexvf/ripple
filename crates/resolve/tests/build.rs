@@ -632,6 +632,32 @@ fn rust_calls_inside_macro_arguments_link() {
     );
 }
 
+/// A name shared across languages is a coincidence, and a call through a stdlib
+/// package (`os.ReadFile`) names that package. Both used to fall back to every
+/// same-named method in the repo (#134).
+#[test]
+fn calls_do_not_resolve_across_languages_or_through_unindexed_packages() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cross_lang");
+    let r = resolve::build(&root).unwrap();
+    let calls = |src: SymbolId| -> Vec<SymbolId> {
+        r.edges
+            .iter()
+            .filter(|e| e.src == src && e.kind == EdgeKind::Calls)
+            .map(|e| e.dst)
+            .collect()
+    };
+    let rust = calls(SymbolId::of("client.rs", "run"));
+    assert!(
+        !rust.contains(&SymbolId::of("JndiLookup.java", "JndiLookup.lookup")),
+        "{rust:?}"
+    );
+    let go = calls(SymbolId::of("fs/manifest.go", "readDeps"));
+    assert!(
+        go.is_empty(),
+        "os.ReadFile is stdlib, not HookFS.ReadFile: {go:?}"
+    );
+}
+
 #[test]
 fn deterministic_build() {
     let a = resolve::build(&fixture()).unwrap();
