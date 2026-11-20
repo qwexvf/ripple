@@ -531,6 +531,12 @@ fn try_diff(
     };
     let mut opts = git2::DiffOptions::new();
     opts.context_lines(0); // hunk ranges = changed lines only, no surrounding context
+                           // a brand-new, not-yet-added file is part of the change under review: extracting
+                           // code into a new module otherwise reviews as if only the call site moved (#147).
+                           // Ignored files stay out, the same as the index walk.
+    opts.include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .show_untracked_content(true);
     let diff = repo.diff_tree_to_workdir_with_index(Some(&old_tree), Some(&mut opts))?;
 
     let mut map: HashMap<String, Vec<(u32, u32)>> = HashMap::new();
@@ -1152,6 +1158,22 @@ mod tests {
             &parents.iter().collect::<Vec<_>>(),
         )
         .expect("commit");
+    }
+
+    #[test]
+    fn diff_includes_untracked_files_but_not_ignored_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        commit(&repo, 0, &["a.ts"]);
+        // written after `commit`, which would overwrite it with filler content
+        std::fs::write(dir.path().join(".gitignore"), "out/\n").unwrap();
+        std::fs::write(dir.path().join("new.ts"), "one\ntwo\n").unwrap();
+        std::fs::create_dir(dir.path().join("out")).unwrap();
+        std::fs::write(dir.path().join("out/bundle.js"), "x\n").unwrap();
+
+        let changed = diff_lines(dir.path(), None);
+        assert_eq!(changed.get("new.ts"), Some(&vec![(1, 2)]));
+        assert!(!changed.contains_key("out/bundle.js"), "{changed:?}");
     }
 
     #[test]
