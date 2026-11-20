@@ -734,6 +734,26 @@ fn go_bare_calls_reach_the_same_package() {
     assert_eq!(called, expected);
 }
 
+/// `export default { async fetch() {} }` is how a Cloudflare Worker is written, and
+/// its test calls `worker.fetch()` through a default import. The method had no
+/// owner, so the call bound to nothing and review marked it untested (#149).
+#[test]
+fn default_export_object_members_are_reachable() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/default_object");
+    let r = resolve::build(&root).unwrap();
+    let fetch = SymbolId::of("src/worker.js", "default.fetch");
+    let callers: Vec<SymbolId> = r
+        .edges
+        .iter()
+        .filter(|e| e.dst == fetch && e.kind == EdgeKind::Calls)
+        .map(|e| e.src)
+        .collect();
+    assert_eq!(
+        callers,
+        vec![SymbolId::of("test/worker.test.ts", "fetchIt")]
+    );
+}
+
 #[test]
 fn deterministic_build() {
     let a = resolve::build(&fixture()).unwrap();

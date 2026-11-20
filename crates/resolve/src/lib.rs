@@ -686,6 +686,9 @@ struct ImportScope {
     /// imported file does not export it and the adapter allows a package search.
     /// A call through the name splits its confidence across them.
     ambiguous: HashMap<String, Vec<SymbolId>>,
+    /// local name → the file whose default export it imports, so `worker.fetch()`
+    /// can reach a member of an `export default { fetch() {} }` object (#149)
+    default_imports: HashMap<String, PathBuf>,
 }
 
 /// Id of the external module (dep-key) node. Kept in sync with
@@ -879,6 +882,11 @@ fn resolve_imports(
             }
             continue;
         }
+        if imp.imported_name == "default" {
+            scope
+                .default_imports
+                .insert(imp.local_name.clone(), target.clone());
+        }
         let resolved = if imp.imported_name == "default" {
             default_export(idx, &target)
         } else {
@@ -1060,7 +1068,16 @@ fn resolve_calls(
                 // target is a single file (a TS `import * as ns`) or a package
                 // directory (a Go import); try the file export table, then the
                 // directory-keyed package exports (#85).
-                if let Some(target) = module_receiver(r.receiver.as_ref(), &scope.modules) {
+                let default_member = match r.receiver.as_ref() {
+                    Some(Receiver::Ident(v)) if !shadowed => scope
+                        .default_imports
+                        .get(v)
+                        .map(|file| default_members(idx, root, file, &r.name)),
+                    _ => None,
+                };
+                if let Some(found) = default_member.filter(|f| !f.is_empty()) {
+                    (found, CONF_KNOWN_RECEIVER)
+                } else if let Some(target) = module_receiver(r.receiver.as_ref(), &scope.modules) {
                     if let Some(sym) = idx.export_table.get(&(target.clone(), r.name.clone())) {
                         (vec![*sym], CONF_KNOWN_RECEIVER)
                     } else if let Some(syms) = idx.pkg_exports.get(&(target, r.name.clone())) {
@@ -1601,6 +1618,18 @@ fn is_container(kind: NodeKind) -> bool {
 fn contains(outer: Span, inner: Span) -> bool {
     (outer.start_line, outer.start_col) <= (inner.start_line, inner.start_col)
         && (outer.end_line, outer.end_col) >= (inner.end_line, inner.end_col)
+}
+
+/// Members named `name` of the default-exported object in `file`: definitions owned
+/// by `default` that live in that file.
+fn default_members(idx: &DefIndex, root: usize, file: &Path, name: &str) -> Vec<SymbolId> {
+    idx.by_owner
+        .get(&(root, "default".to_owned(), name.to_owned()))
+        .into_iter()
+        .flatten()
+        .copied()
+        .filter(|id| idx.file_of.get(id).is_some_and(|f| f == file))
+        .collect()
 }
 
 fn default_export(idx: &DefIndex, target: &Path) -> Option<SymbolId> {

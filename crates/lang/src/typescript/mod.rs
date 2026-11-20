@@ -193,6 +193,9 @@ impl LanguageAdapter for Adapter {
     fn is_exported(&self, def: tree_sitter::Node, src: &[u8]) -> bool {
         let mut cur = def.parent();
         while let Some(n) = cur {
+            if is_default_export_object(n) {
+                return true;
+            }
             match n.kind() {
                 "export_statement" => return true,
                 "class_body" | "interface_body" | "enum_body" | "object_type"
@@ -223,9 +226,23 @@ impl LanguageAdapter for Adapter {
 }
 
 /// Name of the class/interface/enum enclosing a member definition, if any.
+/// The object literal of `export default { … }`. Its methods are the module's
+/// default export's members (a Cloudflare Worker's `fetch`), so they are exported
+/// and owned by `default`: `import worker from "./worker"; worker.fetch()` then has
+/// something to bind to (#149).
+fn is_default_export_object(n: tree_sitter::Node) -> bool {
+    n.kind() == "object"
+        && n.parent().is_some_and(|p| {
+            p.kind() == "export_statement" && p.child_by_field_name("value") == Some(n)
+        })
+}
+
 fn enclosing_type_name(node: tree_sitter::Node, src: &[u8]) -> Option<String> {
     let mut cur = node.parent();
     while let Some(n) = cur {
+        if is_default_export_object(n) {
+            return Some("default".to_owned());
+        }
         match n.kind() {
             "class_declaration"
             | "abstract_class_declaration"

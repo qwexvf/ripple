@@ -414,7 +414,7 @@ pub fn registry() -> Vec<Box<dyn LanguageAdapter>> {
 /// `embedded_regions`, `extract_cross`, `qualified_name`, `test_scopes`, etc. Query
 /// sources and grammar changes are caught automatically by `registry_fingerprint`;
 /// this is the escape hatch for the Rust that isn't a query string. See #71.
-const EXTRACT_LOGIC_VERSION: u32 = 2;
+const EXTRACT_LOGIC_VERSION: u32 = 3;
 
 /// A fingerprint of every adapter's extraction *inputs*: the `.scm` query sources,
 /// the grammar identity, and `EXTRACT_LOGIC_VERSION`.
