@@ -112,3 +112,51 @@ fn ambiguous_neighbors_json_is_one_document() {
         "the lookup caveat belongs on stderr"
     );
 }
+
+/// Result rows carry the line they point at and its text, so an agent does not
+/// grep for a line it was already given the number of.
+#[test]
+fn rows_carry_their_line_and_its_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("a.ts"),
+        "export function loadUser(id: string) {}\n\nexport function main() {\n  loadUser(\"a\");\n}\n",
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_ripple"))
+            .args(args)
+            .current_dir(tmp.path())
+            .output()
+            .expect("run ripple");
+        assert!(out.status.success(), "{args:?}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    run(&["index", "."]);
+
+    let callers = run(&["neighbors", "loadUser", "--in"]);
+    assert!(
+        callers.contains("main (a.ts:4)  loadUser(\"a\");"),
+        "a caller is shown at its call site:\n{callers}"
+    );
+    let callees = run(&["neighbors", "main", "--out"]);
+    assert!(
+        callees.contains("loadUser (a.ts:1)  export function loadUser(id: string) {}"),
+        "a callee is shown at its definition:\n{callees}"
+    );
+    let found = run(&["search", "load", "user"]);
+    assert!(
+        found.contains("loadUser (a.ts:1)  export function loadUser(id: string) {}"),
+        "{found}"
+    );
+    let located = run(&["locate", "load", "user"]);
+    assert!(
+        located.contains("      export function loadUser(id: string) {}"),
+        "{located}"
+    );
+    assert!(
+        !located.contains('←'),
+        "the one-hop preview is opt-in:\n{located}"
+    );
+    assert!(run(&["locate", "load", "user", "--touches"]).contains('←'));
+}
