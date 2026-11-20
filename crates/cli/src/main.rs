@@ -2489,6 +2489,14 @@ fn cmd_eval_vs_grep(args: &[String]) -> Result<()> {
     let graph = store.load()?;
     let tag = root_tag(&store, &root)?;
     let extracts = store.read_extracts()?;
+    // a cache from an older extract shape reads as empty while the graph still
+    // loads, which would score grep at 0% against a plausible ripple row (#155)
+    if extracts.is_empty() && graph.node_count() > 0 {
+        bail!(
+            "the extract cache in {} is empty or from an older ripple build; re-run `ripple index` first",
+            db_path(&root)?.display()
+        );
+    }
 
     let indexed = |p: &str| graph.get(ir::SymbolId::module(p)).is_some();
 
