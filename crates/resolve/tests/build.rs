@@ -1,4 +1,4 @@
-use ir::{EdgeKind, SymbolId};
+use ir::{EdgeKind, NodeKind, SymbolId};
 use std::path::Path;
 
 fn fixture() -> std::path::PathBuf {
@@ -547,6 +547,52 @@ fn resolves_rust_path_calls() {
         news.len(),
         2,
         "exactly the two `new`s we call, nothing dragged in by HashMap::new()"
+    );
+}
+
+/// Rust methods were indexed as plain functions, and member-call resolution keys off
+/// `NodeKind::Method`, so `site.step()` and `self.tick()` linked to nothing and
+/// `impact` on any method was empty (#138).
+#[test]
+fn rust_method_calls_reach_their_methods() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rust_methods");
+    let r = resolve::build(&root).unwrap();
+    let calls = |src: SymbolId| -> Vec<SymbolId> {
+        r.edges
+            .iter()
+            .filter(|e| e.src == src && e.kind == EdgeKind::Calls)
+            .map(|e| e.dst)
+            .collect()
+    };
+
+    let run = calls(SymbolId::of("app.rs", "run"));
+    assert!(
+        run.contains(&SymbolId::of("site.rs", "Site::step")),
+        "{run:?}"
+    );
+    assert!(
+        run.contains(&SymbolId::of("site.rs", "Site::stream")),
+        "{run:?}"
+    );
+
+    let step = calls(SymbolId::of("site.rs", "Site::step"));
+    assert_eq!(
+        step,
+        vec![SymbolId::of("site.rs", "Site::tick")],
+        "self.tick()"
+    );
+
+    let kind = |q: &str| {
+        r.nodes
+            .iter()
+            .find(|n| n.id == SymbolId::of("site.rs", q))
+            .map(|n| n.kind)
+    };
+    assert_eq!(kind("Site::step"), Some(NodeKind::Method));
+    assert_eq!(
+        kind("Stream::stream"),
+        Some(NodeKind::Method),
+        "a required trait method"
     );
 }
 

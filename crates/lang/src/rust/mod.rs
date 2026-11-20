@@ -79,10 +79,12 @@ impl LanguageAdapter for Adapter {
     /// qualified by the type that owns them, for the same reason.
     fn qualified_name(&self, kind: ir::NodeKind, name: &str, def: Node, src: &[u8]) -> String {
         match kind {
-            ir::NodeKind::Function => match impl_type(def, src) {
-                Some(ty) => format!("{ty}::{name}"),
-                None => name.to_owned(),
-            },
+            ir::NodeKind::Function | ir::NodeKind::Method => {
+                match impl_type(def, src).or_else(|| trait_name(def, src)) {
+                    Some(ty) => format!("{ty}::{name}"),
+                    None => name.to_owned(),
+                }
+            }
             ir::NodeKind::Field => member_path(def, name, src).unwrap_or_else(|| name.to_owned()),
             _ => name.to_owned(),
         }
@@ -200,6 +202,13 @@ fn impl_type<'a>(def: Node, src: &'a [u8]) -> Option<&'a str> {
         node = parent;
     }
     None
+}
+
+/// The trait a method is declared in, for a method with no `impl` around it: a
+/// required signature or a default body inside `trait T { … }`.
+fn trait_name<'a>(def: Node, src: &'a [u8]) -> Option<&'a str> {
+    let tr = enclosing(def, &["trait_item"])?;
+    tr.child_by_field_name("name")?.utf8_text(src).ok()
 }
 
 /// `Vec<Edge>` → `Vec`: a generic argument list isn't part of the type's identity

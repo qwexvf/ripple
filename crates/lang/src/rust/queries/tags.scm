@@ -1,6 +1,17 @@
 ; Rust definitions. Free functions and methods share `function_item`; the adapter
 ; qualifies a method by its enclosing `impl` type, so `Client::start` and
 ; `Server::start` stay distinct symbols.
+;
+; Ordering is load-bearing: a method also matches the general `function_item`
+; pattern, both captures produce the same SymbolId, and the first kind seen is kept.
+; So the method patterns come first. `NodeKind::Method` is what member-call
+; resolution keys off; as plain functions, `self.step()` and `site.step()` linked
+; to nothing at all (#138).
+(impl_item body: (declaration_list (function_item name: (identifier) @name) @def.method))
+(trait_item body: (declaration_list (function_item name: (identifier) @name) @def.method))
+; a required trait method has no body, so it is a signature, not a `function_item`
+(trait_item body: (declaration_list (function_signature_item name: (identifier) @name) @def.method))
+
 (function_item name: (identifier) @name) @def.function
 
 (struct_item name: (type_identifier) @name) @def.class

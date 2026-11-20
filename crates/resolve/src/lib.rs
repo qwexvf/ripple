@@ -519,13 +519,13 @@ fn index_defs(files: &[CachedFile], file_root: &[usize]) -> (DefIndex, Vec<Node>
                 }
             }
             if d.kind == NodeKind::Method {
-                if let Some((class, method)) = d.qualified_name.split_once('.') {
+                if let Some(class) = owner_of(&d.qualified_name, &d.name) {
                     idx.methods_by_class
-                        .entry((root, class.to_owned(), method.to_owned()))
+                        .entry((root, class.to_owned(), d.name.clone()))
                         .or_default()
                         .push(d.id);
                     idx.methods_by_name
-                        .entry((root, method.to_owned()))
+                        .entry((root, d.name.clone()))
                         .or_default()
                         .push(d.id);
                 }
@@ -1391,11 +1391,21 @@ fn external_module_receiver(
 /// Python OOP codebase). Splitting on the first `.` matches how `methods_by_class` is
 /// keyed in `index_defs`.
 fn class_of(node: &Node) -> Option<&str> {
-    let (owner, method) = node.qualified_name.split_once('.')?;
-    // guard: the qualified name is genuinely `Owner.<this node's name>`, not some
-    // other dotted string — so a plain function is never mistaken for a member
-    (!owner.is_empty() && node.qualified_name.ends_with(&node.name) && method.ends_with(&node.name))
-        .then_some(owner)
+    owner_of(&node.qualified_name, &node.name)
+}
+
+/// The type a member belongs to, read off its qualified name: `Client` from
+/// `Client.send`, `pkg.Client.send` or `Client::send`. `None` unless the qualified
+/// name really is `<owner><separator><name>`, so a plain function is never mistaken
+/// for a member. Both separators are accepted because that is all the IR says: each
+/// adapter writes member paths the way its language does.
+fn owner_of<'a>(qualified: &'a str, name: &str) -> Option<&'a str> {
+    let prefix = qualified.strip_suffix(name)?;
+    if !(prefix.ends_with('.') || prefix.ends_with("::")) {
+        return None;
+    }
+    let owner = last_segment(prefix);
+    (!owner.is_empty()).then_some(owner)
 }
 
 fn module_symbol(module_path: &str) -> SymbolId {
