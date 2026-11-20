@@ -1437,6 +1437,11 @@ const SNIPPET_CHARS: usize = 80;
 /// A caller keeps its call-site line at any confidence: that line is the evidence.
 const SNIPPET_MIN_CONFIDENCE: f32 = 0.5;
 
+/// Rows per answer that get line text. Past this the answer is already too broad
+/// to read row by row (an ambiguous `New` in a Go repo: thousands of tokens), and
+/// text on every row made it 60% bigger; the first rows keep it.
+const SNIPPET_ROWS: usize = 30;
+
 impl Sources {
     fn new(roots: Vec<(String, PathBuf)>, fallback: &Path) -> Self {
         Sources {
@@ -3599,6 +3604,7 @@ fn cmd_neighbors(args: &[String]) -> Result<()> {
                 start.module_path,
                 format_args!("{:?}", start.kind)
             );
+            let mut snippets = SNIPPET_ROWS;
             for row in &tree_order(start.id, &hops, dir) {
                 let h = &row.hop;
                 // several call sites are several edges; collapsing them silently would
@@ -3609,7 +3615,9 @@ fn cmd_neighbors(args: &[String]) -> Result<()> {
                     String::new()
                 };
                 let indent = "  ".repeat(h.depth);
-                let at = if dir == Dir::In || h.edge.confidence >= SNIPPET_MIN_CONFIDENCE {
+                let wanted = dir == Dir::In || h.edge.confidence >= SNIPPET_MIN_CONFIDENCE;
+                let at = if wanted && snippets > 0 {
+                    snippets -= 1;
                     located_line(&mut sources, &h.node.module_path, row_line(h, dir))
                 } else {
                     match row_line(h, dir) {
@@ -3623,13 +3631,16 @@ fn cmd_neighbors(args: &[String]) -> Result<()> {
                 );
             }
             for (h, member) in &via_members {
+                let line = row_line(h, Dir::In);
+                let at = if snippets > 0 {
+                    snippets -= 1;
+                    located_line(&mut sources, &h.node.module_path, line)
+                } else {
+                    format!("({}:{line})", h.node.module_path)
+                };
                 println!(
-                    "  {:?}<{:.2}> {} → {} {}",
-                    h.edge.kind,
-                    h.edge.confidence,
-                    h.node.name,
-                    member.name,
-                    located_line(&mut sources, &h.node.module_path, row_line(h, Dir::In))
+                    "  {:?}<{:.2}> {} → {} {at}",
+                    h.edge.kind, h.edge.confidence, h.node.name, member.name,
                 );
             }
         }
