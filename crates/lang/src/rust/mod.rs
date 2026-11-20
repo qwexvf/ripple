@@ -79,6 +79,7 @@ impl LanguageAdapter for Adapter {
         let first = spec.split("::").next()?.trim();
         let crate_dir = match first {
             "crate" | "self" | "super" => enclosing_crate(from_file)?,
+            name if declares_child_module(from_file, name) => enclosing_crate(from_file)?,
             name => ws.rust_crates.get(name)?.clone(),
         };
         crate_root_file(&crate_dir)
@@ -254,6 +255,23 @@ fn enclosing_crate(file: &Path) -> Option<PathBuf> {
         .skip(1)
         .find(|d| d.join("Cargo.toml").is_file())
         .map(Path::to_path_buf)
+}
+
+/// Is `name` a module of `file`'s own, so `use name::X` is local rather than a
+/// crate? `pub use cache::DiskCache` in `lib.rs` next to `cache.rs` read as an
+/// external crate called `cache`. A crate root or `mod.rs` keeps its children
+/// beside it; `foo.rs` keeps them in `foo/`.
+fn declares_child_module(file: &Path, name: &str) -> bool {
+    let Some(parent) = file.parent() else {
+        return false;
+    };
+    let stem = file.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    let dir = if matches!(stem, "lib" | "main" | "mod") {
+        parent.to_path_buf()
+    } else {
+        parent.join(stem)
+    };
+    dir.join(format!("{name}.rs")).is_file() || dir.join(name).join("mod.rs").is_file()
 }
 
 /// `src/lib.rs`, else `src/main.rs`, of a crate directory.

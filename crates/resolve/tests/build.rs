@@ -685,16 +685,29 @@ fn rust_use_binds_names_across_workspace_crates() {
         "one candidate keeps full confidence, got {conf}"
     );
 
-    let importers: Vec<SymbolId> = r
+    let mut importers: Vec<SymbolId> = r
         .edges
         .iter()
         .filter(|e| e.dst == disk_cache && e.kind == EdgeKind::Imports)
         .map(|e| e.src)
         .collect();
+    importers.sort_unstable();
+    let mut expected = vec![
+        SymbolId::module("cli/src/main.rs"),
+        // the re-export itself: `pub use cache::DiskCache`
+        SymbolId::module("net/src/lib.rs"),
+    ];
+    expected.sort_unstable();
     assert_eq!(
-        importers,
-        vec![SymbolId::module("cli/src/main.rs")],
+        importers, expected,
         "`use aegis_net::DiskCache` reaches the re-exported struct"
+    );
+    // `pub use cache::DiskCache` in lib.rs names the sibling module, not a crate
+    assert!(
+        !r.nodes
+            .iter()
+            .any(|n| n.kind == NodeKind::External && n.name == "cache"),
+        "a local module read as an external crate"
     );
 }
 
