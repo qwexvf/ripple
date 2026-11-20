@@ -82,9 +82,9 @@ right symbol out of several same-named candidates is an agent problem.
 
 An agent handed "implement rate limiting on login" has no symbol yet, and the task's
 words rarely appear in a function name. `locate` maps the task to code: it matches the
-words against symbol names, module paths, endpoint routes, and doc comments, then fuses
-that lexical recall with graph centrality and risk (Reciprocal Rank Fusion) so a word
-landing on a central, risky symbol outranks a bare substring hit. Each returned seed
+words against symbol names, module paths, endpoint routes, and doc comments. The text
+match decides the order (rare words count more, and matching more of the task beats
+matching one word well); graph centrality and risk break ties. Each returned seed
 carries its `repo`, the fields that matched (`why`), its dependent count, and a one-hop
 blast-radius preview (`touches`) — so one call answers "start here, and this is what it
 touches" instead of a search followed by a read of every candidate and a separate
