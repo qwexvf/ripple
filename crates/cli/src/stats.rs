@@ -517,7 +517,8 @@ pub struct Arms {
 }
 
 impl Arms {
-    /// Reads `{"session_id": .., "arm": ..}` lines; the first assignment of a session wins.
+    /// Reads `{"session_id": .., "arm": ..}` lines; the latest row for a session wins, so a
+    /// holdout session the user switched back to ripple counts under its new arm.
     pub fn load(text: &str) -> Self {
         let mut assignment = HashMap::new();
         for line in text.lines() {
@@ -528,9 +529,7 @@ impl Arms {
                 v.get("session_id").and_then(Value::as_str),
                 v.get("arm").and_then(Value::as_str),
             ) {
-                assignment
-                    .entry(s.to_owned())
-                    .or_insert_with(|| a.to_owned());
+                assignment.insert(s.to_owned(), a.to_owned());
             }
         }
         Arms {
@@ -863,13 +862,13 @@ mod tests {
             serde_json::json!({"type": "tool_use", "id": "2", "name": "Grep", "input": {}}),
         );
         let mut arms = Arms::load(
-            "{\"session_id\":\"s1\",\"arm\":\"holdout\"}\n{\"session_id\":\"s1\",\"arm\":\"ripple\"}",
+            "{\"session_id\":\"s1\",\"arm\":\"ripple\"}\n{\"session_id\":\"s1\",\"arm\":\"holdout\"}",
         );
         arms.add(&meta, &parse_session(&main));
         arms.add(&session_meta(&sub), &parse_session(&sub));
         arms.add(&SessionMeta::default(), &[]);
         let v = arms.json();
-        assert!(v.get("ripple").is_none(), "first assignment wins");
+        assert!(v.get("ripple").is_none(), "the latest row wins");
         let h = &v["holdout"];
         assert_eq!(h["sessions"], 1);
         assert_eq!(h["edits"], 1.0);

@@ -278,7 +278,8 @@ inflates its per-edit cost. `eval --vs-grep` is the controlled comparison.
 To compare fairly on real work, assign sessions at random. `--arms <file>` (default
 `$XDG_STATE_HOME/ripple/ab.jsonl` when it exists) reads lines of
 `{"session_id": "...", "arm": "..."}`, written by a session-start hook that also keeps
-ripple out of `holdout` sessions. The report then adds one row per arm: edits, the
+ripple out of `holdout` sessions. The latest row for a session wins, so a holdout session
+switched back to ripple mid-way can be logged under its own arm (`switched`). The report then adds one row per arm: edits, the
 model's context and output tokens per edit (from each message's `usage`, subagents
 included), lookups per edit, and ripple calls (which should be zero in the holdout arm).
 Edits are counted from the file-editing tools only (Edit, MultiEdit, Write, NotebookEdit),
