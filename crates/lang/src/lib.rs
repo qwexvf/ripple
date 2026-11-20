@@ -7,6 +7,7 @@ pub mod cpp;
 pub mod cross;
 pub mod csharp;
 pub mod elixir;
+pub mod gdscript;
 pub mod gleam;
 pub mod go;
 pub mod graphql;
@@ -427,6 +428,7 @@ pub fn registry() -> Vec<Box<dyn LanguageAdapter>> {
         Box::new(cpp::Adapter::new()),
         Box::new(svelte::Adapter::new()),
         Box::new(vue::Adapter::new()),
+        Box::new(gdscript::Adapter::new()),
     ]
 }
 

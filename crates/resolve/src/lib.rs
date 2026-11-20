@@ -1360,8 +1360,14 @@ fn resolve_member(
             None => (candidates(), CONF_CANDIDATE),
         },
         Some(Receiver::New(ctor)) => by_class(ctor, CONF_KNOWN_RECEIVER),
-        Some(Receiver::Ident(_)) => match recv_type {
+        Some(Receiver::Ident(v)) => match recv_type {
             Some(class) => by_class(class, CONF_TYPED_RECEIVER),
+            // `Inventory.add()`: a capitalized receiver with no binding is the class
+            // itself (a static call, a GDScript `class_name`). Only when that class
+            // really has the method; otherwise it is some other value.
+            None if v.starts_with(char::is_uppercase) && !in_class(v).is_empty() => {
+                (in_class(v), CONF_KNOWN_RECEIVER)
+            }
             None => (candidates(), CONF_CANDIDATE),
         },
         _ => (candidates(), CONF_CANDIDATE),

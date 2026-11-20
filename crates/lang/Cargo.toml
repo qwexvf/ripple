@@ -27,6 +27,7 @@ tree-sitter-c = { workspace = true }
 tree-sitter-cpp = { workspace = true }
 tree-sitter-svelte-next = { workspace = true }
 tree-sitter-vue-vendored = { workspace = true }
+tree-sitter-gdscript = { workspace = true }
 
 [dev-dependencies]
 streaming-iterator = "0.1"
